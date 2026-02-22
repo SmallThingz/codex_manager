@@ -43,7 +43,7 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const web_mode = !hasArg(args, "--desktop") or hasArg(args, "--web");
+    const web_mode = hasArg(args, "--web") and !hasArg(args, "--desktop");
 
     if (builtin.os.tag == .linux and !web_mode) {
         // Work around flaky EGL/DMABUF paths on some Linux+WebKitGTK stacks.

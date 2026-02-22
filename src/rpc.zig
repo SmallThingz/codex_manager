@@ -403,7 +403,7 @@ fn waitForOAuthCallback(
 
     var remaining_ms: i64 = @intCast(timeout_seconds * 1000);
 
-    while (remaining_ms > 0) {
+    accept_loop: while (remaining_ms > 0) {
         if (cancel_ptr.load(.seq_cst)) {
             return error.CallbackListenerStopped;
         }
@@ -421,25 +421,39 @@ fn waitForOAuthCallback(
         defer conn.stream.close();
 
         var buffer: [8192]u8 = undefined;
-        const read_size = conn.stream.read(&buffer) catch 0;
-        if (read_size == 0) {
-            continue;
-        }
-
-        const request = buffer[0..read_size];
-        const maybe_target = extractRequestTarget(request);
-
-        if (maybe_target) |target| {
-            if (std.mem.startsWith(u8, target, "/auth/callback")) {
-                writeHttpResponse(conn.stream, "200 OK", "<html><body><h3>Login completed. You can return to Codex Account Manager.</h3></body></html>");
-                return std.fmt.allocPrint(allocator, "http://localhost:1455{s}", .{target});
+        while (remaining_ms > 0) {
+            if (cancel_ptr.load(.seq_cst)) {
+                return error.CallbackListenerStopped;
             }
 
-            writeHttpResponse(conn.stream, "404 Not Found", "<html><body>Not Found</body></html>");
-            continue;
-        }
+            const read_size = conn.stream.read(&buffer) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    remaining_ms -= 10;
+                    continue;
+                },
+                else => continue :accept_loop,
+            };
+            if (read_size == 0) {
+                continue :accept_loop;
+            }
 
-        writeHttpResponse(conn.stream, "400 Bad Request", "<html><body>Invalid callback request.</body></html>");
+            const request = buffer[0..read_size];
+            const maybe_target = extractRequestTarget(request);
+
+            if (maybe_target) |target| {
+                if (std.mem.startsWith(u8, target, "/auth/callback")) {
+                    writeHttpResponse(conn.stream, "200 OK", "<html><body><h3>Login completed. You can return to Codex Account Manager.</h3></body></html>");
+                    return std.fmt.allocPrint(allocator, "http://localhost:1455{s}", .{target});
+                }
+
+                writeHttpResponse(conn.stream, "404 Not Found", "<html><body>Not Found</body></html>");
+                continue :accept_loop;
+            }
+
+            writeHttpResponse(conn.stream, "400 Bad Request", "<html><body>Invalid callback request.</body></html>");
+            continue :accept_loop;
+        }
     }
 
     return error.CallbackListenerTimeout;

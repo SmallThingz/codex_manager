@@ -1,79 +1,150 @@
 # Codex Account Manager
 
-Codex Account Manager is a SolidJS frontend with a Zig backend powered by [zig-webui](https://github.com/webui-dev/zig-webui).
+Codex Account Manager is a SolidJS + Zig app (via [zig-webui](https://github.com/webui-dev/zig-webui)) for managing multiple Codex accounts.
 
-It manages multiple Codex accounts, switches active `~/.codex/auth.json` on the fly, and checks per-account credits.
+It can switch the active `~/.codex/auth.json` on the fly, organize accounts by status, and show remaining usage per account.
 
-## Architecture
+## Features
 
-- Frontend: SolidJS (`/home/a/projects/js/codex_manager/frontend/src`)
-- Backend runtime: Zig + WebUI (`/home/a/projects/js/codex_manager/src`)
-- Function bridge:
-  - `window.cm_rpc(...)` (provided by `/webui.js` in desktop and `--web` modes)
+- Manage multiple Codex accounts in one place
+- Switch active account instantly
+- Credits/usage checks via ChatGPT token flow (`/backend-api/wham/usage`)
+- Account buckets:
+  - active
+  - depleted
+  - frozen
+- Drag-and-drop reordering in desktop and web modes
+- Custom desktop title bar controls:
+  - minimize
+  - fullscreen toggle
+  - close
+  - double-click title bar to toggle fullscreen
+- Theme persistence (light/dark)
 
-## Build System
+## Tech Stack
 
-The Zig project is now root-level:
+- Frontend: SolidJS (`frontend/src`)
+- Backend: Zig (`src`, `main.zig`)
+- Runtime bridge: `window.cm_rpc(...)` and `window.webui.call(...)`
+- Build pipeline: Zig orchestrates frontend typecheck + Vite builds (`build.zig`)
 
-- `/home/a/projects/js/codex_manager/build.zig`
-- `/home/a/projects/js/codex_manager/build.zig.zon`
+## Requirements
 
-### Commands
+- Zig `0.15+`
+- Node.js `20+`
+- `npm`
+- `curl`
+- `codex` CLI
 
-Run app in dev mode:
+Linux desktop mode also requires GTK/WebKitGTK runtime libraries for WebView.
+
+## Dependency Matrix
+
+### Shared (all OS)
+
+| Type | Dependencies |
+|---|---|
+| Comptime (build-time) | Zig `0.15.2+`, Node.js `20+`, npm, frontend packages: `solid-js`, `vite`, `vite-plugin-solid`, `typescript` |
+| Runtime | `curl` in `PATH`, `codex` CLI in `PATH` |
+| Notes | `zig_webui` is vendored via `build.zig.zon` and built as a static Zig dependency (`enable_tls = false`) |
+
+### Linux
+
+| Type | Dependencies |
+|---|---|
+| Comptime (build-time) | Shared dependencies above; C compilation support via Zig toolchain |
+| Runtime (desktop mode `--desktop`) | `libgtk-3.so.0`, `libwebkit2gtk-4.1.so.0` (or `libwebkit2gtk-4.0.so.37`) and their distro-provided transitive libs |
+| Runtime (web mode `--web`) | A supported installed browser (default browser launch path) |
+| Notes | This project loads GTK/WebKit at runtime via `dlopen`, so missing desktop libs fail at runtime, not compile time |
+
+### macOS
+
+| Type | Dependencies |
+|---|---|
+| Comptime (build-time) | Shared dependencies above; Xcode Command Line Tools (clang + macOS SDK) for Objective-C/WebKit build path |
+| Runtime (desktop mode `--desktop`) | System frameworks: `Cocoa.framework`, `WebKit.framework` |
+| Runtime (web mode `--web`) | A default browser |
+| Notes | No GTK/WebKitGTK packages are required on macOS |
+
+### Windows
+
+| Type | Dependencies |
+|---|---|
+| Comptime (build-time) | Shared dependencies above; C/C++ build support and Windows SDK link libs (`ws2_32`, `ole32`, and ABI-specific system libs) |
+| Runtime (desktop mode `--desktop`) | Microsoft Edge WebView2 Runtime |
+| Runtime (web mode `--web`) | A default browser |
+| Notes | WebView2 headers are vendored by the `webui` dependency; no separate header package is required |
+
+## Development
+
+Run in default mode (web mode):
 
 ```bash
 zig build dev
 ```
 
-Default dev mode runs browser-hosted WebUI (`--web` behavior).
-
-Run app in web mode:
+Run explicitly in web mode:
 
 ```bash
 zig build dev -- --web
 ```
 
-Run desktop WebView mode explicitly:
+Run in desktop WebView mode:
 
 ```bash
 zig build dev -- --desktop
 ```
 
-Build/install release binary:
+## Build and Install
+
+Build/install optimized binary:
 
 ```bash
 zig build install -Doptimize=ReleaseFast
 ```
 
-Output binary:
+Binary output:
 
-- Linux/macOS: `/home/a/projects/js/codex_manager/zig-out/bin/codex-manager`
-- Windows: `/home/a/projects/js/codex_manager/zig-out/bin/codex-manager.exe`
+- Linux/macOS: `zig-out/bin/codex-manager`
+- Windows: `zig-out/bin/codex-manager.exe`
 
-Run built binary in web mode:
+Run installed binary:
 
 ```bash
 ./zig-out/bin/codex-manager --web
-```
-
-Run built binary in desktop mode:
-
-```bash
 ./zig-out/bin/codex-manager --desktop
 ```
 
-## Self-contained Binary
+## Testing
 
-`zig build install` compiles a single binary with frontend assets embedded at compile time:
-- web bundle: `frontend/dist-web/index.html`
-- desktop bundle: `frontend/dist-desktop/index.html`
+Run backend Zig tests:
 
-The runtime does not depend on shipping any external `dist` folder.
+```bash
+zig build test
+```
 
-## Requirements
+## Storage
 
-- Node.js 20+
-- Zig 0.15+
-- `curl` in PATH
-- `codex` CLI
+- Managed accounts: app local data directory, file `accounts.json`
+- UI bootstrap cache: app local data directory, file `bootstrap-state.json`
+- Theme setting: app local data directory, file `ui-theme.txt`
+- Active Codex auth target: `~/.codex/auth.json`
+
+## Troubleshooting
+
+- `WebUI RPC unavailable in this session`:
+  - Launch through the app (`zig build dev -- --web` or `zig build dev -- --desktop`)
+  - Open the app URL from the printed `127.0.0.1` address
+- Desktop WebView crashes on Linux:
+  - Ensure GTK/WebKitGTK packages are installed
+  - Try web mode (`--web`) if your system WebView stack is unstable
+- Window buttons do nothing:
+  - This can happen in plain browser mode
+  - Use desktop mode for native window controls
+
+## Notes
+
+- Frontend bundles are built into two targets:
+  - `dist-web`
+  - `dist-desktop`
+- The executable is self-contained for app logic and embedded frontend assets.

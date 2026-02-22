@@ -1035,6 +1035,7 @@ function App() {
   };
 
   const handleDragOverAccount = (event: DragEvent, bucket: AccountBucket, targetId: string) => {
+    event.stopPropagation();
     const draggedId = resolveDragId(event);
     if (!draggedId) {
       return;
