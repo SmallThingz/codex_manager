@@ -74,7 +74,7 @@ body.drag-select-lock * {
 .app-root {
   height: 100vh;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
@@ -86,78 +86,6 @@ body.drag-select-lock * {
   padding: 1rem 0 1.4rem;
   display: grid;
   gap: 1rem;
-}
-
-.window-bar {
-  height: 2.2rem;
-  width: 100%;
-  margin: 0;
-  border: 0;
-  background: var(--surface);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 0.4rem 0 0.7rem;
-  user-select: none;
-  cursor: grab;
-  -webkit-app-region: drag;
-  --webui-app-region: drag;
-  app-region: drag;
-}
-
-.window-title {
-  margin: 0;
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-soft);
-}
-
-.window-drag-area {
-  flex: 1;
-  min-width: 1rem;
-  height: 100%;
-  -webkit-app-region: drag;
-  --webui-app-region: drag;
-  app-region: drag;
-}
-
-.window-controls {
-  display: flex;
-  gap: 0.3rem;
-  cursor: default;
-  -webkit-app-region: no-drag;
-  --webui-app-region: no-drag;
-  app-region: no-drag;
-}
-
-.window-btn {
-  width: 1.7rem;
-  height: 1.45rem;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.window-btn svg {
-  width: 0.92rem;
-  height: 0.92rem;
-  stroke: currentColor;
-  stroke-width: 1.9;
-  fill: none;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.window-btn-close {
-  color: var(--danger);
-  border-color: var(--danger);
-}
-
-.window-btn-close:hover:enabled {
-  background: var(--danger);
-  color: #ffffff;
 }
 
 .topbar {
@@ -175,15 +103,6 @@ body.drag-select-lock * {
 
 .topbar-main {
   min-width: 0;
-}
-
-button,
-input,
-a,
-[role="button"] {
-  -webkit-app-region: no-drag;
-  --webui-app-region: no-drag;
-  app-region: no-drag;
 }
 
 .topbar h1 {

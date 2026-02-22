@@ -14,7 +14,7 @@ const APP_ID = "com.codex.manager";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
 const DEFAULT_BOOTSTRAP_STATE_JSON =
-    \\{"theme":null,"showWindowBar":false,"view":null,"usageById":{},"savedAt":0}
+    \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
 ;
 
 const IndexTemplate = struct {
@@ -22,12 +22,8 @@ const IndexTemplate = struct {
     suffix: []const u8,
 };
 
-var app_window: ?webui = null;
-var window_is_fullscreen: bool = false;
-var window_state_lock = std.Thread.Mutex{};
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
 var active_bundle: assets.Bundle = .web;
-var show_custom_window_bar = false;
 var templates_initialized = false;
 var index_template: ?IndexTemplate = null;
 
@@ -45,7 +41,6 @@ pub fn main() !void {
     }
 
     var window = webui.newWindow();
-    app_window = window;
     initIndexTemplates();
 
     webui.setConfig(.multi_client, true);
@@ -73,35 +68,16 @@ pub fn main() !void {
 
     if (force_web_mode) {
         active_bundle = .web;
-        show_custom_window_bar = false;
         std.debug.print("Codex Manager web mode URL: {s}\n", .{loopback_url});
         webui.openUrl(loopback_url_z);
     } else {
         // Default mode is desktop; if WebView dependencies are unavailable, fall back to browser.
         active_bundle = .desktop;
-        // Linux WebUI drag/minimize/maximize in frameless mode is unstable upstream.
-        // Keep native OS chrome there; use custom HTML chrome on other desktop OSes.
-        const use_custom_window_chrome = builtin.os.tag != .linux;
-        show_custom_window_bar = use_custom_window_chrome;
-        if (!use_custom_window_chrome) {
-            std.debug.print("Linux desktop: using native window chrome (frameless drag is unstable in current WebUI build)\n", .{});
-        }
-        if (use_custom_window_chrome) {
-            window.setFrameless(true);
-        }
         window.setCloseHandlerWv(cmWindowCloseHandler);
-
-        if (use_custom_window_chrome) {
-            _ = try window.bind("cm_window_minimize", cmWindowMinimize);
-            _ = try window.bind("cm_window_toggle_fullscreen", cmWindowToggleFullscreen);
-            _ = try window.bind("cm_window_is_fullscreen", cmWindowIsFullscreen);
-            _ = try window.bind("cm_window_close", cmWindowClose);
-        }
 
         std.debug.print("Codex Manager desktop URL: {s}\n", .{loopback_url});
         window.showWv(loopback_url_z) catch |err| {
             active_bundle = .web;
-            show_custom_window_bar = false;
             std.debug.print(
                 "Desktop WebView unavailable ({s}); falling back to browser mode at {s}\n",
                 .{ @errorName(err), loopback_url },
@@ -238,36 +214,26 @@ fn loadBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
     return normalized;
 }
 
-fn fallbackBootstrapStateJson(allocator: std.mem.Allocator, show_window_bar: bool) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"theme\":null,\"showWindowBar\":{s},\"view\":null,\"usageById\":{{}},\"savedAt\":0}}",
-        .{if (show_window_bar) "true" else "false"},
-    );
+fn fallbackBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
+    return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
 }
 
-fn makeDynamicIndexResponse(bundle: assets.Bundle) ?[]const u8 {
+fn makeDynamicIndexResponse(_: assets.Bundle) ?[]const u8 {
     const template = index_template orelse return null;
     const allocator = std.heap.c_allocator;
 
     const state_json = loadBootstrapStateJson(allocator) catch return null;
     defer allocator.free(state_json);
-    _ = bundle;
-    const show_window_bar = show_custom_window_bar;
 
     const injected_state_json = blk: {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, state_json, .{}) catch {
-            break :blk fallbackBootstrapStateJson(allocator, show_window_bar) catch return null;
+            break :blk fallbackBootstrapStateJson(allocator) catch return null;
         };
         defer parsed.deinit();
 
         switch (parsed.value) {
-            .object => |*obj| {
-                obj.put("showWindowBar", .{ .bool = show_window_bar }) catch {
-                    break :blk fallbackBootstrapStateJson(allocator, show_window_bar) catch return null;
-                };
-            },
-            else => break :blk fallbackBootstrapStateJson(allocator, show_window_bar) catch return null,
+            .object => {},
+            else => break :blk fallbackBootstrapStateJson(allocator) catch return null,
         }
 
         break :blk std.fmt.allocPrint(allocator, "{f}", .{
@@ -332,60 +298,6 @@ fn customFileHandler(filename: []const u8) ?[]const u8 {
 
     // Let WebUI handle internal endpoints such as websocket transport.
     return null;
-}
-
-fn sendOk(e: *webui.Event, value: anytype) void {
-    const allocator = std.heap.c_allocator;
-    const json = std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .ok = true, .value = value }, .{})}) catch {
-        e.returnString("{\"ok\":false,\"error\":\"internal serialization error\"}");
-        return;
-    };
-    defer allocator.free(json);
-
-    const json_z = allocator.dupeZ(u8, json) catch {
-        e.returnString("{\"ok\":false,\"error\":\"internal allocation error\"}");
-        return;
-    };
-    defer allocator.free(json_z);
-
-    e.returnString(json_z);
-}
-
-fn cmWindowMinimize(e: *webui.Event) void {
-    window_state_lock.lock();
-    defer window_state_lock.unlock();
-    if (app_window) |window| {
-        window.minimize();
-    }
-    sendOk(e, @as(?u8, null));
-}
-
-fn cmWindowToggleFullscreen(e: *webui.Event) void {
-    window_state_lock.lock();
-    defer window_state_lock.unlock();
-
-    if (app_window) |window| {
-        if (window_is_fullscreen) {
-            window.setKiosk(false);
-            window_is_fullscreen = false;
-        } else {
-            window.setKiosk(true);
-            window_is_fullscreen = true;
-        }
-    }
-
-    sendOk(e, window_is_fullscreen);
-}
-
-fn cmWindowIsFullscreen(e: *webui.Event) void {
-    window_state_lock.lock();
-    defer window_state_lock.unlock();
-    sendOk(e, window_is_fullscreen);
-}
-
-fn cmWindowClose(e: *webui.Event) void {
-    _ = e;
-    exitNow();
 }
 
 fn cmWindowCloseHandler(_: usize) bool {

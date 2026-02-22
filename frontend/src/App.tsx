@@ -34,98 +34,6 @@ const AUTO_ARCHIVE_ZERO_QUOTA = true;
 const AUTO_UNARCHIVE_NON_ZERO_QUOTA = true;
 const AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN = true;
 
-type BridgeResult<T> = {
-  ok: boolean;
-  value?: T;
-  error?: string;
-};
-
-const isDesktopBridgeRuntime = (): boolean => {
-  if (typeof window === "undefined") {
-    return false;
-  }
-
-  return typeof window.cm_window_close === "function" || typeof window.webui?.call === "function";
-};
-
-const runWindowAction = async <T,>(
-  actionNames: string[],
-  action: ((...args: never[]) => Promise<T> | T) | undefined,
-  ...args: unknown[]
-): Promise<T | null> => {
-  const parseBridgeResult = (raw: unknown): T | null => {
-    if (typeof raw === "string") {
-      const trimmed = raw.trim();
-      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-        let parsedJson: unknown;
-        try {
-          parsedJson = JSON.parse(raw);
-        } catch {
-          return raw as T;
-        }
-
-        if (parsedJson && typeof parsedJson === "object" && "ok" in (parsedJson as Record<string, unknown>)) {
-          const parsed = parsedJson as BridgeResult<T>;
-          if (!parsed.ok) {
-            throw new Error(parsed.error || "Backend bridge call failed.");
-          }
-          return (parsed.value ?? null) as T | null;
-        }
-      }
-      return raw as T;
-    }
-
-    if (raw && typeof raw === "object" && "ok" in (raw as Record<string, unknown>)) {
-      const parsed = raw as BridgeResult<T>;
-      if (!parsed.ok) {
-        throw new Error(parsed.error || "Backend bridge call failed.");
-      }
-      return (parsed.value ?? null) as T | null;
-    }
-
-    return (raw ?? null) as T | null;
-  };
-
-  let lastError: string | null = null;
-  if (typeof action === "function") {
-    try {
-      const directRaw = await action(...(args as never[]));
-      // For side-effect commands (close/minimize/toggle), many WebUI bindings return
-      // `undefined` even when they succeed. Treat that as success and do not re-issue
-      // the same action through fallback RPC (which causes lag/double-toggle).
-      if (directRaw === undefined) {
-        return null;
-      }
-      return parseBridgeResult(directRaw);
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  if (!isDesktopBridgeRuntime()) {
-    throw new Error(lastError || "Desktop window bridge is unavailable.");
-  }
-
-  const webuiCall = window.webui?.call;
-  if (typeof webuiCall !== "function") {
-    throw new Error(lastError || "WebUI call bridge is unavailable.");
-  }
-
-  for (const name of actionNames) {
-    try {
-      const raw = await webuiCall(name, ...args);
-      return parseBridgeResult(raw);
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  throw new Error(lastError || `Window action failed: ${actionNames.join(", ")}`);
-};
-
-const windowFullscreenGetter = () => window.cm_window_is_fullscreen;
-const windowFullscreenToggler = () => window.cm_window_toggle_fullscreen;
-
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
 const formatEpoch = (epoch: number | null | undefined): string => {
@@ -346,28 +254,8 @@ const IconClose = () => (
   </svg>
 );
 
-const IconMinimize = () => (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M5 12h14" />
-  </svg>
-);
-
-const IconMaximize = () => (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <rect x="5" y="5" width="14" height="14" />
-  </svg>
-);
-
-const IconRestore = () => (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M8 8h11v11H8z" />
-    <path d="M5 5h11v3" />
-  </svg>
-);
-
 function App() {
   const embeddedState = getEmbeddedBootstrapState();
-  const showDesktopTopBar = embeddedState?.showWindowBar ?? false;
   const hasEmbeddedState =
     Boolean(embeddedState?.view) || Boolean(embeddedState && Object.keys(embeddedState.usageById).length > 0);
 
@@ -376,7 +264,6 @@ function App() {
   const [browserStart, setBrowserStart] = createSignal<BrowserLoginStart | null>(null);
   const [apiKeyDraft, setApiKeyDraft] = createSignal("");
   const [theme, setTheme] = createSignal<Theme>(embeddedState?.theme === "dark" ? "dark" : "light");
-  const [fullscreen, setFullscreen] = createSignal(false);
   const [addMenuOpen, setAddMenuOpen] = createSignal(false);
   const [isListeningForCallback, setIsListeningForCallback] = createSignal(false);
   const [showDepleted, setShowDepleted] = createSignal(false);
@@ -490,7 +377,6 @@ function App() {
 
       void saveEmbeddedBootstrapState({
         theme: theme(),
-        showWindowBar: showDesktopTopBar,
         autoArchiveZeroQuota: AUTO_ARCHIVE_ZERO_QUOTA,
         autoUnarchiveNonZeroQuota: AUTO_UNARCHIVE_NON_ZERO_QUOTA,
         autoSwitchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
@@ -1311,61 +1197,6 @@ function App() {
     setNotice("Account removed.");
   };
 
-  const refreshWindowState = async () => {
-    try {
-      const status = await runWindowAction<boolean>(
-        ["cm_window_is_fullscreen"],
-        windowFullscreenGetter(),
-      );
-      setFullscreen(Boolean(status));
-    } catch {
-      setFullscreen(false);
-    }
-  };
-
-  const handleMinimize = async () => {
-    try {
-      await runWindowAction(["cm_window_minimize"], window.cm_window_minimize);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setError(`Minimize failed: ${message}`);
-    }
-  };
-
-  const handleToggleFullscreen = async () => {
-    try {
-      await runWindowAction<boolean>(
-        ["cm_window_toggle_fullscreen"],
-        windowFullscreenToggler(),
-      );
-      const status = await runWindowAction<boolean>(
-        ["cm_window_is_fullscreen"],
-        windowFullscreenGetter(),
-      );
-      setFullscreen(Boolean(status));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setError(`Fullscreen toggle failed: ${message}`);
-    }
-  };
-
-  const handleCloseWindow = async () => {
-    try {
-      await runWindowAction(["cm_window_close"], window.cm_window_close);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setError(`Close failed: ${message}`);
-    }
-  };
-
-  const handleTitleBarDoubleClick = async (event: MouseEvent) => {
-    const target = event.target as HTMLElement | null;
-    if (target?.closest(".window-controls")) {
-      return;
-    }
-    await handleToggleFullscreen();
-  };
-
   const toggleTheme = () => {
     const nextTheme: Theme = theme() === "light" ? "dark" : "light";
     setTheme(nextTheme);
@@ -1418,7 +1249,7 @@ function App() {
     });
 
     try {
-      await Promise.all([refreshWindowState(), refreshAccounts(true)]);
+      await refreshAccounts(true);
     } finally {
       setInitializing(false);
     }
@@ -1426,43 +1257,6 @@ function App() {
 
   return (
     <div class="app-root">
-      <Show when={showDesktopTopBar}>
-        <header class="window-bar reveal" onDblClick={(event) => void handleTitleBarDoubleClick(event)}>
-          <div class="window-title mono">
-            Codex Account Manager
-          </div>
-          <div class="window-drag-area" />
-          <div class="window-controls">
-            <button
-              class="window-btn"
-              type="button"
-              onClick={handleMinimize}
-              aria-label="Minimize"
-            >
-              <IconMinimize />
-            </button>
-            <button
-              class="window-btn"
-              type="button"
-              onClick={handleToggleFullscreen}
-              aria-label="Toggle fullscreen"
-            >
-              <Show when={fullscreen()} fallback={<IconMaximize />}>
-                <IconRestore />
-              </Show>
-            </button>
-            <button
-              class="window-btn window-btn-close"
-              type="button"
-              onClick={handleCloseWindow}
-              aria-label="Close"
-            >
-              <IconClose />
-            </button>
-          </div>
-        </header>
-      </Show>
-
       <header class="topbar reveal">
         <div class="topbar-main">
           <h1>Managed Accounts</h1>
