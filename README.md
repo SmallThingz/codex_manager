@@ -109,20 +109,49 @@ Build release binaries for all supported targets:
 zig build build-all-targets
 ```
 
-Artifacts are written to `zig-out/bin/` as `codex-manager-<os>-<arch>`.
+Artifacts are written to `zig-out/bin/` as `codex-manager-<os>-<arch>` (Windows ends with `.exe`).
+This step runs target builds in parallel and performs the frontend npm build once.
 
 Target set depends on host OS:
-- Linux host: Linux + Windows targets
+- Linux host: Linux + Windows targets, plus macOS when an SDK is configured or auto-download is enabled
 - macOS host: macOS targets
 - Windows host: Windows targets
 
-To include macOS cross-builds from Linux, provide a macOS SDK path:
+macOS SDK auto-download is supported for matrix builds when explicitly enabled.
+
+To explicitly set SDK path:
 
 ```bash
-MACOS_SDK_ROOT=/path/to/MacOSX.sdk zig build build-all-targets
+zig build build-all-targets -Dmacos_sdk=/path/to/MacOSX.sdk
 ```
 
 This is required because `zig-webui` links macOS frameworks (`Cocoa`, `WebKit`) for macOS targets.
+`MACOS_SDK_ROOT=/path/to/MacOSX.sdk` is also supported as an environment variable.
+
+To disable automatic SDK download:
+
+```bash
+zig build build-all-targets -Dmacos_sdk_auto_download=false
+```
+
+To override SDK download URL:
+
+```bash
+zig build build-all-targets -Dmacos_sdk_url=https://example.com/MacOSX.sdk.tar.xz
+```
+
+To enable automatic SDK download:
+
+```bash
+zig build build-all-targets -Dmacos_sdk_auto_download=true
+```
+
+You can also cross-compile a single macOS target directly:
+
+```bash
+zig build install -Dtarget=aarch64-macos -Doptimize=ReleaseSafe --sysroot /path/to/MacOSX.sdk
+zig build install -Dtarget=x86_64-macos -Doptimize=ReleaseSafe --sysroot /path/to/MacOSX.sdk
+```
 
 Binary output:
 

@@ -22,23 +22,16 @@ const IndexTemplate = struct {
     suffix: []const u8,
 };
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var app_window: ?webui = null;
 var window_is_fullscreen: bool = false;
+var window_state_lock = std.Thread.Mutex{};
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
 var active_bundle: assets.Bundle = .web;
 var templates_initialized = false;
 var index_template: ?IndexTemplate = null;
 
 pub fn main() !void {
-    defer {
-        const deinit_status = gpa.deinit();
-        if (deinit_status == .leak) {
-            @panic("memory leak detected");
-        }
-    }
-
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -56,14 +49,14 @@ pub fn main() !void {
 
     webui.setConfig(.multi_client, true);
     webui.setConfig(.use_cookies, true);
-    // WebUI 2.5 beta can race in websocket event cleanup under concurrent callbacks.
-    // Force serialized event handling to avoid heap corruption/crashes.
-    webui.setConfig(.ui_event_blocking, true);
+    // Allow concurrent RPC handling; long-running operations (OAuth listener)
+    // must not block unrelated commands such as credits refresh.
+    webui.setConfig(.ui_event_blocking, false);
 
     // Keep browser/profile storage persistent across runs (theme, local state).
     window.setProfile("codex-manager", ".codex-manager-profile");
     window.setSize(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-    window.setEventBlocking(true);
+    window.setEventBlocking(false);
 
     _ = try window.bind("cm_rpc", cmRpc);
 
@@ -125,7 +118,7 @@ fn toLoopbackUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
 }
 
 fn cmRpc(e: *webui.Event) void {
-    rpc_webui.handleRpcEvent(e, gpa.allocator(), &oauth_listener_cancel);
+    rpc_webui.handleRpcEvent(e, std.heap.c_allocator, &oauth_listener_cancel);
 }
 
 fn initIndexTemplates() void {
@@ -241,7 +234,7 @@ fn fallbackBootstrapStateJson(allocator: std.mem.Allocator, show_window_bar: boo
 
 fn makeDynamicIndexResponse(bundle: assets.Bundle) ?[]const u8 {
     const template = index_template orelse return null;
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
 
     const state_json = loadBootstrapStateJson(allocator) catch return null;
     defer allocator.free(state_json);
@@ -290,7 +283,7 @@ fn toWebUiManaged(bytes: []const u8) ?[]const u8 {
 }
 
 fn makeHttpResponse(status: []const u8, content_type: []const u8, body: []const u8) ?[]const u8 {
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
     const header = std.fmt.allocPrint(
         allocator,
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
@@ -327,7 +320,7 @@ fn customFileHandler(filename: []const u8) ?[]const u8 {
 }
 
 fn sendOk(e: *webui.Event, value: anytype) void {
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
     const json = std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .ok = true, .value = value }, .{})}) catch {
         e.returnString("{\"ok\":false,\"error\":\"internal serialization error\"}");
         return;
@@ -344,6 +337,8 @@ fn sendOk(e: *webui.Event, value: anytype) void {
 }
 
 fn cmWindowMinimize(e: *webui.Event) void {
+    window_state_lock.lock();
+    defer window_state_lock.unlock();
     if (app_window) |window| {
         window.minimize();
     }
@@ -351,6 +346,9 @@ fn cmWindowMinimize(e: *webui.Event) void {
 }
 
 fn cmWindowToggleFullscreen(e: *webui.Event) void {
+    window_state_lock.lock();
+    defer window_state_lock.unlock();
+
     if (app_window) |window| {
         if (window_is_fullscreen) {
             window.setKiosk(false);
@@ -365,6 +363,8 @@ fn cmWindowToggleFullscreen(e: *webui.Event) void {
 }
 
 fn cmWindowIsFullscreen(e: *webui.Event) void {
+    window_state_lock.lock();
+    defer window_state_lock.unlock();
     sendOk(e, window_is_fullscreen);
 }
 

@@ -89,6 +89,9 @@ const UsageResult = struct {
     body: []const u8,
 };
 
+var oauth_listener_lock = std.Thread.Mutex{};
+var oauth_listener_running = false;
+
 pub fn handleRpcText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     return rpcFromText(allocator, request_text, cancel_ptr);
 }
@@ -432,6 +435,20 @@ fn waitForOAuthCallback(
     timeout_seconds: u64,
     cancel_ptr: *std.atomic.Value(bool),
 ) ![]u8 {
+    oauth_listener_lock.lock();
+    if (oauth_listener_running) {
+        oauth_listener_lock.unlock();
+        return error.CallbackListenerAlreadyRunning;
+    }
+    oauth_listener_running = true;
+    oauth_listener_lock.unlock();
+    defer {
+        oauth_listener_lock.lock();
+        oauth_listener_running = false;
+        oauth_listener_lock.unlock();
+        cancel_ptr.store(false, .seq_cst);
+    }
+
     cancel_ptr.store(false, .seq_cst);
 
     const address = try std.net.Address.parseIp4("127.0.0.1", 1455);
@@ -441,19 +458,39 @@ fn waitForOAuthCallback(
     });
     defer server.deinit();
 
-    var remaining_ms: i64 = @intCast(timeout_seconds * 1000);
+    const timeout_ms_total_u64 = timeout_seconds * 1000;
+    const timeout_ms_total_i64 = std.math.cast(i64, timeout_ms_total_u64) orelse std.math.maxInt(i64);
+    const deadline_ms = std.time.milliTimestamp() + timeout_ms_total_i64;
 
-    accept_loop: while (remaining_ms > 0) {
+    accept_loop: while (true) {
         if (cancel_ptr.load(.seq_cst)) {
             return error.CallbackListenerStopped;
         }
 
-        const connection = server.accept() catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-                remaining_ms -= 100;
-                continue;
+        const accept_timeout_ms = computePollTimeoutMs(deadline_ms);
+        if (accept_timeout_ms < 0) {
+            return error.CallbackListenerTimeout;
+        }
+
+        var accept_fds = [_]std.posix.pollfd{
+            .{
+                .fd = server.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
             },
+        };
+
+        const accept_ready = try std.posix.poll(&accept_fds, accept_timeout_ms);
+        if (accept_ready == 0) {
+            continue;
+        }
+
+        if ((accept_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+            return error.CallbackListenerSocketError;
+        }
+
+        const connection = server.accept() catch |err| switch (err) {
+            error.WouldBlock => continue,
             else => return err,
         };
 
@@ -461,17 +498,35 @@ fn waitForOAuthCallback(
         defer conn.stream.close();
 
         var buffer: [8192]u8 = undefined;
-        while (remaining_ms > 0) {
+        while (true) {
             if (cancel_ptr.load(.seq_cst)) {
                 return error.CallbackListenerStopped;
             }
 
-            const read_size = conn.stream.read(&buffer) catch |err| switch (err) {
-                error.WouldBlock => {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
-                    remaining_ms -= 10;
-                    continue;
+            const read_timeout_ms = computePollTimeoutMs(deadline_ms);
+            if (read_timeout_ms < 0) {
+                return error.CallbackListenerTimeout;
+            }
+
+            var read_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = conn.stream.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
                 },
+            };
+
+            const read_ready = try std.posix.poll(&read_fds, read_timeout_ms);
+            if (read_ready == 0) {
+                continue;
+            }
+
+            if ((read_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) {
+                continue :accept_loop;
+            }
+
+            const read_size = conn.stream.read(&buffer) catch |err| switch (err) {
+                error.WouldBlock => continue,
                 else => continue :accept_loop,
             };
             if (read_size == 0) {
@@ -495,8 +550,18 @@ fn waitForOAuthCallback(
             continue :accept_loop;
         }
     }
+}
 
-    return error.CallbackListenerTimeout;
+fn computePollTimeoutMs(deadline_ms: i64) i32 {
+    const now = std.time.milliTimestamp();
+    if (now >= deadline_ms) {
+        return -1;
+    }
+
+    const remaining = deadline_ms - now;
+    const slice_ms: i64 = 250;
+    const next = @min(remaining, slice_ms);
+    return @intCast(next);
 }
 
 pub fn openUrl(url: []const u8, allocator: std.mem.Allocator) !void {

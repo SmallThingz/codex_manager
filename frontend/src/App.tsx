@@ -457,6 +457,13 @@ function App() {
   const nonFrozenAccountIds = (nextView: AccountsView): string[] =>
     nextView.accounts.filter((account) => !account.frozen).map((account) => account.id);
 
+  const newlyAddedAccountIds = (previousView: AccountsView | null, nextView: AccountsView): string[] => {
+    const previousIds = new Set((previousView?.accounts ?? []).map((account) => account.id));
+    return nextView.accounts
+      .filter((account) => !previousIds.has(account.id))
+      .map((account) => account.id);
+  };
+
   const normalizedCreditsCache = (): Record<string, CreditsInfo> => {
     const current = creditsById();
     const next: Record<string, CreditsInfo> = {};
@@ -774,6 +781,17 @@ function App() {
     setNotice("Depleted account credits refreshed.");
   };
 
+  const handleRefreshFrozenCredits = async () => {
+    const ids = frozenAccounts().map((account) => account.id);
+    if (ids.length === 0) {
+      setNotice("No frozen accounts to refresh.");
+      return;
+    }
+
+    await refreshCreditsForAccounts(ids);
+    setNotice("Frozen account credits refreshed.");
+  };
+
   const refreshAccounts = async (initialLoad = false) => {
     if (!initialLoad) {
       batch(() => {
@@ -833,6 +851,7 @@ function App() {
         return;
       }
 
+      const previousView = view();
       setViewState(login.view);
       setBrowserStart(null);
       setApiKeyDraft("");
@@ -841,7 +860,10 @@ function App() {
       }
       setNotice(login.output.length > 0 ? login.output : "ChatGPT login completed.");
 
-      await refreshCreditsForAccounts(quotaSyncAccountIds(login.view), { quiet: true });
+      const addedIds = newlyAddedAccountIds(previousView, login.view);
+      if (addedIds.length > 0) {
+        await refreshCreditsForAccounts(addedIds, { quiet: true });
+      }
     } catch (listenerError) {
       if (runId !== callbackListenRunId) {
         return;
@@ -901,6 +923,7 @@ function App() {
       return;
     }
 
+    const previousView = view();
     setViewState(login.view);
     setApiKeyDraft("");
     if (activeAccountIds(login.view).length > 0) {
@@ -908,7 +931,10 @@ function App() {
     }
     setNotice(login.output.length > 0 ? login.output : "API key login completed.");
 
-    await refreshCreditsForAccounts(quotaSyncAccountIds(login.view), { quiet: true });
+    const addedIds = newlyAddedAccountIds(previousView, login.view);
+    if (addedIds.length > 0) {
+      await refreshCreditsForAccounts(addedIds, { quiet: true });
+    }
   };
 
   const handleImportCurrent = async () => {
@@ -918,6 +944,7 @@ function App() {
       return;
     }
 
+    const previousView = view();
     setViewState(next);
     setApiKeyDraft("");
     if (activeAccountIds(next).length > 0) {
@@ -925,7 +952,10 @@ function App() {
     }
     setNotice("Imported active Codex auth into managed accounts.");
 
-    await refreshCreditsForAccounts(quotaSyncAccountIds(next), { quiet: true });
+    const addedIds = newlyAddedAccountIds(previousView, next);
+    if (addedIds.length > 0) {
+      await refreshCreditsForAccounts(addedIds, { quiet: true });
+    }
   };
 
   const handleSwitch = async (id: string) => {
@@ -1882,9 +1912,16 @@ function App() {
             <section class="panel panel-frozen reveal">
               <div class="section-head">
                 <h2>Frozen Accounts</h2>
-                <button type="button" onClick={handleToggleFrozenSection}>
-                  {showFrozen() ? "Hide" : "Show"}
-                </button>
+                <div class="section-actions">
+                  <Show when={frozenAccounts().length > 0}>
+                    <button type="button" onClick={handleRefreshFrozenCredits}>
+                      Refresh Frozen
+                    </button>
+                  </Show>
+                  <button type="button" onClick={handleToggleFrozenSection}>
+                    {showFrozen() ? "Hide" : "Show"}
+                  </button>
+                </div>
               </div>
 
               <Show when={showFrozen()}>
@@ -1910,57 +1947,89 @@ function App() {
                     onDrop={(event) => void handleDropOnBucket(event, "frozen")}
                   >
                     <For each={frozenAccounts()}>
-                      {(account) => (
-                        <article
-                          class={`account account-frozen archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
-                            isDropBefore("frozen", account.id) ? "drop-before" : ""
-                          }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
-                          draggable={true}
-                          onDragStart={(event) => handleDragStart(event, account, "frozen")}
-                          onDragEnd={handleDragEnd}
-                          onDragOver={(event) => handleDragOverAccount(event, "frozen", account.id)}
-                          onDrop={(event) => void handleDropBeforeAccount(event, "frozen", account.id)}
-                        >
-                          <header class="account-head">
-                            <span class="icon-btn drag-handle" aria-hidden="true">
-                              <IconDragHandle />
-                            </span>
-                            <div class="account-main">
-                              <p class="account-title account-main-value">{accountTitle(account)}</p>
-                              <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
-                            </div>
-                          </header>
+                      {(account) => {
+                        const credits = () => creditsById()[account.id];
+                        const availablePercent = () => quotaRemainingPercent(credits());
 
-                          <div class="mini-grid">
-                            <div>
-                              <p class="label">Updated</p>
-                              <p class="mono">{formatEpoch(account.updatedAt)}</p>
-                            </div>
-                            <div>
-                              <p class="label">Last used</p>
-                              <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
-                            </div>
-                          </div>
+                        return (
+                          <article
+                            class={`account account-frozen archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
+                              isDropBefore("frozen", account.id) ? "drop-before" : ""
+                            }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
+                            draggable={true}
+                            onDragStart={(event) => handleDragStart(event, account, "frozen")}
+                            onDragEnd={handleDragEnd}
+                            onDragOver={(event) => handleDragOverAccount(event, "frozen", account.id)}
+                            onDrop={(event) => void handleDropBeforeAccount(event, "frozen", account.id)}
+                          >
+                            <header class="account-head">
+                              <span class="icon-btn drag-handle" aria-hidden="true">
+                                <IconDragHandle />
+                              </span>
+                              <div class="account-main">
+                                <p class="account-title account-main-value">{accountTitle(account)}</p>
+                                <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
+                              </div>
+                            </header>
 
-                          <div class="card-actions">
-                            <button type="button" class="switch-btn" onClick={() => void handleThaw(account.id)}>
-                              Activate
-                            </button>
+                            <div class="credit-bars">
+                              <div class="credit-bar-item">
+                                <div class="credit-bar-head">
+                                  <p class="label">Available</p>
+                                  <p class="mono credit-value align-right">{percentOrDash(availablePercent())}</p>
+                                </div>
+                                <div class="progress-track">
+                                  <div
+                                    class="progress-fill progress-available"
+                                    style={{ width: `${percentWidth(availablePercent())}%` }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
 
-                            <div class="icon-actions">
-                              <button
-                                type="button"
-                                class="icon-btn danger-icon"
-                                onClick={() => handleRemove(account.id)}
-                                aria-label="Delete account"
-                                title="Delete account"
-                              >
-                                <IconTrash />
+                            <div class="mini-grid">
+                              <div>
+                                <p class="label">Updated</p>
+                                <p class="mono">{formatEpoch(account.updatedAt)}</p>
+                              </div>
+                              <div>
+                                <p class="label">Last used</p>
+                                <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
+                              </div>
+                            </div>
+
+                            <div class="card-actions">
+                              <button type="button" class="switch-btn" onClick={() => void handleThaw(account.id)}>
+                                Activate
                               </button>
+
+                              <div class="icon-actions">
+                                <button
+                                  type="button"
+                                  class="icon-btn action"
+                                  onClick={() => refreshAccountCredits(account.id)}
+                                  disabled={Boolean(refreshingById()[account.id])}
+                                  aria-label="Refresh credits"
+                                  title="Refresh credits"
+                                >
+                                  <Show when={refreshingById()[account.id]} fallback={<IconRefresh />}>
+                                    <IconRefreshing />
+                                  </Show>
+                                </button>
+                                <button
+                                  type="button"
+                                  class="icon-btn danger-icon"
+                                  onClick={() => handleRemove(account.id)}
+                                  aria-label="Delete account"
+                                  title="Delete account"
+                                >
+                                  <IconTrash />
+                                </button>
+                              </div>
                             </div>
-                          </div>
-                        </article>
-                      )}
+                          </article>
+                        );
+                      }}
                     </For>
                   </div>
                 </Show>
