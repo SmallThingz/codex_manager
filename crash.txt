@@ -1,0 +1,32 @@
+~/projects/js/codex_manager ❯❯ zig build dev --
+vite v7.3.1 building client environment for production...
+✓ 8 modules transformed.
+dist/index.html       0.49 kB │ gzip:  0.33 kB
+dist/assets/app.css  14.24 kB │ gzip:  3.76 kB
+dist/assets/app.js   61.58 kB │ gzip: 19.05 kB
+✓ built in 453ms
+Codex Manager desktop URL: http://127.0.0.1:14555/index.html
+Segmentation fault at address 0x28
+???:?:?: 0x7fcd2a705a1e in ??? (libglib-2.0.so.0)
+Unwind information for `libglib-2.0.so.0:0x7fcd2a705a1e` was not available, trace may be incomplete
+
+???:?:?: 0x7fcd2acfc212 in ??? (libgtk-3.so.0)
+/home/a/.cache/zig/p/webui-2.5.0-beta.4-pxqD5Rb7NwBVEwKyEzxwKAprzUIYjN20Y_Wffl_SWVdg/src/webui.c:12173:17: 0x129553c in _webui_wv_set_position (/home/a/.cache/zig/p/webui-2.5.0-beta.4-pxqD5Rb7NwBVEwKyEzxwKAprzUIYjN20Y_Wffl_SWVdg/src/webui.c)
+                gtk_window_move(webView->gtk_win, webView->x, webView->y);
+                ^
+/home/a/.cache/zig/p/webui-2.5.0-beta.4-pxqD5Rb7NwBVEwKyEzxwKAprzUIYjN20Y_Wffl_SWVdg/src/webui.c:12669:25: 0x129497c in _webui_webview_thread (/home/a/.cache/zig/p/webui-2.5.0-beta.4-pxqD5Rb7NwBVEwKyEzxwKAprzUIYjN20Y_Wffl_SWVdg/src/webui.c)
+                        _webui_wv_set_position(win->webView, win->webView->x, win->webView->y);
+                        ^
+???:?:?: 0x7fcd2b3c9979 in ??? (libc.so.6)
+???:?:?: 0x7fcd2b44d2bb in ??? (libc.so.6)
+dev
+└─ run exe codex-manager failure
+error: the following command terminated unexpectedly:
+./.zig-cache/o/ac1f3594cb029bd37a71e0f582a44df6/codex-manager
+
+Build Summary: 7/9 steps succeeded; 1 failed
+dev transitive failure
+└─ run exe codex-manager failure
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/8d1b01c57edb2b5cd0be174e9e1fd3ce/build /home/a/.local/bin/zig /home/a/.local/lib/zig /home/a/projects/js/codex_manager .zig-cache /home/a/.cache/zig --seed 0xe4725bbb -Z17307fc56fbdf828 dev --

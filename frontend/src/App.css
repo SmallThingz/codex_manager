@@ -175,10 +175,6 @@ body.drag-select-lock * {
 
 .topbar-main {
   min-width: 0;
-  cursor: grab;
-  -webkit-app-region: drag;
-  --webui-app-region: drag;
-  app-region: drag;
 }
 
 button,

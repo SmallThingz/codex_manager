@@ -27,6 +27,7 @@ var window_is_fullscreen: bool = false;
 var window_state_lock = std.Thread.Mutex{};
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
 var active_bundle: assets.Bundle = .web;
+var show_custom_window_bar = false;
 var templates_initialized = false;
 var index_template: ?IndexTemplate = null;
 
@@ -72,22 +73,35 @@ pub fn main() !void {
 
     if (force_web_mode) {
         active_bundle = .web;
+        show_custom_window_bar = false;
         std.debug.print("Codex Manager web mode URL: {s}\n", .{loopback_url});
         webui.openUrl(loopback_url_z);
     } else {
         // Default mode is desktop; if WebView dependencies are unavailable, fall back to browser.
         active_bundle = .desktop;
-        window.setFrameless(true);
+        // Linux WebUI drag/minimize/maximize in frameless mode is unstable upstream.
+        // Keep native OS chrome there; use custom HTML chrome on other desktop OSes.
+        const use_custom_window_chrome = builtin.os.tag != .linux;
+        show_custom_window_bar = use_custom_window_chrome;
+        if (!use_custom_window_chrome) {
+            std.debug.print("Linux desktop: using native window chrome (frameless drag is unstable in current WebUI build)\n", .{});
+        }
+        if (use_custom_window_chrome) {
+            window.setFrameless(true);
+        }
         window.setCloseHandlerWv(cmWindowCloseHandler);
 
-        _ = try window.bind("cm_window_minimize", cmWindowMinimize);
-        _ = try window.bind("cm_window_toggle_fullscreen", cmWindowToggleFullscreen);
-        _ = try window.bind("cm_window_is_fullscreen", cmWindowIsFullscreen);
-        _ = try window.bind("cm_window_close", cmWindowClose);
+        if (use_custom_window_chrome) {
+            _ = try window.bind("cm_window_minimize", cmWindowMinimize);
+            _ = try window.bind("cm_window_toggle_fullscreen", cmWindowToggleFullscreen);
+            _ = try window.bind("cm_window_is_fullscreen", cmWindowIsFullscreen);
+            _ = try window.bind("cm_window_close", cmWindowClose);
+        }
 
         std.debug.print("Codex Manager desktop URL: {s}\n", .{loopback_url});
         window.showWv(loopback_url_z) catch |err| {
             active_bundle = .web;
+            show_custom_window_bar = false;
             std.debug.print(
                 "Desktop WebView unavailable ({s}); falling back to browser mode at {s}\n",
                 .{ @errorName(err), loopback_url },
@@ -238,7 +252,8 @@ fn makeDynamicIndexResponse(bundle: assets.Bundle) ?[]const u8 {
 
     const state_json = loadBootstrapStateJson(allocator) catch return null;
     defer allocator.free(state_json);
-    const show_window_bar = bundle == .desktop;
+    _ = bundle;
+    const show_window_bar = show_custom_window_bar;
 
     const injected_state_json = blk: {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, state_json, .{}) catch {
