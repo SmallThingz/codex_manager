@@ -1,13 +1,5 @@
 /// <reference types="vite/client" />
 
-interface ImportMetaEnv {
-  readonly VITE_SHOW_WINDOW_BAR?: string;
-}
-
-interface ImportMeta {
-  readonly env: ImportMetaEnv;
-}
-
 interface Window {
   __CM_BOOTSTRAP_STATE__?: string;
   cm_rpc?: (requestJson: string) => Promise<string> | string;

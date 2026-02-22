@@ -89,6 +89,7 @@ type Paths = {
 
 export type EmbeddedBootstrapState = {
   theme: "light" | "dark" | null;
+  showWindowBar: boolean;
   autoArchiveZeroQuota: boolean;
   autoUnarchiveNonZeroQuota: boolean;
   autoSwitchAwayFromArchived: boolean;
@@ -901,6 +902,7 @@ const asBootstrapState = (value: unknown): EmbeddedBootstrapState | null => {
 
   return {
     theme,
+    showWindowBar: valueAsBoolean(parsed.showWindowBar) ?? false,
     autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? legacyAutoArchiveEnabled,
     autoUnarchiveNonZeroQuota: valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? false,
     autoSwitchAwayFromArchived: valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? true,

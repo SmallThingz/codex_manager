@@ -14,7 +14,7 @@ const APP_ID = "com.codex.manager";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
 const DEFAULT_BOOTSTRAP_STATE_JSON =
-    \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
+    \\{"theme":null,"showWindowBar":false,"view":null,"usageById":{},"savedAt":0}
 ;
 
 const IndexTemplate = struct {
@@ -28,8 +28,7 @@ var window_is_fullscreen: bool = false;
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
 var active_bundle: assets.Bundle = .web;
 var templates_initialized = false;
-var web_index_template: ?IndexTemplate = null;
-var desktop_index_template: ?IndexTemplate = null;
+var index_template: ?IndexTemplate = null;
 
 pub fn main() !void {
     defer {
@@ -43,9 +42,9 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const web_mode = hasArg(args, "--web") and !hasArg(args, "--desktop");
+    const force_web_mode = hasArg(args, "--web") and !hasArg(args, "--desktop");
 
-    if (builtin.os.tag == .linux and !web_mode) {
+    if (builtin.os.tag == .linux and !force_web_mode) {
         // Work around flaky EGL/DMABUF paths on some Linux+WebKitGTK stacks.
         _ = c.setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 0);
         _ = c.setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 0);
@@ -55,7 +54,7 @@ pub fn main() !void {
     app_window = window;
     initIndexTemplates();
 
-    webui.setConfig(.multi_client, web_mode);
+    webui.setConfig(.multi_client, true);
     webui.setConfig(.use_cookies, true);
     // WebUI 2.5 beta can race in websocket event cleanup under concurrent callbacks.
     // Force serialized event handling to avoid heap corruption/crashes.
@@ -68,20 +67,22 @@ pub fn main() !void {
 
     _ = try window.bind("cm_rpc", cmRpc);
 
-    if (web_mode) {
-        active_bundle = .web;
-        window.setFileHandler(customFileHandler);
-        _ = window.setPort(14555) catch {};
+    // Serve app assets from a single embedded frontend bundle.
+    window.setFileHandler(customFileHandler);
+    _ = window.setPort(14555) catch {};
+    const url = try window.startServer("index.html");
+    const loopback_owned: ?[]const u8 = toLoopbackUrl(allocator, url) catch null;
+    const loopback_url = loopback_owned orelse url;
+    defer if (loopback_owned) |value| allocator.free(value);
+    const loopback_url_z = try allocator.dupeZ(u8, loopback_url);
+    defer allocator.free(loopback_url_z);
 
-        const url = try window.startServer("index.html");
-        const open_url_owned: ?[]const u8 = toLoopbackUrl(allocator, url) catch null;
-        const open_url = open_url_owned orelse url;
-        defer if (open_url_owned) |value| allocator.free(value);
-        const open_url_z = try allocator.dupeZ(u8, open_url);
-        defer allocator.free(open_url_z);
-        std.debug.print("Codex Manager web mode URL: {s}\n", .{open_url});
-        webui.openUrl(open_url_z);
+    if (force_web_mode) {
+        active_bundle = .web;
+        std.debug.print("Codex Manager web mode URL: {s}\n", .{loopback_url});
+        webui.openUrl(loopback_url_z);
     } else {
+        // Default mode is desktop; if WebView dependencies are unavailable, fall back to browser.
         active_bundle = .desktop;
         window.setFrameless(true);
         window.setCloseHandlerWv(cmWindowCloseHandler);
@@ -91,21 +92,14 @@ pub fn main() !void {
         _ = try window.bind("cm_window_is_fullscreen", cmWindowIsFullscreen);
         _ = try window.bind("cm_window_close", cmWindowClose);
 
-        // Avoid large inline HTML in showWv; serve desktop bundle over local WebUI server.
-        window.setFileHandler(customFileHandler);
-        const desktop_url = try window.startServer("index.html");
-        const desktop_loopback_owned: ?[]const u8 = toLoopbackUrl(allocator, desktop_url) catch null;
-        const desktop_loopback_url = desktop_loopback_owned orelse desktop_url;
-        defer if (desktop_loopback_owned) |value| allocator.free(value);
-        const desktop_loopback_z = try allocator.dupeZ(u8, desktop_loopback_url);
-        defer allocator.free(desktop_loopback_z);
-        std.debug.print("Codex Manager desktop URL: {s}\n", .{desktop_loopback_url});
-        window.showWv(desktop_loopback_z) catch |err| {
+        std.debug.print("Codex Manager desktop URL: {s}\n", .{loopback_url});
+        window.showWv(loopback_url_z) catch |err| {
+            active_bundle = .web;
             std.debug.print(
-                "Desktop WebView unavailable ({s}); falling back to browser window.\n",
-                .{@errorName(err)},
+                "Desktop WebView unavailable ({s}); falling back to browser mode at {s}\n",
+                .{ @errorName(err), loopback_url },
             );
-            webui.openUrl(desktop_loopback_z);
+            webui.openUrl(loopback_url_z);
         };
     }
 
@@ -140,12 +134,8 @@ fn initIndexTemplates() void {
     }
     templates_initialized = true;
 
-    if (assets.assetForPath("index.html", .web)) |asset| {
-        web_index_template = splitIndexTemplate(asset.body);
-    }
-
-    if (assets.assetForPath("index.html", .desktop)) |asset| {
-        desktop_index_template = splitIndexTemplate(asset.body);
+    if (assets.assetForPath("index.html")) |asset| {
+        index_template = splitIndexTemplate(asset.body);
     }
 }
 
@@ -241,24 +231,47 @@ fn loadBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
     return normalized;
 }
 
-fn indexTemplateForBundle(bundle: assets.Bundle) ?IndexTemplate {
-    return switch (bundle) {
-        .web => web_index_template,
-        .desktop => desktop_index_template,
-    };
+fn fallbackBootstrapStateJson(allocator: std.mem.Allocator, show_window_bar: bool) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"theme\":null,\"showWindowBar\":{s},\"view\":null,\"usageById\":{{}},\"savedAt\":0}}",
+        .{if (show_window_bar) "true" else "false"},
+    );
 }
 
 fn makeDynamicIndexResponse(bundle: assets.Bundle) ?[]const u8 {
-    const template = indexTemplateForBundle(bundle) orelse return null;
+    const template = index_template orelse return null;
     const allocator = gpa.allocator();
 
     const state_json = loadBootstrapStateJson(allocator) catch return null;
     defer allocator.free(state_json);
+    const show_window_bar = bundle == .desktop;
 
-    const encoded_len = std.base64.standard.Encoder.calcSize(state_json.len);
+    const injected_state_json = blk: {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, state_json, .{}) catch {
+            break :blk fallbackBootstrapStateJson(allocator, show_window_bar) catch return null;
+        };
+        defer parsed.deinit();
+
+        switch (parsed.value) {
+            .object => |*obj| {
+                obj.put("showWindowBar", .{ .bool = show_window_bar }) catch {
+                    break :blk fallbackBootstrapStateJson(allocator, show_window_bar) catch return null;
+                };
+            },
+            else => break :blk fallbackBootstrapStateJson(allocator, show_window_bar) catch return null,
+        }
+
+        break :blk std.fmt.allocPrint(allocator, "{f}", .{
+            std.json.fmt(parsed.value, .{}),
+        }) catch return null;
+    };
+    defer allocator.free(injected_state_json);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(injected_state_json.len);
     const encoded_state = allocator.alloc(u8, encoded_len) catch return null;
     defer allocator.free(encoded_state);
-    _ = std.base64.standard.Encoder.encode(encoded_state, state_json);
+    _ = std.base64.standard.Encoder.encode(encoded_state, injected_state_json);
 
     const html = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
         template.prefix,
@@ -300,7 +313,7 @@ fn customFileHandler(filename: []const u8) ?[]const u8 {
         }
     }
 
-    if (assets.assetForPath(path, active_bundle)) |asset| {
+    if (assets.assetForPath(path)) |asset| {
         return makeHttpResponse("200 OK", asset.content_type, asset.body);
     }
 

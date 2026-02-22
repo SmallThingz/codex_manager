@@ -77,7 +77,7 @@ Linux desktop mode also requires GTK/WebKitGTK runtime libraries for WebView.
 
 ## Development
 
-Run in default mode (web mode):
+Run in default mode (desktop mode, with automatic fallback to web mode if WebView is unavailable):
 
 ```bash
 zig build dev
@@ -109,7 +109,12 @@ Build release binaries for all supported targets:
 zig build build-all-targets
 ```
 
-Artifacts are written to `release/all-targets/<target>/`.
+Artifacts are written to `release/all-targets/` as `codex-manager-<os>-<arch>`.
+
+Target set depends on host OS:
+- Linux host: Linux + Windows targets
+- macOS host: macOS targets
+- Windows host: Windows targets
 
 Binary output:
 
@@ -152,7 +157,6 @@ zig build test
 
 ## Notes
 
-- Frontend bundles are built into two targets:
-  - `dist-web`
-  - `dist-desktop`
+- Frontend is built into a single embedded target:
+  - `dist`
 - The executable is self-contained for app logic and embedded frontend assets.

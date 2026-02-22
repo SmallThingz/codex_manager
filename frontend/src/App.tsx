@@ -28,7 +28,6 @@ import "./App.css";
 type CreditsByAccount = Record<string, CreditsInfo | undefined>;
 
 type Theme = "light" | "dark";
-const SHOW_DESKTOP_TOP_BAR = import.meta.env.VITE_SHOW_WINDOW_BAR !== "0";
 const QUOTA_EPSILON = 0.0001;
 const DRAG_SELECT_LOCK_CLASS = "drag-select-lock";
 const AUTO_ARCHIVE_ZERO_QUOTA = true;
@@ -368,6 +367,7 @@ const IconRestore = () => (
 
 function App() {
   const embeddedState = getEmbeddedBootstrapState();
+  const showDesktopTopBar = embeddedState?.showWindowBar ?? false;
   const hasEmbeddedState =
     Boolean(embeddedState?.view) || Boolean(embeddedState && Object.keys(embeddedState.usageById).length > 0);
 
@@ -483,6 +483,7 @@ function App() {
 
       void saveEmbeddedBootstrapState({
         theme: theme(),
+        showWindowBar: showDesktopTopBar,
         autoArchiveZeroQuota: AUTO_ARCHIVE_ZERO_QUOTA,
         autoUnarchiveNonZeroQuota: AUTO_UNARCHIVE_NON_ZERO_QUOTA,
         autoSwitchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
@@ -1395,7 +1396,7 @@ function App() {
 
   return (
     <div class="app-root">
-      <Show when={SHOW_DESKTOP_TOP_BAR}>
+      <Show when={showDesktopTopBar}>
         <header class="window-bar reveal" onDblClick={(event) => void handleTitleBarDoubleClick(event)}>
           <div class="window-title mono">
             Codex Account Manager
