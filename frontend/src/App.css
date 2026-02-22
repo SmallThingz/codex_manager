@@ -648,17 +648,16 @@ select {
 }
 
 .account-main-value {
-  user-select: text;
-  -webkit-user-select: text;
-  cursor: text;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .drag-handle {
   width: 2.25rem;
   height: 2.25rem;
   flex: 0 0 auto;
-  cursor: grab;
-  pointer-events: auto;
+  cursor: inherit;
+  pointer-events: none;
   user-select: none;
   -webkit-user-select: none;
   -moz-user-select: none;

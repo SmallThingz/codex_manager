@@ -89,10 +89,7 @@ pub fn main() !void {
         _ = try window.bind("cm_window_minimize", cmWindowMinimize);
         _ = try window.bind("cm_window_toggle_fullscreen", cmWindowToggleFullscreen);
         _ = try window.bind("cm_window_is_fullscreen", cmWindowIsFullscreen);
-        _ = try window.bind("cm_window_toggle_maximize", cmWindowToggleMaximize);
-        _ = try window.bind("cm_window_is_maximized", cmWindowIsMaximized);
         _ = try window.bind("cm_window_close", cmWindowClose);
-        _ = try window.bind("cm_window_start_drag", cmWindowStartDrag);
 
         // Avoid large inline HTML in showWv; serve desktop bundle over local WebUI server.
         window.setFileHandler(customFileHandler);
@@ -340,10 +337,6 @@ fn cmWindowMinimize(e: *webui.Event) void {
     sendOk(e, @as(?u8, null));
 }
 
-fn cmWindowToggleMaximize(e: *webui.Event) void {
-    cmWindowToggleFullscreen(e);
-}
-
 fn cmWindowToggleFullscreen(e: *webui.Event) void {
     if (app_window) |window| {
         if (window_is_fullscreen) {
@@ -358,10 +351,6 @@ fn cmWindowToggleFullscreen(e: *webui.Event) void {
     sendOk(e, window_is_fullscreen);
 }
 
-fn cmWindowIsMaximized(e: *webui.Event) void {
-    cmWindowIsFullscreen(e);
-}
-
 fn cmWindowIsFullscreen(e: *webui.Event) void {
     sendOk(e, window_is_fullscreen);
 }
@@ -369,11 +358,6 @@ fn cmWindowIsFullscreen(e: *webui.Event) void {
 fn cmWindowClose(e: *webui.Event) void {
     _ = e;
     exitNow();
-}
-
-fn cmWindowStartDrag(e: *webui.Event) void {
-    // Dragging is handled via CSS app-region in the frontend.
-    sendOk(e, @as(?u8, null));
 }
 
 fn cmWindowCloseHandler(_: usize) bool {

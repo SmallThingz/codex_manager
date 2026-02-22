@@ -124,9 +124,8 @@ const runWindowAction = async <T,>(
   throw new Error(lastError || `Window action failed: ${actionNames.join(", ")}`);
 };
 
-const windowFullscreenGetter = () => window.cm_window_is_fullscreen ?? window.cm_window_is_maximized;
-const windowFullscreenToggler = () =>
-  window.cm_window_toggle_fullscreen ?? window.cm_window_toggle_maximize;
+const windowFullscreenGetter = () => window.cm_window_is_fullscreen;
+const windowFullscreenToggler = () => window.cm_window_toggle_fullscreen;
 
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
@@ -288,13 +287,6 @@ const IconRefreshing = () => (
       <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
       <path d="M21 21v-5h-5" />
     </g>
-  </svg>
-);
-
-const IconArchive = () => (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M4 4h16v4H4zM5 8h14v11H5z" />
-    <path d="M10 12h4" />
   </svg>
 );
 
@@ -464,11 +456,7 @@ function App() {
 
     persistStateTimer = window.setTimeout(() => {
       persistStateTimer = undefined;
-
       const currentView = view();
-      if (!currentView) {
-        return;
-      }
 
       void saveEmbeddedBootstrapState({
         theme: theme(),
@@ -1019,8 +1007,10 @@ function App() {
   };
 
   const handleDragOverBucket = (event: DragEvent, bucket: AccountBucket) => {
+    allowDrop(event);
     const draggedId = resolveDragId(event);
     if (!draggedId) {
+      setDragHover(null);
       return;
     }
     if (!canDropInBucket(draggedId, bucket)) {
@@ -1030,14 +1020,15 @@ function App() {
       }
       return;
     }
-    allowDrop(event);
     setDragHoverTarget(bucket, null);
   };
 
   const handleDragOverAccount = (event: DragEvent, bucket: AccountBucket, targetId: string) => {
     event.stopPropagation();
+    allowDrop(event);
     const draggedId = resolveDragId(event);
     if (!draggedId) {
+      setDragHover(null);
       return;
     }
     if (!canDropInBucket(draggedId, bucket)) {
@@ -1047,7 +1038,6 @@ function App() {
       }
       return;
     }
-    allowDrop(event);
     if (draggedId === targetId) {
       setDragHoverTarget(bucket, null);
       return;
@@ -1081,11 +1071,40 @@ function App() {
     return element;
   };
 
-  const dragStartBlocked = (target: EventTarget | null): boolean => {
-    if (!(target instanceof Element)) {
+  const resolveEventElement = (target: EventTarget | null): Element | null => {
+    if (target instanceof Element) {
+      return target;
+    }
+    if (target instanceof Node) {
+      return target.parentElement;
+    }
+    return null;
+  };
+
+  const accountCopySelectionActive = (): boolean => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed) {
       return false;
     }
-    return Boolean(target.closest("button, input, select, textarea, a, .account-copyable, .account-main-value"));
+
+    const isCopyableNode = (node: Node | null): boolean => {
+      if (!node) {
+        return false;
+      }
+      const element = node instanceof Element ? node : node.parentElement;
+      return Boolean(element?.closest(".account-copyable, .account-main-value"));
+    };
+
+    return isCopyableNode(selection.anchorNode) || isCopyableNode(selection.focusNode);
+  };
+
+  const dragStartBlocked = (target: EventTarget | null): boolean => {
+    const element = resolveEventElement(target);
+    if (element?.closest("button, input, select, textarea, a, .account-copyable, .account-main-value")) {
+      return true;
+    }
+
+    return accountCopySelectionActive();
   };
 
   const handleDropOnBucket = async (event: DragEvent, bucket: AccountBucket) => {
@@ -1167,26 +1186,6 @@ function App() {
     }
   };
 
-  const handleDragHandlePointerDown = () => {
-    // Keep text from being selected while still allowing native drag events in browsers.
-    document.body.classList.add(DRAG_SELECT_LOCK_CLASS);
-  };
-
-  const handleArchive = async (id: string) => {
-    const next = await runAction("Moving account to depleted", () =>
-      archiveAccount(id, {
-        switchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
-      }),
-    );
-
-    if (!next) {
-      return;
-    }
-
-    setViewState(next);
-    setNotice("Account moved to depleted.");
-  };
-
   const handleFreeze = async (id: string) => {
     const targetIndex = frozenAccounts().filter((account) => account.id !== id).length;
     await moveAccountToBucket(id, "frozen", targetIndex);
@@ -1223,7 +1222,7 @@ function App() {
   const refreshWindowState = async () => {
     try {
       const status = await runWindowAction<boolean>(
-        ["cm_window_is_fullscreen", "cm_window_is_maximized"],
+        ["cm_window_is_fullscreen"],
         windowFullscreenGetter(),
       );
       setFullscreen(Boolean(status));
@@ -1244,11 +1243,11 @@ function App() {
   const handleToggleFullscreen = async () => {
     try {
       await runWindowAction<boolean>(
-        ["cm_window_toggle_fullscreen", "cm_window_toggle_maximize"],
+        ["cm_window_toggle_fullscreen"],
         windowFullscreenToggler(),
       );
       const status = await runWindowAction<boolean>(
-        ["cm_window_is_fullscreen", "cm_window_is_maximized"],
+        ["cm_window_is_fullscreen"],
         windowFullscreenGetter(),
       );
       setFullscreen(Boolean(status));
@@ -1285,7 +1284,7 @@ function App() {
 
   onMount(async () => {
     const fallbackTheme = localStorage.getItem("codex-manager-theme");
-    let initialTheme: Theme = fallbackTheme === "dark" ? "dark" : "light";
+    let initialTheme: Theme = embeddedState?.theme === "dark" ? "dark" : fallbackTheme === "dark" ? "dark" : "light";
     try {
       const bridgedTheme = await getSavedTheme();
       if (bridgedTheme) {
@@ -1525,14 +1524,14 @@ function App() {
                           } ${isDropBefore("active", account.id) ? "drop-before" : ""}${
                             draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""
                           }`}
-                          draggable
+                          draggable={true}
                           onDragStart={(event) => handleDragStart(event, account, "active")}
                           onDragEnd={handleDragEnd}
                           onDragOver={(event) => handleDragOverAccount(event, "active", account.id)}
                           onDrop={(event) => void handleDropBeforeAccount(event, "active", account.id)}
                         >
                           <header class="account-head">
-                            <span class="icon-btn drag-handle" aria-hidden="true" onPointerDown={handleDragHandlePointerDown}>
+                            <span class="icon-btn drag-handle" aria-hidden="true">
                               <IconDragHandle />
                             </span>
                             <div class="account-main">
@@ -1633,15 +1632,6 @@ function App() {
                               <button
                                 type="button"
                                 class="icon-btn action"
-                                onClick={() => handleArchive(account.id)}
-                                aria-label="Move to depleted"
-                                title="Move to depleted"
-                              >
-                                <IconArchive />
-                              </button>
-                              <button
-                                type="button"
-                                class="icon-btn action"
                                 onClick={() => void handleFreeze(account.id)}
                                 aria-label="Freeze account"
                                 title="Freeze account"
@@ -1713,14 +1703,14 @@ function App() {
                             class={`account account-depleted archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
                               isDropBefore("depleted", account.id) ? "drop-before" : ""
                             }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
-                            draggable
+                            draggable={true}
                             onDragStart={(event) => handleDragStart(event, account, "depleted")}
                             onDragEnd={handleDragEnd}
                             onDragOver={(event) => handleDragOverAccount(event, "depleted", account.id)}
                             onDrop={(event) => void handleDropBeforeAccount(event, "depleted", account.id)}
                           >
                             <header class="account-head">
-                              <span class="icon-btn drag-handle" aria-hidden="true" onPointerDown={handleDragHandlePointerDown}>
+                              <span class="icon-btn drag-handle" aria-hidden="true">
                                 <IconDragHandle />
                               </span>
                               <div class="account-main">
@@ -1858,14 +1848,14 @@ function App() {
                           class={`account account-frozen archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
                             isDropBefore("frozen", account.id) ? "drop-before" : ""
                           }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
-                          draggable
+                          draggable={true}
                           onDragStart={(event) => handleDragStart(event, account, "frozen")}
                           onDragEnd={handleDragEnd}
                           onDragOver={(event) => handleDragOverAccount(event, "frozen", account.id)}
                           onDrop={(event) => void handleDropBeforeAccount(event, "frozen", account.id)}
                         >
                           <header class="account-head">
-                            <span class="icon-btn drag-handle" aria-hidden="true" onPointerDown={handleDragHandlePointerDown}>
+                            <span class="icon-btn drag-handle" aria-hidden="true">
                               <IconDragHandle />
                             </span>
                             <div class="account-main">
@@ -1891,15 +1881,6 @@ function App() {
                             </button>
 
                             <div class="icon-actions">
-                              <button
-                                type="button"
-                                class="icon-btn action"
-                                onClick={() => handleArchive(account.id)}
-                                aria-label="Move to depleted"
-                                title="Move to depleted"
-                              >
-                                <IconArchive />
-                              </button>
                               <button
                                 type="button"
                                 class="icon-btn danger-icon"
