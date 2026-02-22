@@ -211,6 +211,59 @@ a,
   letter-spacing: 0.14em;
 }
 
+.boot-panel {
+  background: var(--surface);
+  display: grid;
+  gap: 0.9rem;
+}
+
+.boot-title {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.boot-pulse {
+  width: min(480px, 100%);
+  height: 0.44rem;
+  background: var(--progress-bg);
+  position: relative;
+  overflow: hidden;
+}
+
+.boot-pulse::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--line), transparent);
+  animation: boot-sweep 940ms linear infinite;
+}
+
+.boot-skeleton-grid {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+}
+
+.boot-skeleton-card {
+  height: 8.5rem;
+  background: var(--card);
+  border: 1px solid var(--line-soft);
+  position: relative;
+  overflow: hidden;
+}
+
+.boot-skeleton-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.12), transparent);
+  animation: boot-sweep 1.1s linear infinite;
+}
+
 .section-head {
   display: flex;
   justify-content: space-between;
@@ -315,6 +368,7 @@ input {
   padding: 0.9rem;
   display: grid;
   gap: 0.68rem;
+  contain: layout paint;
 }
 
 .account.active {
@@ -356,11 +410,8 @@ input {
 
 .mini-grid {
   display: grid;
-  gap: 0.52rem;
-}
-
-.mini-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.52rem;
 }
 
 .credit-bars {
@@ -545,6 +596,24 @@ input {
   }
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes boot-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal,
+  .icon-rotor,
+  .boot-pulse::after,
+  .boot-skeleton-card::after {
+    animation: none !important;
   }
 }
 

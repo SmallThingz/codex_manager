@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, batch, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import {
   archiveAccount,
   beginCodexLogin,
@@ -160,14 +160,6 @@ const applyTheme = (theme: Theme) => {
   localStorage.setItem("codex-manager-theme", theme);
 };
 
-const loadThemeFromBridge = async (): Promise<Theme | null> => {
-  return getSavedTheme();
-};
-
-const saveThemeToBridge = async (theme: Theme): Promise<void> => {
-  await saveTheme(theme);
-};
-
 const IconPlus = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M12 5v14M5 12h14" />
@@ -256,6 +248,7 @@ function App() {
   const [showArchived, setShowArchived] = createSignal(false);
   const [refreshingById, setRefreshingById] = createSignal<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = createSignal(false);
+  const [initializing, setInitializing] = createSignal(true);
   const [busy, setBusy] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
@@ -265,11 +258,24 @@ function App() {
 
   const activeAccounts = createMemo(() => view()?.accounts.filter((account) => !account.archived) || []);
   const archivedAccounts = createMemo(() => view()?.accounts.filter((account) => account.archived) || []);
+  const addMenuVisible = createMemo(
+    () => !initializing() && (addMenuOpen() || activeAccounts().length === 0),
+  );
+
+  type RefreshOptions = {
+    quiet?: boolean;
+    trackAll?: boolean;
+  };
+
+  const activeAccountIds = (nextView: AccountsView): string[] =>
+    nextView.accounts.filter((account) => !account.archived).map((account) => account.id);
 
   const runAction = async <T,>(message: string, action: () => Promise<T>): Promise<T | undefined> => {
-    setBusy(message);
-    setError(null);
-    setNotice(null);
+    batch(() => {
+      setBusy(message);
+      setError(null);
+      setNotice(null);
+    });
 
     try {
       return await action();
@@ -283,36 +289,59 @@ function App() {
   };
 
   const setViewState = (nextView: AccountsView) => {
-    setView(nextView);
+    batch(() => {
+      setView(nextView);
 
-    if (nextView.accounts.length === 0) {
-      setAddMenuOpen(true);
-    }
+      if (nextView.accounts.length === 0) {
+        setAddMenuOpen(true);
+      }
+    });
   };
 
   const markRefreshing = (accountIds: string[], refreshing: boolean) => {
     setRefreshingById((previous) => {
-      const next = { ...previous };
+      let changed = false;
+      let next: Record<string, boolean> | null = null;
+
       for (const id of accountIds) {
         if (refreshing) {
-          next[id] = true;
-        } else {
+          if (!previous[id]) {
+            next = next || { ...previous };
+            next[id] = true;
+            changed = true;
+          }
+        } else if (previous[id]) {
+          next = next || { ...previous };
           delete next[id];
+          changed = true;
         }
       }
-      return next;
+
+      return changed && next ? next : previous;
     });
   };
 
-  const refreshCreditsForAccounts = async (accountIds: string[]) => {
+  const refreshCreditsForAccounts = async (
+    accountIds: string[],
+    options: RefreshOptions = {},
+  ) => {
+    const quiet = options.quiet ?? false;
+    const trackAll = options.trackAll ?? false;
+
     if (accountIds.length === 0) {
       setCreditsById({});
       return;
     }
 
-    setBusy("Checking remaining credits");
-    setError(null);
-    setRefreshingAll(true);
+    if (!quiet) {
+      batch(() => {
+        setBusy("Checking remaining credits");
+        setError(null);
+      });
+    }
+    if (trackAll) {
+      setRefreshingAll(true);
+    }
     markRefreshing(accountIds, true);
 
     try {
@@ -330,28 +359,32 @@ function App() {
         return next;
       });
 
-      const failures = entries.filter((entry) => entry[1].status === "error");
-      if (failures.length > 0) {
-        const first = failures[0][1];
-        setError(`Credits check issue: ${first.message}`);
+      if (!quiet) {
+        const failures = entries.filter((entry) => entry[1].status === "error");
+        if (failures.length > 0) {
+          const first = failures[0][1];
+          setError(`Credits check issue: ${first.message}`);
+        }
       }
     } catch (creditsError) {
       const rendered = creditsError instanceof Error ? creditsError.message : String(creditsError);
       setError(rendered);
     } finally {
       markRefreshing(accountIds, false);
-      setRefreshingAll(false);
-      setBusy(null);
+      if (trackAll) {
+        setRefreshingAll(false);
+      }
+      if (!quiet) {
+        setBusy(null);
+      }
     }
   };
 
   const refreshAccountCredits = async (id: string) => {
     markRefreshing([id], true);
+    setError(null);
     try {
-      const credits = await runAction("Checking remaining credits", () => getRemainingCreditsForAccount(id));
-      if (!credits) {
-        return;
-      }
+      const credits = await getRemainingCreditsForAccount(id);
 
       setCreditsById((current) => ({
         ...current,
@@ -371,19 +404,33 @@ function App() {
 
   const handleRefreshAllCredits = async () => {
     const ids = activeAccounts().map((account) => account.id);
-    await refreshCreditsForAccounts(ids);
+    await refreshCreditsForAccounts(ids, { trackAll: true });
     setNotice("All credits refreshed.");
   };
 
-  const refreshAccounts = async () => {
-    const next = await runAction("Loading accounts", () => getAccounts());
-    if (!next) {
-      return;
+  const refreshAccounts = async (initialLoad = false) => {
+    if (!initialLoad) {
+      batch(() => {
+        setBusy("Loading accounts");
+        setError(null);
+        setNotice(null);
+      });
+    } else {
+      setError(null);
     }
 
-    setViewState(next);
-    const ids = next.accounts.filter((account) => !account.archived).map((account) => account.id);
-    await refreshCreditsForAccounts(ids);
+    try {
+      const next = await getAccounts();
+      setViewState(next);
+      await refreshCreditsForAccounts(activeAccountIds(next), { quiet: initialLoad });
+    } catch (actionError) {
+      const rendered = actionError instanceof Error ? actionError.message : String(actionError);
+      setError(rendered);
+    } finally {
+      if (!initialLoad) {
+        setBusy(null);
+      }
+    }
   };
 
   const handleAddChatgptStart = async () => {
@@ -421,13 +468,12 @@ function App() {
       setViewState(login.view);
       setBrowserStart(null);
       setApiKeyDraft("");
-      if (activeAccounts().length > 0) {
+      if (activeAccountIds(login.view).length > 0) {
         setAddMenuOpen(false);
       }
       setNotice(login.output.length > 0 ? login.output : "ChatGPT login completed.");
 
-      const ids = login.view.accounts.filter((account) => !account.archived).map((account) => account.id);
-      await refreshCreditsForAccounts(ids);
+      await refreshCreditsForAccounts(activeAccountIds(login.view), { quiet: true });
     } catch (listenerError) {
       if (runId !== callbackListenRunId) {
         return;
@@ -489,13 +535,12 @@ function App() {
 
     setViewState(login.view);
     setApiKeyDraft("");
-    if (activeAccounts().length > 0) {
+    if (activeAccountIds(login.view).length > 0) {
       setAddMenuOpen(false);
     }
     setNotice(login.output.length > 0 ? login.output : "API key login completed.");
 
-    const ids = login.view.accounts.filter((account) => !account.archived).map((account) => account.id);
-    await refreshCreditsForAccounts(ids);
+    await refreshCreditsForAccounts(activeAccountIds(login.view), { quiet: true });
   };
 
   const handleImportCurrent = async () => {
@@ -507,13 +552,12 @@ function App() {
 
     setViewState(next);
     setApiKeyDraft("");
-    if (activeAccounts().length > 0) {
+    if (activeAccountIds(next).length > 0) {
       setAddMenuOpen(false);
     }
     setNotice("Imported active Codex auth into managed accounts.");
 
-    const ids = next.accounts.filter((account) => !account.archived).map((account) => account.id);
-    await refreshCreditsForAccounts(ids);
+    await refreshCreditsForAccounts(activeAccountIds(next), { quiet: true });
   };
 
   const handleSwitch = async (id: string) => {
@@ -622,11 +666,11 @@ function App() {
     const nextTheme: Theme = theme() === "light" ? "dark" : "light";
     setTheme(nextTheme);
     applyTheme(nextTheme);
-    void saveThemeToBridge(nextTheme).catch(() => {});
+    void saveTheme(nextTheme).catch(() => {});
   };
 
   const closeAddMenu = () => {
-    if (activeAccounts().length === 0) {
+    if (initializing() || activeAccounts().length === 0) {
       return;
     }
 
@@ -637,7 +681,7 @@ function App() {
     const fallbackTheme = localStorage.getItem("codex-manager-theme");
     let initialTheme: Theme = fallbackTheme === "dark" ? "dark" : "light";
     try {
-      const bridgedTheme = await loadThemeFromBridge();
+      const bridgedTheme = await getSavedTheme();
       if (bridgedTheme) {
         initialTheme = bridgedTheme;
       }
@@ -646,10 +690,10 @@ function App() {
     }
     setTheme(initialTheme);
     applyTheme(initialTheme);
-    void saveThemeToBridge(initialTheme).catch(() => {});
+    void saveTheme(initialTheme).catch(() => {});
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (!addMenuOpen() || activeAccounts().length === 0) {
+      if (!addMenuVisible()) {
         return;
       }
 
@@ -670,8 +714,11 @@ function App() {
       window.removeEventListener("pointerdown", handlePointerDown);
     });
 
-    await refreshWindowState();
-    await refreshAccounts();
+    try {
+      await Promise.all([refreshWindowState(), refreshAccounts(true)]);
+    } finally {
+      setInitializing(false);
+    }
   });
 
   return (
@@ -732,6 +779,7 @@ function App() {
                 addButtonRef = element;
               }}
               type="button"
+              disabled={initializing()}
               onClick={() => setAddMenuOpen((open) => !open)}
               aria-label="Add account"
               title="Add account"
@@ -739,7 +787,7 @@ function App() {
               <IconPlus />
             </button>
 
-            <Show when={addMenuOpen() || activeAccounts().length === 0}>
+            <Show when={addMenuVisible()}>
               <div
                 class="context-menu reveal"
                 ref={(element) => {
@@ -748,7 +796,7 @@ function App() {
               >
                 <header class="context-head">
                   <p class="label">Add Account</p>
-                  <Show when={activeAccounts().length > 0}>
+                  <Show when={activeAccounts().length > 0 && !initializing()}>
                     <button
                       class="icon-btn"
                       type="button"
@@ -801,214 +849,234 @@ function App() {
       </header>
 
       <main class="content-scroll">
-      <div class="shell">
-      <Show when={error()}>{(message) => <section class="notice error reveal">{message()}</section>}</Show>
-      <Show when={notice()}>{(message) => <section class="notice reveal">{message()}</section>}</Show>
-      <Show when={busy()}>{(message) => <section class="notice reveal">{message()}</section>}</Show>
+        <div class="shell">
+          <Show when={error()}>{(message) => <section class="notice error reveal">{message()}</section>}</Show>
+          <Show when={notice() && !initializing()}>
+            {(message) => <section class="notice reveal">{message()}</section>}
+          </Show>
+          <Show when={busy() && !initializing()}>
+            {(message) => <section class="notice reveal">{message()}</section>}
+          </Show>
 
-      <section class="panel panel-accounts reveal">
-        <div class="section-head">
-          <h2>Managed Accounts</h2>
-          <Show when={activeAccounts().length > 0}>
-            <button
-              type="button"
-              onClick={handleRefreshAllCredits}
-              disabled={refreshingAll()}
-            >
-              Refresh All
-            </button>
+          <Show
+            when={!initializing()}
+            fallback={
+              <section class="panel boot-panel reveal">
+                <div class="boot-pulse" />
+                <p class="boot-title">Loading accounts</p>
+                <p class="mono muted">Syncing account state and remaining credits.</p>
+                <div class="boot-skeleton-grid" aria-hidden="true">
+                  <div class="boot-skeleton-card" />
+                  <div class="boot-skeleton-card" />
+                  <div class="boot-skeleton-card" />
+                </div>
+              </section>
+            }
+          >
+            <section class="panel panel-accounts reveal">
+              <div class="section-head">
+                <h2>Managed Accounts</h2>
+                <Show when={activeAccounts().length > 0}>
+                  <button
+                    type="button"
+                    onClick={handleRefreshAllCredits}
+                    disabled={refreshingAll()}
+                  >
+                    Refresh All
+                  </button>
+                </Show>
+              </div>
+
+              <Show
+                when={activeAccounts().length > 0}
+                fallback={
+                  <div class="empty-state">
+                    <p class="mono muted">No accounts yet.</p>
+                    <button type="button" onClick={() => setAddMenuOpen(true)}>
+                      Add Account
+                    </button>
+                  </div>
+                }
+              >
+                <div class="accounts-grid">
+                  <For each={activeAccounts()}>
+                    {(account) => {
+                      const credits = () => creditsById()[account.id];
+
+                      return (
+                        <article class={`account ${account.isActive ? "active" : ""}`}>
+                          <header class="account-head">
+                            <div>
+                              <p class="account-title">{accountTitle(account)}</p>
+                              <p class="mono muted">{account.email || account.accountId || account.id}</p>
+                            </div>
+                            <p class={`pill ${account.isActive ? "pill-active" : ""}`}>
+                              {account.isActive ? "ACTIVE" : "STANDBY"}
+                            </p>
+                          </header>
+
+                          <Show when={credits()?.isPaidPlan !== true}>
+                            <div class="credit-bars">
+                              <div class="credit-bar-item">
+                                <div class="credit-bar-head">
+                                  <p class="mono credit-value">
+                                    Available: {renderCreditValue(credits()?.available ?? null, credits())}
+                                  </p>
+                                  <p class="mono credit-value align-right">
+                                    Total: {renderCreditValue(credits()?.total ?? null, credits())}
+                                  </p>
+                                </div>
+                                <div class="progress-track">
+                                  <div
+                                    class="progress-fill progress-available"
+                                    style={{
+                                      width: `${percentFromCredits(credits())}%`,
+                                    }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          </Show>
+
+                          <Show when={credits()?.isPaidPlan}>
+                            <div class="rate-limits-grid">
+                              <div class="rate-limits-item">
+                                <div class="rate-limit-head">
+                                  <p class="label">Hourly Remaining</p>
+                                  <p class="mono">{percentOrDash(credits()?.hourlyRemainingPercent ?? null)}</p>
+                                </div>
+                                <div class="limit-track">
+                                  <div
+                                    class="limit-fill"
+                                    style={{ width: `${percentWidth(credits()?.hourlyRemainingPercent ?? null)}%` }}
+                                  />
+                                </div>
+                              </div>
+                              <div class="rate-limits-item">
+                                <div class="rate-limit-head">
+                                  <p class="label">Weekly Remaining</p>
+                                  <p class="mono">{percentOrDash(credits()?.weeklyRemainingPercent ?? null)}</p>
+                                </div>
+                                <div class="limit-track">
+                                  <div
+                                    class="limit-fill"
+                                    style={{ width: `${percentWidth(credits()?.weeklyRemainingPercent ?? null)}%` }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          </Show>
+
+                          <div class="mini-grid">
+                            <div>
+                              <p class="label">Updated</p>
+                              <p class="mono">{formatEpoch(account.updatedAt)}</p>
+                            </div>
+                            <div>
+                              <p class="label">Last used</p>
+                              <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
+                            </div>
+                          </div>
+
+                          <div class="card-actions">
+                            <button
+                              type="button"
+                              class="switch-btn"
+                              disabled={account.isActive}
+                              onClick={() => handleSwitch(account.id)}
+                            >
+                              {account.isActive ? "Current Account" : "Switch Account"}
+                            </button>
+
+                            <div class="icon-actions">
+                              <button
+                                type="button"
+                                class="icon-btn action"
+                                onClick={() => refreshAccountCredits(account.id)}
+                                disabled={Boolean(refreshingById()[account.id])}
+                                aria-label="Refresh credits"
+                                title="Refresh credits"
+                              >
+                                <Show when={refreshingById()[account.id]} fallback={<IconRefresh />}>
+                                  <IconRefreshing />
+                                </Show>
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn action"
+                                onClick={() => handleArchive(account.id)}
+                                aria-label="Archive account"
+                                title="Archive account"
+                              >
+                                <IconArchive />
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn danger-icon"
+                                onClick={() => handleRemove(account.id)}
+                                aria-label="Delete account"
+                                title="Delete account"
+                              >
+                                <IconTrash />
+                              </button>
+                            </div>
+                          </div>
+                        </article>
+                      );
+                    }}
+                  </For>
+                </div>
+              </Show>
+            </section>
+
+            <Show when={archivedAccounts().length > 0}>
+              <section class="panel panel-archived reveal">
+                <div class="section-head">
+                  <h2>Archived Accounts</h2>
+                  <button type="button" onClick={() => setShowArchived((value) => !value)}>
+                    {showArchived() ? "Hide" : "Show"}
+                  </button>
+                </div>
+
+                <Show when={showArchived()}>
+                  <div class="accounts-grid">
+                    <For each={archivedAccounts()}>
+                      {(account) => (
+                        <article class="account archived">
+                          <header class="account-head">
+                            <div>
+                              <p class="account-title">{accountTitle(account)}</p>
+                              <p class="mono muted">{account.email || account.accountId || account.id}</p>
+                            </div>
+                            <p class="pill">ARCHIVED</p>
+                          </header>
+
+                          <div class="card-actions">
+                            <button type="button" class="switch-btn" onClick={() => handleUnarchive(account.id)}>
+                              Restore
+                            </button>
+
+                            <div class="icon-actions">
+                              <button
+                                type="button"
+                                class="icon-btn danger-icon"
+                                onClick={() => handleRemove(account.id)}
+                                aria-label="Delete account"
+                                title="Delete account"
+                              >
+                                <IconTrash />
+                              </button>
+                            </div>
+                          </div>
+                        </article>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </section>
+            </Show>
           </Show>
         </div>
-
-        <Show
-          when={activeAccounts().length > 0}
-          fallback={
-            <div class="empty-state">
-              <p class="mono muted">No accounts yet.</p>
-              <button type="button" onClick={() => setAddMenuOpen(true)}>
-                Add Account
-              </button>
-            </div>
-          }
-        >
-          <div class="accounts-grid">
-            <For each={activeAccounts()}>
-              {(account) => {
-                const credits = () => creditsById()[account.id];
-
-                return (
-                  <article class={`account ${account.isActive ? "active" : ""}`}>
-                    <header class="account-head">
-                      <div>
-                        <p class="account-title">{accountTitle(account)}</p>
-                        <p class="mono muted">{account.email || account.accountId || account.id}</p>
-                      </div>
-                      <p class={`pill ${account.isActive ? "pill-active" : ""}`}>
-                        {account.isActive ? "ACTIVE" : "STANDBY"}
-                      </p>
-                    </header>
-
-                    <Show when={credits()?.isPaidPlan !== true}>
-                      <div class="credit-bars">
-                        <div class="credit-bar-item">
-                          <div class="credit-bar-head">
-                            <p class="mono credit-value">
-                              Available: {renderCreditValue(credits()?.available ?? null, credits())}
-                            </p>
-                            <p class="mono credit-value align-right">
-                              Total: {renderCreditValue(credits()?.total ?? null, credits())}
-                            </p>
-                          </div>
-                          <div class="progress-track">
-                            <div
-                              class="progress-fill progress-available"
-                              style={{
-                                width: `${percentFromCredits(credits())}%`,
-                              }}
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    </Show>
-
-                    <Show when={credits()?.isPaidPlan}>
-                      <div class="rate-limits-grid">
-                        <div class="rate-limits-item">
-                          <div class="rate-limit-head">
-                            <p class="label">Hourly Remaining</p>
-                            <p class="mono">{percentOrDash(credits()?.hourlyRemainingPercent ?? null)}</p>
-                          </div>
-                          <div class="limit-track">
-                            <div
-                              class="limit-fill"
-                              style={{ width: `${percentWidth(credits()?.hourlyRemainingPercent ?? null)}%` }}
-                            />
-                          </div>
-                        </div>
-                        <div class="rate-limits-item">
-                          <div class="rate-limit-head">
-                            <p class="label">Weekly Remaining</p>
-                            <p class="mono">{percentOrDash(credits()?.weeklyRemainingPercent ?? null)}</p>
-                          </div>
-                          <div class="limit-track">
-                            <div
-                              class="limit-fill"
-                              style={{ width: `${percentWidth(credits()?.weeklyRemainingPercent ?? null)}%` }}
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    </Show>
-
-                    <div class="mini-grid">
-                      <div>
-                        <p class="label">Updated</p>
-                        <p class="mono">{formatEpoch(account.updatedAt)}</p>
-                      </div>
-                      <div>
-                        <p class="label">Last used</p>
-                        <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
-                      </div>
-                    </div>
-
-                    <div class="card-actions">
-                      <button
-                        type="button"
-                        class="switch-btn"
-                        disabled={account.isActive}
-                        onClick={() => handleSwitch(account.id)}
-                      >
-                        {account.isActive ? "Current Account" : "Switch Account"}
-                      </button>
-
-                      <div class="icon-actions">
-                        <button
-                          type="button"
-                          class="icon-btn action"
-                          onClick={() => refreshAccountCredits(account.id)}
-                          disabled={Boolean(refreshingById()[account.id])}
-                          aria-label="Refresh credits"
-                          title="Refresh credits"
-                        >
-                          <Show when={refreshingById()[account.id]} fallback={<IconRefresh />}>
-                            <IconRefreshing />
-                          </Show>
-                        </button>
-                        <button
-                          type="button"
-                          class="icon-btn action"
-                          onClick={() => handleArchive(account.id)}
-                          aria-label="Archive account"
-                          title="Archive account"
-                        >
-                          <IconArchive />
-                        </button>
-                        <button
-                          type="button"
-                          class="icon-btn danger-icon"
-                          onClick={() => handleRemove(account.id)}
-                          aria-label="Delete account"
-                          title="Delete account"
-                        >
-                          <IconTrash />
-                        </button>
-                      </div>
-                    </div>
-                  </article>
-                );
-              }}
-            </For>
-          </div>
-        </Show>
-      </section>
-
-      <Show when={archivedAccounts().length > 0}>
-        <section class="panel panel-archived reveal">
-          <div class="section-head">
-            <h2>Archived Accounts</h2>
-            <button type="button" onClick={() => setShowArchived((value) => !value)}>
-              {showArchived() ? "Hide" : "Show"}
-            </button>
-          </div>
-
-          <Show when={showArchived()}>
-            <div class="accounts-grid">
-              <For each={archivedAccounts()}>
-                {(account) => (
-                  <article class="account archived">
-                    <header class="account-head">
-                      <div>
-                        <p class="account-title">{accountTitle(account)}</p>
-                        <p class="mono muted">{account.email || account.accountId || account.id}</p>
-                      </div>
-                      <p class="pill">ARCHIVED</p>
-                    </header>
-
-                    <div class="card-actions">
-                      <button type="button" class="switch-btn" onClick={() => handleUnarchive(account.id)}>
-                        Restore
-                      </button>
-
-                      <div class="icon-actions">
-                        <button
-                          type="button"
-                          class="icon-btn danger-icon"
-                          onClick={() => handleRemove(account.id)}
-                          aria-label="Delete account"
-                          title="Delete account"
-                        >
-                          <IconTrash />
-                        </button>
-                      </div>
-                    </div>
-                  </article>
-                )}
-              </For>
-            </div>
-          </Show>
-        </section>
-      </Show>
-      </div>
       </main>
     </div>
   );
