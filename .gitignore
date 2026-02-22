@@ -8,8 +8,14 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+frontend/node_modules
 dist
+frontend/dist-web
+frontend/dist-desktop
 dist-ssr
+release
+zig-out
+.zig-cache
 *.local
 
 # Editor directories and files

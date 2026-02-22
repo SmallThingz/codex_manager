@@ -1,8 +1,3 @@
-import { appLocalDataDir, homeDir, join } from "@tauri-apps/api/path";
-import { invoke } from "@tauri-apps/api/core";
-import { exists, mkdir, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import { openUrl } from "@tauri-apps/plugin-opener";
-
 const STORE_FILE = "accounts.json";
 const CODEX_DIR = ".codex";
 const AUTH_FILE = "auth.json";
@@ -108,6 +103,129 @@ type WhamUsageResponse = {
 
 let pathsPromise: Promise<Paths> | null = null;
 let pendingBrowserLogin: PendingBrowserLogin | null = null;
+
+type BackendApis = {
+  invoke: <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
+  appLocalDataDir: () => Promise<string>;
+  homeDir: () => Promise<string>;
+  join: (...paths: string[]) => Promise<string>;
+  exists: (path: string) => Promise<boolean>;
+  mkdir: (path: string, options?: { recursive?: boolean }) => Promise<void>;
+  readTextFile: (path: string) => Promise<string>;
+  writeTextFile: (path: string, contents: string) => Promise<void>;
+  openUrl: (url: string) => Promise<void>;
+};
+
+type BridgeResult<T> = {
+  ok: boolean;
+  value?: T;
+  error?: string;
+};
+
+let backendApisPromise: Promise<BackendApis> | null = null;
+
+type WebUiBridge = {
+  call?: (fn: string, ...args: unknown[]) => Promise<string> | string;
+};
+
+const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
+  const request = JSON.stringify({
+    op,
+    ...payload,
+  });
+
+  let lastBridgeError: string | null = null;
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 15000) {
+    if (typeof window.cm_rpc === "function") {
+      try {
+        const rawResponse = await window.cm_rpc(request);
+        const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
+        if (!parsed.ok) {
+          throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
+        }
+        return parsed.value as T;
+      } catch (error) {
+        lastBridgeError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    const webuiCall = (window as Window & { webui?: WebUiBridge }).webui?.call;
+    if (typeof webuiCall === "function") {
+      try {
+        const rawResponse = await webuiCall("cm_rpc", request);
+        const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
+        if (!parsed.ok) {
+          throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
+        }
+        return parsed.value as T;
+      } catch (error) {
+        lastBridgeError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 75);
+    });
+  }
+
+  const hasCmRpc = typeof window.cm_rpc === "function";
+  const hasWebUiObject = typeof (window as Window & { webui?: WebUiBridge }).webui !== "undefined";
+  const hasWebUiCall = typeof (window as Window & { webui?: WebUiBridge }).webui?.call === "function";
+
+  throw new Error(
+    [
+      `WebUI RPC unavailable in this session at ${window.location.origin}.`,
+      `has_cm_rpc=${String(hasCmRpc)}`,
+      `has_webui=${String(hasWebUiObject)}`,
+      `has_webui_call=${String(hasWebUiCall)}`,
+      `document_ready_state=${document.readyState}`,
+      lastBridgeError ? `last_bridge_error=${lastBridgeError}` : "last_bridge_error=none",
+    ].join(" "),
+  );
+};
+
+const loadBackendApis = async (): Promise<BackendApis> => {
+  if (!backendApisPromise) {
+    backendApisPromise = Promise.resolve({
+      invoke: async <T>(command: string, payload: Record<string, unknown> = {}) =>
+        callBridge<T>(`invoke:${command}`, payload),
+      appLocalDataDir: async () => callBridge<string>("path:app_local_data_dir"),
+      homeDir: async () => callBridge<string>("path:home_dir"),
+      join: async (...paths: string[]) => callBridge<string>("path:join", { paths }),
+      exists: async (path: string) => callBridge<boolean>("fs:exists", { path }),
+      mkdir: async (path: string, options?: { recursive?: boolean }) => {
+        await callBridge<null>("fs:mkdir", {
+          path,
+          recursive: Boolean(options?.recursive),
+        });
+      },
+      readTextFile: async (path: string) => callBridge<string>("fs:read_text", { path }),
+      writeTextFile: async (path: string, contents: string) => {
+        await callBridge<null>("fs:write_text", { path, contents });
+      },
+      openUrl: async (url: string) => {
+        await callBridge<null>("shell:open_url", { url });
+      },
+    });
+  }
+
+  return backendApisPromise;
+};
+
+export const getSavedTheme = async (): Promise<"light" | "dark" | null> => {
+  const value = await callBridge<string | null>("settings:get_theme");
+  if (value === "light" || value === "dark") {
+    return value;
+  }
+
+  return null;
+};
+
+export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
+  await callBridge<null>("settings:set_theme", { theme });
+};
 
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
@@ -538,7 +656,8 @@ const parseCallbackInput = (callbackInput: string): { code: string; state: strin
 };
 
 const waitForOAuthCallbackFromBrowser = async (): Promise<string> => {
-  const callbackUrl = await invoke<string>("wait_for_oauth_callback", {
+  const tauri = await loadBackendApis();
+  const callbackUrl = await tauri.invoke<string>("wait_for_oauth_callback", {
     timeoutSeconds: 180,
   });
 
@@ -554,16 +673,27 @@ const fetchWhamUsageViaTauri = async (
   accessToken: string,
   accountId: string | null,
 ): Promise<{ status: number; payload: Record<string, unknown> | null; rawBody: unknown }> => {
-  const response = await invoke<WhamUsageResponse>("fetch_wham_usage", {
+  const tauri = await loadBackendApis();
+  const response = await tauri.invoke<WhamUsageResponse>("fetch_wham_usage", {
     accessToken,
     accountId,
   });
 
-  const payload = asRecord(response.body);
+  const bodyCandidate =
+    typeof response.body === "string"
+      ? (() => {
+          try {
+            return JSON.parse(response.body);
+          } catch {
+            return response.body;
+          }
+        })()
+      : response.body;
+  const payload = asRecord(bodyCandidate);
   return {
     status: response.status,
     payload,
-    rawBody: response.body,
+    rawBody: bodyCandidate,
   };
 };
 
@@ -572,7 +702,8 @@ export const listenForCodexCallback = async (): Promise<string> => {
 };
 
 export const stopCodexCallbackListener = async (): Promise<void> => {
-  await invoke<boolean>("cancel_oauth_callback_listener");
+  const tauri = await loadBackendApis();
+  await tauri.invoke<boolean>("cancel_oauth_callback_listener");
 };
 
 const exchangeAuthorizationCode = async (
@@ -663,11 +794,12 @@ const buildChatgptAuthPayload = (tokens: TokenPair, apiKey: string | null): Reco
 const resolvePaths = async (): Promise<Paths> => {
   if (!pathsPromise) {
     pathsPromise = (async () => {
-      const home = await homeDir();
-      const codexHome = await join(home, CODEX_DIR);
-      const codexAuthPath = await join(codexHome, AUTH_FILE);
-      const storeDir = await appLocalDataDir();
-      const storePath = await join(storeDir, STORE_FILE);
+      const tauri = await loadBackendApis();
+      const home = await tauri.homeDir();
+      const codexHome = await tauri.join(home, CODEX_DIR);
+      const codexAuthPath = await tauri.join(codexHome, AUTH_FILE);
+      const storeDir = await tauri.appLocalDataDir();
+      const storePath = await tauri.join(storeDir, STORE_FILE);
 
       return {
         codexHome,
@@ -682,18 +814,20 @@ const resolvePaths = async (): Promise<Paths> => {
 };
 
 const readJsonFile = async <T>(path: string): Promise<T | null> => {
-  const fileExists = await exists(path);
+  const tauri = await loadBackendApis();
+  const fileExists = await tauri.exists(path);
   if (!fileExists) {
     return null;
   }
 
-  const raw = await readTextFile(path);
+  const raw = await tauri.readTextFile(path);
   return JSON.parse(raw) as T;
 };
 
 const writeJsonFile = async (path: string, value: unknown): Promise<void> => {
+  const tauri = await loadBackendApis();
   const text = JSON.stringify(value, null, 2);
-  await writeTextFile(path, text);
+  await tauri.writeTextFile(path, text);
 };
 
 const readAuthFile = async (): Promise<unknown> => {
@@ -709,7 +843,8 @@ const readAuthFile = async (): Promise<unknown> => {
 
 const writeAuthFile = async (auth: unknown): Promise<void> => {
   const paths = await resolvePaths();
-  await mkdir(paths.codexHome, { recursive: true });
+  const tauri = await loadBackendApis();
+  await tauri.mkdir(paths.codexHome, { recursive: true });
   await writeJsonFile(paths.codexAuthPath, auth);
 };
 
@@ -743,7 +878,8 @@ const sanitizeAccount = (value: unknown): ManagedAccount | null => {
 
 const readStore = async (): Promise<AccountsStore> => {
   const paths = await resolvePaths();
-  await mkdir(paths.storeDir, { recursive: true });
+  const tauri = await loadBackendApis();
+  await tauri.mkdir(paths.storeDir, { recursive: true });
 
   const store = await readJsonFile<AccountsStore>(paths.storePath);
   if (!store) {
@@ -768,7 +904,8 @@ const readStore = async (): Promise<AccountsStore> => {
 
 const writeStore = async (store: AccountsStore): Promise<void> => {
   const paths = await resolvePaths();
-  await mkdir(paths.storeDir, { recursive: true });
+  const tauri = await loadBackendApis();
+  await tauri.mkdir(paths.storeDir, { recursive: true });
   await writeJsonFile(paths.storePath, store);
 };
 
@@ -1193,7 +1330,8 @@ export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
     pending.state,
   );
 
-  await openUrl(authUrl);
+  const tauri = await loadBackendApis();
+  await tauri.openUrl(authUrl);
 
   return {
     authUrl,

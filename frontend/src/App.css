@@ -83,6 +83,7 @@ body {
   padding: 0 0.4rem 0 0.7rem;
   user-select: none;
   cursor: grab;
+  --webui-app-region: drag;
 }
 
 .window-title {
@@ -103,6 +104,7 @@ body {
   display: flex;
   gap: 0.3rem;
   cursor: default;
+  --webui-app-region: no-drag;
 }
 
 .window-btn {
@@ -150,6 +152,14 @@ body {
 .topbar-main {
   min-width: 0;
   cursor: grab;
+  --webui-app-region: drag;
+}
+
+button,
+input,
+a,
+[role="button"] {
+  --webui-app-region: no-drag;
 }
 
 .topbar h1 {

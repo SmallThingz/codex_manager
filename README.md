@@ -1,132 +1,79 @@
 # Codex Account Manager
 
-A Tauri + SolidJS desktop app to manage multiple Codex accounts and switch between them instantly.
+Codex Account Manager is a SolidJS frontend with a Zig backend powered by [zig-webui](https://github.com/webui-dev/zig-webui).
 
-## What It Does
+It manages multiple Codex accounts, switches active `~/.codex/auth.json` on the fly, and checks per-account credits.
 
-- Manages multiple Codex identities in one place.
-- Switches the active account by writing the selected auth payload to `~/.codex/auth.json`.
-- Supports ChatGPT OAuth login flow and API key accounts.
-- Lets you start browser login, then listen/stop listening for OAuth callback.
-- Imports the currently active Codex CLI auth into the managed list.
-- Archives/unarchives/removes accounts.
-- Shows per-account usage/credits status.
+## Architecture
 
-## UI Highlights
+- Frontend: SolidJS (`/home/a/projects/js/codex_manager/frontend/src`)
+- Backend runtime: Zig + WebUI (`/home/a/projects/js/codex_manager/src`)
+- Function bridge:
+  - `window.cm_rpc(...)` (provided by `/webui.js` in desktop and `--web` modes)
 
-- Minimal monochrome design with light/dark theme toggle.
-- Custom window titlebar (minimize/fullscreen/close + drag support).
-- Account cards in responsive columns.
-- Add-account popup menu.
+## Build System
 
-## Credits/Usage Behavior
+The Zig project is now root-level:
 
-For ChatGPT-auth accounts, usage is fetched in a Codex-CLI-compatible way:
+- `/home/a/projects/js/codex_manager/build.zig`
+- `/home/a/projects/js/codex_manager/build.zig.zon`
 
-- Endpoint: `https://chatgpt.com/backend-api/wham/usage`
-- Headers:
-  - `Authorization: Bearer <tokens.access_token>`
-  - `ChatGPT-Account-Id: <tokens.account_id>` (when present)
-  - `User-Agent: codex-cli`
+### Commands
 
-If `credits.balance` is available, the app shows that value directly.
-
-If `credits` is absent/null but `rate_limit.primary_window.used_percent` exists, the app uses fallback display:
-
-- `available = 100 - used_percent`
-- `total = 100`
-- unit `%`
-
-For API-key-only auth, a legacy billing endpoint fallback is still available.
-
-## Project Structure
-
-```text
-src/
-  App.tsx                # SolidJS UI
-  App.css                # Styling/theme/layout
-  lib/codexAuth.ts       # Account store + auth + credits logic
-
-src-tauri/
-  src/lib.rs             # Tauri commands (oauth callback listener, usage fetch)
-  tauri.conf.json        # Tauri app config
-  capabilities/          # Permission capabilities
-```
-
-## Local Data
-
-- Managed accounts store: `$APPLOCALDATA/accounts.json`
-- Active Codex auth file: `~/.codex/auth.json`
-
-The app reads/writes those files to switch accounts and keep state in sync.
-
-## Prerequisites
-
-- Node.js (LTS recommended)
-- Rust toolchain
-- Tauri CLI (`@tauri-apps/cli` already in devDependencies)
-
-Linux (Debian/Ubuntu) native deps (commonly required):
+Run app in dev mode:
 
 ```bash
-sudo apt update
-sudo apt install -y \
-  libwebkit2gtk-4.1-dev \
-  libjavascriptcoregtk-4.1-dev \
-  libsoup-3.0-dev \
-  libgtk-3-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev
+zig build dev
 ```
 
-## Development
+Default dev mode runs browser-hosted WebUI (`--web` behavior).
 
-Install dependencies:
+Run app in web mode:
 
 ```bash
-npm install
+zig build dev -- --web
 ```
 
-Run web UI only:
+Run desktop WebView mode explicitly:
 
 ```bash
-npm run dev
+zig build dev -- --desktop
 ```
 
-Run desktop app (Tauri dev):
+Build/install release binary:
 
 ```bash
-npm run tauri dev
+zig build install -Doptimize=ReleaseFast
 ```
 
-Build frontend:
+Output binary:
+
+- Linux/macOS: `/home/a/projects/js/codex_manager/zig-out/bin/codex-manager`
+- Windows: `/home/a/projects/js/codex_manager/zig-out/bin/codex-manager.exe`
+
+Run built binary in web mode:
 
 ```bash
-npm run build
+./zig-out/bin/codex-manager --web
 ```
 
-Rust check:
+Run built binary in desktop mode:
 
 ```bash
-cd src-tauri
-cargo check
+./zig-out/bin/codex-manager --desktop
 ```
 
-## Troubleshooting
+## Self-contained Binary
 
-### `javascriptcoregtk-4.1` / `webkit2gtk` build errors
+`zig build install` compiles a single binary with frontend assets embedded at compile time:
+- web bundle: `frontend/dist-web/index.html`
+- desktop bundle: `frontend/dist-desktop/index.html`
 
-Install the Linux native packages listed above and retry `npm run tauri dev`.
+The runtime does not depend on shipping any external `dist` folder.
 
-### Credits check fails in UI but works with curl
+## Requirements
 
-This app fetches `/wham/usage` through a Rust Tauri command (not browser fetch) to avoid webview/CORS/load limitations.
-
-### Titlebar drag not working
-
-Make sure the app is restarted after permission changes; drag support depends on Tauri window capabilities and drag-region attributes.
-
-## Notes
-
-- This project is intentionally focused on Codex account switching workflows.
-- It assumes Codex-compatible auth payloads in `~/.codex/auth.json`.
+- Node.js 20+
+- Zig 0.15+
+- `curl` in PATH
+- `codex` CLI

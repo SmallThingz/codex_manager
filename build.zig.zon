@@ -1,0 +1,19 @@
+.{
+    .name = .codex_manager_webui,
+    .version = "0.1.0",
+    .fingerprint = 0x722ff198580114f2,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zig_webui = .{
+            .url = "https://github.com/webui-dev/zig-webui/archive/main.tar.gz",
+            .hash = "zig_webui-2.5.0-beta.4-M4z7zfBlAQDCSVNk_B9TZkOw3PE1NsKKrabgVforJoaV",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "frontend",
+        "src",
+    },
+}

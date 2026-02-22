@@ -1,5 +1,4 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   archiveAccount,
   beginCodexLogin,
@@ -7,9 +6,11 @@ import {
   completeCodexLogin,
   getAccounts,
   getRemainingCreditsForAccount,
+  getSavedTheme,
   importCurrentAccount,
   listenForCodexCallback,
   removeAccount,
+  saveTheme,
   stopCodexCallbackListener,
   switchAccount,
   unarchiveAccount,
@@ -23,6 +24,64 @@ import "./App.css";
 type CreditsByAccount = Record<string, CreditsInfo | undefined>;
 
 type Theme = "light" | "dark";
+const SHOW_DESKTOP_TOP_BAR = import.meta.env.VITE_SHOW_WINDOW_BAR !== "0";
+
+type BridgeResult<T> = {
+  ok: boolean;
+  value?: T;
+  error?: string;
+};
+
+const isDesktopBridgeRuntime = (): boolean => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return typeof window.cm_window_close === "function" || typeof window.webui?.call === "function";
+};
+
+const runWindowAction = async <T,>(
+  actionNames: string[],
+  action: ((...args: never[]) => Promise<T> | T) | undefined,
+  ...args: unknown[]
+): Promise<T | null> => {
+  if (typeof action === "function") {
+    return await action(...(args as never[]));
+  }
+
+  if (!isDesktopBridgeRuntime()) {
+    return null;
+  }
+
+  const webuiCall = window.webui?.call;
+  if (typeof webuiCall !== "function") {
+    return null;
+  }
+
+  let lastError: string | null = null;
+  for (const name of actionNames) {
+    try {
+      const raw = await webuiCall(name, ...args);
+      if (typeof raw !== "string") {
+        return null;
+      }
+
+      const parsed = JSON.parse(raw) as BridgeResult<T>;
+      if (!parsed.ok) {
+        throw new Error(parsed.error || `Backend bridge call failed for "${name}".`);
+      }
+      return (parsed.value ?? null) as T | null;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  throw new Error(lastError || `Window action failed: ${actionNames.join(", ")}`);
+};
+
+const windowFullscreenGetter = () => window.cm_window_is_fullscreen ?? window.cm_window_is_maximized;
+const windowFullscreenToggler = () =>
+  window.cm_window_toggle_fullscreen ?? window.cm_window_toggle_maximize;
 
 const formatEpoch = (epoch: number | null | undefined): string => {
   if (!epoch) {
@@ -99,6 +158,14 @@ const accountTitle = (account: AccountSummary): string => {
 const applyTheme = (theme: Theme) => {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("codex-manager-theme", theme);
+};
+
+const loadThemeFromBridge = async (): Promise<Theme | null> => {
+  return getSavedTheme();
+};
+
+const saveThemeToBridge = async (theme: Theme): Promise<void> => {
+  await saveTheme(theme);
 };
 
 const IconPlus = () => (
@@ -507,8 +574,11 @@ function App() {
 
   const refreshWindowState = async () => {
     try {
-      const current = getCurrentWindow();
-      setFullscreen(await current.isFullscreen());
+      const status = await runWindowAction<boolean>(
+        ["cm_window_is_fullscreen", "cm_window_is_maximized"],
+        windowFullscreenGetter(),
+      );
+      setFullscreen(Boolean(status));
     } catch {
       setFullscreen(false);
     }
@@ -516,7 +586,7 @@ function App() {
 
   const handleMinimize = async () => {
     try {
-      await getCurrentWindow().minimize();
+      await runWindowAction(["cm_window_minimize"], window.cm_window_minimize);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError(`Minimize failed: ${message}`);
@@ -525,9 +595,13 @@ function App() {
 
   const handleToggleFullscreen = async () => {
     try {
-      const current = getCurrentWindow();
-      const next = !(await current.isFullscreen());
-      await current.setFullscreen(next);
+      const next = await runWindowAction<boolean>(
+        ["cm_window_toggle_fullscreen", "cm_window_toggle_maximize"],
+        windowFullscreenToggler(),
+      );
+      if (next === null) {
+        return;
+      }
       setFullscreen(next);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -537,33 +611,10 @@ function App() {
 
   const handleCloseWindow = async () => {
     try {
-      await getCurrentWindow().close();
+      await runWindowAction(["cm_window_close"], window.cm_window_close);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError(`Close failed: ${message}`);
-    }
-  };
-
-  const handleWindowBarPointerDown = async (event: PointerEvent) => {
-    if (event.button !== 0) {
-      return;
-    }
-
-    const target = event.target as HTMLElement | null;
-    if (!target) {
-      return;
-    }
-
-    if (target.closest(".window-controls, button, input, a, [role='button']")) {
-      return;
-    }
-
-    try {
-      event.preventDefault();
-      await getCurrentWindow().startDragging();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setError(`Drag failed: ${message}`);
     }
   };
 
@@ -571,6 +622,7 @@ function App() {
     const nextTheme: Theme = theme() === "light" ? "dark" : "light";
     setTheme(nextTheme);
     applyTheme(nextTheme);
+    void saveThemeToBridge(nextTheme).catch(() => {});
   };
 
   const closeAddMenu = () => {
@@ -582,10 +634,19 @@ function App() {
   };
 
   onMount(async () => {
-    const savedTheme = localStorage.getItem("codex-manager-theme");
-    const initialTheme: Theme = savedTheme === "dark" ? "dark" : "light";
+    const fallbackTheme = localStorage.getItem("codex-manager-theme");
+    let initialTheme: Theme = fallbackTheme === "dark" ? "dark" : "light";
+    try {
+      const bridgedTheme = await loadThemeFromBridge();
+      if (bridgedTheme) {
+        initialTheme = bridgedTheme;
+      }
+    } catch {
+      // Keep localStorage fallback for pure browser sessions.
+    }
     setTheme(initialTheme);
     applyTheme(initialTheme);
+    void saveThemeToBridge(initialTheme).catch(() => {});
 
     const handlePointerDown = (event: PointerEvent) => {
       if (!addMenuOpen() || activeAccounts().length === 0) {
@@ -615,43 +676,42 @@ function App() {
 
   return (
     <div class="app-root">
-      <header class="window-bar reveal" data-tauri-drag-region onPointerDown={handleWindowBarPointerDown}>
-        <div class="window-title mono" data-tauri-drag-region>
-          Codex Account Manager
-        </div>
-        <div class="window-drag-area" data-tauri-drag-region />
-        <div class="window-controls" data-tauri-drag-region="false">
-          <button
-            class="window-btn"
-            data-tauri-drag-region="false"
-            type="button"
-            onClick={handleMinimize}
-            aria-label="Minimize"
-          >
-            <IconMinimize />
-          </button>
-          <button
-            class="window-btn"
-            data-tauri-drag-region="false"
-            type="button"
-            onClick={handleToggleFullscreen}
-            aria-label="Toggle fullscreen"
-          >
-            <Show when={fullscreen()} fallback={<IconMaximize />}>
-              <IconRestore />
-            </Show>
-          </button>
-          <button
-            class="window-btn window-btn-close"
-            data-tauri-drag-region="false"
-            type="button"
-            onClick={handleCloseWindow}
-            aria-label="Close"
-          >
-            <IconClose />
-          </button>
-        </div>
-      </header>
+      <Show when={SHOW_DESKTOP_TOP_BAR}>
+        <header class="window-bar reveal">
+          <div class="window-title mono">
+            Codex Account Manager
+          </div>
+          <div class="window-drag-area" />
+          <div class="window-controls">
+            <button
+              class="window-btn"
+              type="button"
+              onClick={handleMinimize}
+              aria-label="Minimize"
+            >
+              <IconMinimize />
+            </button>
+            <button
+              class="window-btn"
+              type="button"
+              onClick={handleToggleFullscreen}
+              aria-label="Toggle fullscreen"
+            >
+              <Show when={fullscreen()} fallback={<IconMaximize />}>
+                <IconRestore />
+              </Show>
+            </button>
+            <button
+              class="window-btn window-btn-close"
+              type="button"
+              onClick={handleCloseWindow}
+              aria-label="Close"
+            >
+              <IconClose />
+            </button>
+          </div>
+        </header>
+      </Show>
 
       <header class="topbar reveal">
         <div class="topbar-main">
