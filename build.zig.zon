@@ -12,7 +12,6 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "build-all-targets.sh",
         "main.zig",
         "frontend",
         "src",

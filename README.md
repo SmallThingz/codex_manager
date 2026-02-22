@@ -109,12 +109,20 @@ Build release binaries for all supported targets:
 zig build build-all-targets
 ```
 
-Artifacts are written to `release/all-targets/` as `codex-manager-<os>-<arch>`.
+Artifacts are written to `zig-out/bin/` as `codex-manager-<os>-<arch>`.
 
 Target set depends on host OS:
 - Linux host: Linux + Windows targets
 - macOS host: macOS targets
 - Windows host: Windows targets
+
+To include macOS cross-builds from Linux, provide a macOS SDK path:
+
+```bash
+MACOS_SDK_ROOT=/path/to/MacOSX.sdk zig build build-all-targets
+```
+
+This is required because `zig-webui` links macOS frameworks (`Cocoa`, `WebKit`) for macOS targets.
 
 Binary output:
 
