@@ -396,6 +396,7 @@ function App() {
   let addMenuRef: HTMLDivElement | undefined;
   let addButtonRef: HTMLButtonElement | undefined;
   let dragPreviewElement: HTMLDivElement | undefined;
+  let contentScrollRef: HTMLElement | undefined;
 
   const activeAccounts = createMemo(
     () => view()?.accounts.filter((account) => !account.archived && !account.frozen) || [],
@@ -409,6 +410,28 @@ function App() {
   const addMenuVisible = createMemo(
     () => !initializing() && addMenuOpen(),
   );
+  const visibleNotice = createMemo(() => {
+    if (initializing()) {
+      return null;
+    }
+    const value = notice();
+    if (!value) {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  });
+  const visibleBusy = createMemo(() => {
+    if (initializing()) {
+      return null;
+    }
+    const value = busy();
+    if (!value) {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  });
 
   type RefreshOptions = {
     quiet?: boolean;
@@ -1186,6 +1209,44 @@ function App() {
     }
   };
 
+  const normalizeContentScrollAfterCollapse = (forceTop: boolean) => {
+    if (!contentScrollRef) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      if (!contentScrollRef) {
+        return;
+      }
+
+      const maxTop = Math.max(0, contentScrollRef.scrollHeight - contentScrollRef.clientHeight);
+      const clampedTop = Math.min(contentScrollRef.scrollTop, maxTop);
+      if (contentScrollRef.scrollTop !== clampedTop) {
+        contentScrollRef.scrollTop = clampedTop;
+      }
+
+      if (forceTop) {
+        contentScrollRef.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    });
+  };
+
+  const handleToggleDepletedSection = () => {
+    const nextVisible = !showDepleted();
+    setShowDepleted(nextVisible);
+    if (!nextVisible) {
+      normalizeContentScrollAfterCollapse(true);
+    }
+  };
+
+  const handleToggleFrozenSection = () => {
+    const nextVisible = !showFrozen();
+    setShowFrozen(nextVisible);
+    if (!nextVisible) {
+      normalizeContentScrollAfterCollapse(false);
+    }
+  };
+
   const handleFreeze = async (id: string) => {
     const targetIndex = frozenAccounts().filter((account) => account.id !== id).length;
     await moveAccountToBucket(id, "frozen", targetIndex);
@@ -1450,13 +1511,18 @@ function App() {
         </div>
       </header>
 
-      <main class="content-scroll">
+      <main
+        class="content-scroll"
+        ref={(element) => {
+          contentScrollRef = element;
+        }}
+      >
         <div class="shell">
           <Show when={error()}>{(message) => <section class="notice error reveal">{message()}</section>}</Show>
-          <Show when={notice() && !initializing()}>
+          <Show when={visibleNotice()}>
             {(message) => <section class="notice reveal">{message()}</section>}
           </Show>
-          <Show when={busy() && !initializing()}>
+          <Show when={visibleBusy()}>
             {(message) => <section class="notice reveal">{message()}</section>}
           </Show>
 
@@ -1666,7 +1732,7 @@ function App() {
                       Refresh Depleted
                     </button>
                   </Show>
-                  <button type="button" onClick={() => setShowDepleted((value) => !value)}>
+                  <button type="button" onClick={handleToggleDepletedSection}>
                     {showDepleted() ? "Hide" : "Show"}
                   </button>
                 </div>
@@ -1815,7 +1881,7 @@ function App() {
             <section class="panel panel-frozen reveal">
               <div class="section-head">
                 <h2>Frozen Accounts</h2>
-                <button type="button" onClick={() => setShowFrozen((value) => !value)}>
+                <button type="button" onClick={handleToggleFrozenSection}>
                   {showFrozen() ? "Hide" : "Show"}
                 </button>
               </div>

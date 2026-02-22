@@ -1,8 +1,75 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const webui = @import("webui");
 
 const APP_ID = "com.codex.manager";
+const OAUTH_CALLBACK_SUCCESS_HTML =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\  <meta charset="utf-8" />
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1" />
+    \\  <title>Login Complete</title>
+    \\  <style>
+    \\    :root {
+    \\      color-scheme: light;
+    \\      --bg-1: #f7fbff;
+    \\      --bg-2: #edf4ff;
+    \\      --line: #c7d8ee;
+    \\      --card: #ffffff;
+    \\      --text: #1b2a40;
+    \\      --muted: #4e6784;
+    \\      --accent: #2f6ea8;
+    \\    }
+    \\    * { box-sizing: border-box; }
+    \\    html, body { height: 100%; }
+    \\    body {
+    \\      margin: 0;
+    \\      font-family: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    \\      background: radial-gradient(120% 120% at 10% 0%, var(--bg-2), var(--bg-1));
+    \\      color: var(--text);
+    \\      display: grid;
+    \\      place-items: center;
+    \\      padding: 1.5rem;
+    \\    }
+    \\    .card {
+    \\      width: min(680px, 100%);
+    \\      border: 1px solid var(--line);
+    \\      background: linear-gradient(180deg, #ffffff, #fbfdff);
+    \\      box-shadow: 0 14px 42px rgba(48, 85, 126, 0.16);
+    \\      padding: 1.6rem 1.7rem;
+    \\    }
+    \\    .eyebrow {
+    \\      margin: 0 0 0.5rem;
+    \\      font-size: 0.74rem;
+    \\      letter-spacing: 0.09em;
+    \\      text-transform: uppercase;
+    \\      color: var(--accent);
+    \\      font-weight: 700;
+    \\    }
+    \\    h1 {
+    \\      margin: 0;
+    \\      font-size: clamp(1.18rem, 2vw + 0.4rem, 1.65rem);
+    \\      line-height: 1.35;
+    \\      font-weight: 600;
+    \\      text-wrap: balance;
+    \\    }
+    \\    p {
+    \\      margin: 0.8rem 0 0;
+    \\      color: var(--muted);
+    \\      line-height: 1.55;
+    \\      font-size: 0.95rem;
+    \\    }
+    \\  </style>
+    \\</head>
+    \\<body>
+    \\  <main class="card">
+    \\    <p class="eyebrow">Codex Account Manager</p>
+    \\    <h1>login complete, you can return to codex account manager</h1>
+    \\    <p>This tab can now be closed.</p>
+    \\  </main>
+    \\</body>
+    \\</html>
+;
 
 pub const RpcRequest = struct {
     op: []const u8,
@@ -22,13 +89,8 @@ const UsageResult = struct {
     body: []const u8,
 };
 
-pub fn handleRpcEvent(e: *webui.Event, allocator: std.mem.Allocator, cancel_ptr: *std.atomic.Value(bool)) void {
-    const response = rpcFromText(allocator, e.getString(), cancel_ptr) catch {
-        sendError(e, allocator, "internal RPC failure");
-        return;
-    };
-    defer allocator.free(response);
-    returnJsonToEvent(e, allocator, response);
+pub fn handleRpcText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
+    return rpcFromText(allocator, request_text, cancel_ptr);
 }
 
 fn jsonError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
@@ -37,25 +99,6 @@ fn jsonError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
 
 fn jsonOk(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .ok = true, .value = value }, .{})});
-}
-
-fn returnJsonToEvent(e: *webui.Event, allocator: std.mem.Allocator, json_text: []const u8) void {
-    const json_z = allocator.dupeZ(u8, json_text) catch {
-        e.returnString("{\"ok\":false,\"error\":\"internal allocation error\"}");
-        return;
-    };
-    defer allocator.free(json_z);
-
-    e.returnString(json_z);
-}
-
-fn sendError(e: *webui.Event, allocator: std.mem.Allocator, message: []const u8) void {
-    const json = jsonError(allocator, message) catch {
-        e.returnString("{\"ok\":false,\"error\":\"internal serialization error\"}");
-        return;
-    };
-    defer allocator.free(json);
-    returnJsonToEvent(e, allocator, json);
 }
 
 fn rpcFromText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
@@ -189,12 +232,9 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
 
     if (std.mem.eql(u8, request.op, "shell:open_url")) {
         const url = request.url orelse return jsonError(allocator, "open_url requires url");
-        const url_z = allocator.dupeZ(u8, url) catch |err| {
+        openUrl(url, allocator) catch |err| {
             return jsonError(allocator, @errorName(err));
         };
-        defer allocator.free(url_z);
-
-        webui.openUrl(url_z);
         return jsonOk(allocator, @as(?u8, null));
     }
 
@@ -443,7 +483,7 @@ fn waitForOAuthCallback(
 
             if (maybe_target) |target| {
                 if (std.mem.startsWith(u8, target, "/auth/callback")) {
-                    writeHttpResponse(conn.stream, "200 OK", "<html><body><h3>Login completed. You can return to Codex Account Manager.</h3></body></html>");
+                    writeHttpResponse(conn.stream, "200 OK", OAUTH_CALLBACK_SUCCESS_HTML);
                     return std.fmt.allocPrint(allocator, "http://localhost:1455{s}", .{target});
                 }
 
@@ -457,6 +497,30 @@ fn waitForOAuthCallback(
     }
 
     return error.CallbackListenerTimeout;
+}
+
+pub fn openUrl(url: []const u8, allocator: std.mem.Allocator) !void {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+
+    switch (builtin.os.tag) {
+        .windows => {
+            try argv.appendSlice(allocator, &.{ "rundll32", "url.dll,FileProtocolHandler", url });
+        },
+        .macos => {
+            try argv.appendSlice(allocator, &.{ "open", url });
+        },
+        else => {
+            try argv.appendSlice(allocator, &.{ "xdg-open", url });
+        },
+    }
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    _ = child.wait() catch {};
 }
 
 fn expectRpcErrorContains(response: []const u8, needle: []const u8) !void {

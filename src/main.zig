@@ -6,7 +6,7 @@ const c = @cImport({
 });
 
 const assets = @import("assets.zig");
-const rpc = @import("rpc.zig");
+const rpc_webui = @import("rpc_webui.zig");
 
 const DEFAULT_WIDTH: u32 = 1000;
 const DEFAULT_HEIGHT: u32 = 760;
@@ -131,7 +131,7 @@ fn toLoopbackUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
 }
 
 fn cmRpc(e: *webui.Event) void {
-    rpc.handleRpcEvent(e, gpa.allocator(), &oauth_listener_cancel);
+    rpc_webui.handleRpcEvent(e, gpa.allocator(), &oauth_listener_cancel);
 }
 
 fn initIndexTemplates() void {

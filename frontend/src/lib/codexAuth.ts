@@ -181,6 +181,31 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
       }
     }
 
+    if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+      try {
+        const response = await fetch("/rpc", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: request,
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          lastBridgeError = `HTTP bridge request failed (${response.status}).`;
+        } else {
+          const rawResponse = await response.text();
+          const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
+          if (!parsed.ok) {
+            throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
+          }
+          return parsed.value as T;
+        }
+      } catch (error) {
+        lastBridgeError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
     await new Promise((resolve) => {
       window.setTimeout(resolve, 75);
     });
@@ -192,7 +217,7 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
 
   throw new Error(
     [
-      `WebUI RPC unavailable in this session at ${window.location.origin}.`,
+      `Backend RPC unavailable in this session at ${window.location.origin}.`,
       `has_cm_rpc=${String(hasCmRpc)}`,
       `has_webui=${String(hasWebUiObject)}`,
       `has_webui_call=${String(hasWebUiCall)}`,

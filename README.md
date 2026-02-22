@@ -103,6 +103,14 @@ Build/install optimized binary:
 zig build install -Doptimize=ReleaseFast
 ```
 
+Build release binaries for all supported targets:
+
+```bash
+zig build build-all-targets
+```
+
+Artifacts are written to `release/all-targets/<target>/`.
+
 Binary output:
 
 - Linux/macOS: `zig-out/bin/codex-manager`
