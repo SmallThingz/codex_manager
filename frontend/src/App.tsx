@@ -5,16 +5,20 @@ import {
   codexLoginWithApiKey,
   completeCodexLogin,
   getAccounts,
+  getEmbeddedBootstrapState,
   getRemainingCreditsForAccount,
   getSavedTheme,
   importCurrentAccount,
   listenForCodexCallback,
+  moveAccount,
   removeAccount,
+  saveEmbeddedBootstrapState,
   saveTheme,
   stopCodexCallbackListener,
   switchAccount,
   unarchiveAccount,
   type AccountSummary,
+  type AccountBucket,
   type AccountsView,
   type BrowserLoginStart,
   type CreditsInfo,
@@ -25,6 +29,11 @@ type CreditsByAccount = Record<string, CreditsInfo | undefined>;
 
 type Theme = "light" | "dark";
 const SHOW_DESKTOP_TOP_BAR = import.meta.env.VITE_SHOW_WINDOW_BAR !== "0";
+const QUOTA_EPSILON = 0.0001;
+const DRAG_SELECT_LOCK_CLASS = "drag-select-lock";
+const AUTO_ARCHIVE_ZERO_QUOTA = true;
+const AUTO_UNARCHIVE_NON_ZERO_QUOTA = true;
+const AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN = true;
 
 type BridgeResult<T> = {
   ok: boolean;
@@ -45,32 +54,68 @@ const runWindowAction = async <T,>(
   action: ((...args: never[]) => Promise<T> | T) | undefined,
   ...args: unknown[]
 ): Promise<T | null> => {
+  const parseBridgeResult = (raw: unknown): T | null => {
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(raw);
+        } catch {
+          return raw as T;
+        }
+
+        if (parsedJson && typeof parsedJson === "object" && "ok" in (parsedJson as Record<string, unknown>)) {
+          const parsed = parsedJson as BridgeResult<T>;
+          if (!parsed.ok) {
+            throw new Error(parsed.error || "Backend bridge call failed.");
+          }
+          return (parsed.value ?? null) as T | null;
+        }
+      }
+      return raw as T;
+    }
+
+    if (raw && typeof raw === "object" && "ok" in (raw as Record<string, unknown>)) {
+      const parsed = raw as BridgeResult<T>;
+      if (!parsed.ok) {
+        throw new Error(parsed.error || "Backend bridge call failed.");
+      }
+      return (parsed.value ?? null) as T | null;
+    }
+
+    return (raw ?? null) as T | null;
+  };
+
+  let lastError: string | null = null;
   if (typeof action === "function") {
-    return await action(...(args as never[]));
+    try {
+      const directRaw = await action(...(args as never[]));
+      // For side-effect commands (close/minimize/toggle), many WebUI bindings return
+      // `undefined` even when they succeed. Treat that as success and do not re-issue
+      // the same action through fallback RPC (which causes lag/double-toggle).
+      if (directRaw === undefined) {
+        return null;
+      }
+      return parseBridgeResult(directRaw);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
   }
 
   if (!isDesktopBridgeRuntime()) {
-    return null;
+    throw new Error(lastError || "Desktop window bridge is unavailable.");
   }
 
   const webuiCall = window.webui?.call;
   if (typeof webuiCall !== "function") {
-    return null;
+    throw new Error(lastError || "WebUI call bridge is unavailable.");
   }
 
-  let lastError: string | null = null;
   for (const name of actionNames) {
     try {
       const raw = await webuiCall(name, ...args);
-      if (typeof raw !== "string") {
-        return null;
-      }
-
-      const parsed = JSON.parse(raw) as BridgeResult<T>;
-      if (!parsed.ok) {
-        throw new Error(parsed.error || `Backend bridge call failed for "${name}".`);
-      }
-      return (parsed.value ?? null) as T | null;
+      return parseBridgeResult(raw);
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
@@ -82,6 +127,8 @@ const runWindowAction = async <T,>(
 const windowFullscreenGetter = () => window.cm_window_is_fullscreen ?? window.cm_window_is_maximized;
 const windowFullscreenToggler = () =>
   window.cm_window_toggle_fullscreen ?? window.cm_window_toggle_maximize;
+
+const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
 const formatEpoch = (epoch: number | null | undefined): string => {
   if (!epoch) {
@@ -151,8 +198,51 @@ const percentWidth = (value: number | null): number => {
   return Math.max(0, Math.min(100, value));
 };
 
+const quotaRemainingPercent = (credits: CreditsInfo | undefined): number | null => {
+  if (!credits || credits.status !== "available") {
+    return null;
+  }
+
+  if (credits.isPaidPlan) {
+    const windows = [credits.weeklyRemainingPercent, credits.hourlyRemainingPercent].filter(
+      (value): value is number => value !== null,
+    );
+
+    if (windows.length === 0) {
+      return null;
+    }
+
+    return Math.min(...windows);
+  }
+
+  return percentFromCredits(credits);
+};
+
+const hasZeroQuotaRemaining = (credits: CreditsInfo | undefined): boolean => {
+  const remaining = quotaRemainingPercent(credits);
+  return remaining !== null && remaining <= QUOTA_EPSILON;
+};
+
+const hasNonZeroQuotaRemaining = (credits: CreditsInfo | undefined): boolean => {
+  const remaining = quotaRemainingPercent(credits);
+  return remaining !== null && remaining > QUOTA_EPSILON;
+};
+
 const accountTitle = (account: AccountSummary): string => {
   return account.label || account.email || account.accountId || account.id;
+};
+
+const accountMainIdentity = (account: AccountSummary): string => {
+  return account.accountId || account.id;
+};
+
+const accountMetaLine = (account: AccountSummary): string | null => {
+  const title = accountTitle(account);
+  const id = account.accountId || account.id;
+  if (id !== title) {
+    return id;
+  }
+  return null;
 };
 
 const applyTheme = (theme: Theme) => {
@@ -166,6 +256,12 @@ const IconPlus = () => (
   </svg>
 );
 
+const IconMoon = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M20 14.4A8.5 8.5 0 1 1 9.6 4 7.1 7.1 0 0 0 20 14.4Z" />
+  </svg>
+);
+
 const IconSun = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <circle cx="12" cy="12" r="4" />
@@ -173,26 +269,25 @@ const IconSun = () => (
   </svg>
 );
 
-const IconMoon = () => (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M20 14.2A8 8 0 1 1 9.8 4 6.5 6.5 0 0 0 20 14.2Z" />
-  </svg>
-);
-
 const IconRefresh = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M8 4.8A8.5 8.5 0 0 1 20 12" />
-    <path d="M20 7.5V12h-4.5" />
-    <path d="M16 19.2A8.5 8.5 0 0 1 4 12" />
-    <path d="M4 16.5V12h4.5" />
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+      <path d="M21 21v-5h-5" />
+    </g>
   </svg>
 );
 
 const IconRefreshing = () => (
   <svg class="icon-rotor" viewBox="0 0 24 24" aria-hidden="true">
-    <circle cx="12" cy="12" r="7.2" opacity="0.28" />
-    <path d="M12 4.8a7.2 7.2 0 0 1 6.8 4.8" />
-    <path d="M19.1 9.6l-.1 2.8-2.6-.8" />
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+      <path d="M21 21v-5h-5" />
+    </g>
   </svg>
 );
 
@@ -200,6 +295,49 @@ const IconArchive = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M4 4h16v4H4zM5 8h14v11H5z" />
     <path d="M10 12h4" />
+  </svg>
+);
+
+const IconDragHandle = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <circle cx="8" cy="7" r="1.2" />
+    <circle cx="16" cy="7" r="1.2" />
+    <circle cx="8" cy="12" r="1.2" />
+    <circle cx="16" cy="12" r="1.2" />
+    <circle cx="8" cy="17" r="1.2" />
+    <circle cx="16" cy="17" r="1.2" />
+  </svg>
+);
+
+const IconFrost = () => (
+  <svg class="icon-frost" viewBox="0 0 100 100" aria-hidden="true">
+    <g fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+      <g>
+        <path d="M50 50V15" />
+        <path d="M38 25l12-10 12 10" />
+      </g>
+      <g transform="rotate(60 50 50)">
+        <path d="M50 50V15" />
+        <path d="M38 25l12-10 12 10" />
+      </g>
+      <g transform="rotate(120 50 50)">
+        <path d="M50 50V15" />
+        <path d="M38 25l12-10 12 10" />
+      </g>
+      <g transform="rotate(180 50 50)">
+        <path d="M50 50V15" />
+        <path d="M38 25l12-10 12 10" />
+      </g>
+      <g transform="rotate(240 50 50)">
+        <path d="M50 50V15" />
+        <path d="M38 25l12-10 12 10" />
+      </g>
+      <g transform="rotate(300 50 50)">
+        <path d="M50 50V15" />
+        <path d="M38 25l12-10 12 10" />
+      </g>
+      <circle cx="50" cy="50" r="3" fill="currentColor" stroke="none" />
+    </g>
   </svg>
 );
 
@@ -237,38 +375,112 @@ const IconRestore = () => (
 );
 
 function App() {
-  const [view, setView] = createSignal<AccountsView | null>(null);
-  const [creditsById, setCreditsById] = createSignal<CreditsByAccount>({});
+  const embeddedState = getEmbeddedBootstrapState();
+  const hasEmbeddedState =
+    Boolean(embeddedState?.view) || Boolean(embeddedState && Object.keys(embeddedState.usageById).length > 0);
+
+  const [view, setView] = createSignal<AccountsView | null>(embeddedState?.view ?? null);
+  const [creditsById, setCreditsById] = createSignal<CreditsByAccount>(embeddedState?.usageById ?? {});
   const [browserStart, setBrowserStart] = createSignal<BrowserLoginStart | null>(null);
   const [apiKeyDraft, setApiKeyDraft] = createSignal("");
-  const [theme, setTheme] = createSignal<Theme>("light");
+  const [theme, setTheme] = createSignal<Theme>(embeddedState?.theme === "dark" ? "dark" : "light");
   const [fullscreen, setFullscreen] = createSignal(false);
   const [addMenuOpen, setAddMenuOpen] = createSignal(false);
   const [isListeningForCallback, setIsListeningForCallback] = createSignal(false);
-  const [showArchived, setShowArchived] = createSignal(false);
+  const [showDepleted, setShowDepleted] = createSignal(false);
+  const [showFrozen, setShowFrozen] = createSignal(false);
+  const [draggingAccountId, setDraggingAccountId] = createSignal<string | null>(null);
+  const [draggingBucket, setDraggingBucket] = createSignal<AccountBucket | null>(null);
+  const [dragHover, setDragHover] = createSignal<{ bucket: AccountBucket; targetId: string | null } | null>(null);
   const [refreshingById, setRefreshingById] = createSignal<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = createSignal(false);
-  const [initializing, setInitializing] = createSignal(true);
+  const [initializing, setInitializing] = createSignal(!hasEmbeddedState);
   const [busy, setBusy] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
   let callbackListenRunId = 0;
+  let autoQuotaSyncInFlight = false;
+  let persistStateTimer: number | undefined;
   let addMenuRef: HTMLDivElement | undefined;
   let addButtonRef: HTMLButtonElement | undefined;
+  let dragPreviewElement: HTMLDivElement | undefined;
 
-  const activeAccounts = createMemo(() => view()?.accounts.filter((account) => !account.archived) || []);
-  const archivedAccounts = createMemo(() => view()?.accounts.filter((account) => account.archived) || []);
+  const activeAccounts = createMemo(
+    () => view()?.accounts.filter((account) => !account.archived && !account.frozen) || [],
+  );
+  const depletedAccounts = createMemo(
+    () => view()?.accounts.filter((account) => account.archived && !account.frozen) || [],
+  );
+  const frozenAccounts = createMemo(
+    () => view()?.accounts.filter((account) => account.frozen) || [],
+  );
   const addMenuVisible = createMemo(
-    () => !initializing() && (addMenuOpen() || activeAccounts().length === 0),
+    () => !initializing() && addMenuOpen(),
   );
 
   type RefreshOptions = {
     quiet?: boolean;
     trackAll?: boolean;
+    skipAutoSync?: boolean;
   };
 
   const activeAccountIds = (nextView: AccountsView): string[] =>
-    nextView.accounts.filter((account) => !account.archived).map((account) => account.id);
+    nextView.accounts.filter((account) => !account.archived && !account.frozen).map((account) => account.id);
+
+  const quotaSyncAccountIds = (nextView: AccountsView): string[] => {
+    const ids = new Set(activeAccountIds(nextView));
+
+    for (const account of nextView.accounts) {
+      if (account.archived && !account.frozen) {
+        ids.add(account.id);
+      }
+    }
+
+    return [...ids];
+  };
+
+  const nonFrozenAccountIds = (nextView: AccountsView): string[] =>
+    nextView.accounts.filter((account) => !account.frozen).map((account) => account.id);
+
+  const normalizedCreditsCache = (): Record<string, CreditsInfo> => {
+    const current = creditsById();
+    const next: Record<string, CreditsInfo> = {};
+    for (const [accountId, credits] of Object.entries(current)) {
+      if (credits) {
+        next[accountId] = credits;
+      }
+    }
+    return next;
+  };
+
+  const schedulePersistEmbeddedState = () => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (persistStateTimer !== undefined) {
+      window.clearTimeout(persistStateTimer);
+    }
+
+    persistStateTimer = window.setTimeout(() => {
+      persistStateTimer = undefined;
+
+      const currentView = view();
+      if (!currentView) {
+        return;
+      }
+
+      void saveEmbeddedBootstrapState({
+        theme: theme(),
+        autoArchiveZeroQuota: AUTO_ARCHIVE_ZERO_QUOTA,
+        autoUnarchiveNonZeroQuota: AUTO_UNARCHIVE_NON_ZERO_QUOTA,
+        autoSwitchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+        view: currentView,
+        usageById: normalizedCreditsCache(),
+        savedAt: nowEpoch(),
+      }).catch(() => {});
+    }, 120);
+  };
 
   const runAction = async <T,>(message: string, action: () => Promise<T>): Promise<T | undefined> => {
     batch(() => {
@@ -291,11 +503,11 @@ function App() {
   const setViewState = (nextView: AccountsView) => {
     batch(() => {
       setView(nextView);
-
       if (nextView.accounts.length === 0) {
         setAddMenuOpen(true);
       }
     });
+    schedulePersistEmbeddedState();
   };
 
   const markRefreshing = (accountIds: string[], refreshing: boolean) => {
@@ -327,6 +539,7 @@ function App() {
   ) => {
     const quiet = options.quiet ?? false;
     const trackAll = options.trackAll ?? false;
+    const skipAutoSync = options.skipAutoSync ?? false;
 
     if (accountIds.length === 0) {
       setCreditsById({});
@@ -358,6 +571,7 @@ function App() {
 
         return next;
       });
+      schedulePersistEmbeddedState();
 
       if (!quiet) {
         const failures = entries.filter((entry) => entry[1].status === "error");
@@ -378,6 +592,10 @@ function App() {
         setBusy(null);
       }
     }
+
+    if (!skipAutoSync) {
+      await syncAutoQuotaPolicies();
+    }
   };
 
   const refreshAccountCredits = async (id: string) => {
@@ -390,22 +608,158 @@ function App() {
         ...current,
         [id]: credits,
       }));
+      schedulePersistEmbeddedState();
 
       if (credits.status !== "error") {
         setNotice("Credits refreshed.");
-        return;
+      } else {
+        setError(`Credits check issue: ${credits.message}`);
       }
-
-      setError(`Credits check issue: ${credits.message}`);
     } finally {
       markRefreshing([id], false);
+    }
+
+    await syncAutoQuotaPolicies();
+  };
+
+  const syncAutoQuotaPolicies = async () => {
+    if (autoQuotaSyncInFlight) {
+      return;
+    }
+
+    const currentView = view();
+    if (!currentView) {
+      return;
+    }
+
+    autoQuotaSyncInFlight = true;
+    try {
+      let nextView = currentView;
+      const cachedCredits = creditsById();
+      let changed = false;
+
+      const active = nextView.activeAccountId
+        ? nextView.accounts.find((account) => account.id === nextView.activeAccountId) ?? null
+        : null;
+      if (!active || active.archived || active.frozen) {
+        const switchTarget = nextView.accounts.find((account) => !account.archived && !account.frozen);
+        if (switchTarget) {
+          const switchedView = await switchAccount(switchTarget.id);
+          nextView = switchedView;
+          setViewState(switchedView);
+          changed = true;
+        }
+      }
+
+      const activeAccountsWithQuota = nextView.accounts.filter((account) => !account.archived && !account.frozen);
+      const depletedActiveIds = activeAccountsWithQuota
+        .filter((account) => hasZeroQuotaRemaining(cachedCredits[account.id]))
+        .map((account) => account.id);
+
+      const activeId = nextView.activeAccountId;
+      if (activeId && depletedActiveIds.includes(activeId)) {
+        let switchTarget = activeAccountsWithQuota.find(
+          (account) =>
+            account.id !== activeId &&
+            !depletedActiveIds.includes(account.id) &&
+            hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+        );
+
+        if (!switchTarget) {
+          const archivedRecoveryTarget = nextView.accounts.find(
+            (account) => account.archived && !account.frozen && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+          );
+
+          if (archivedRecoveryTarget) {
+            const restoredView = await unarchiveAccount(archivedRecoveryTarget.id);
+            nextView = restoredView;
+            setViewState(restoredView);
+            changed = true;
+
+            const restoredActive = nextView.accounts.filter((account) => !account.archived && !account.frozen);
+            switchTarget = restoredActive.find(
+              (account) =>
+                account.id !== activeId &&
+                hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+            );
+          }
+        }
+
+        if (switchTarget) {
+          const switchedView = await switchAccount(switchTarget.id);
+          nextView = switchedView;
+          setViewState(switchedView);
+          changed = true;
+        }
+      }
+
+      for (const id of depletedActiveIds) {
+        const stillActive = nextView.accounts.find(
+          (account) => account.id === id && !account.archived && !account.frozen,
+        );
+        if (!stillActive || !hasZeroQuotaRemaining(cachedCredits[id])) {
+          continue;
+        }
+
+        const archivedView = await archiveAccount(id, {
+          switchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+        });
+        nextView = archivedView;
+        setViewState(archivedView);
+        changed = true;
+      }
+
+      const recoverableArchivedIds = nextView.accounts
+        .filter(
+          (account) => account.archived && !account.frozen && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+        )
+        .map((account) => account.id);
+
+      for (const id of recoverableArchivedIds) {
+        const stillArchived = nextView.accounts.find(
+          (account) => account.id === id && account.archived && !account.frozen,
+        );
+        if (!stillArchived || !hasNonZeroQuotaRemaining(cachedCredits[id])) {
+          continue;
+        }
+
+        const restoredView = await unarchiveAccount(id);
+        nextView = restoredView;
+        setViewState(restoredView);
+        changed = true;
+      }
+
+      if (changed) {
+        setNotice("Auto quota sync updated account status.");
+      }
+    } catch (syncError) {
+      const rendered = syncError instanceof Error ? syncError.message : String(syncError);
+      setError(rendered);
+    } finally {
+      autoQuotaSyncInFlight = false;
     }
   };
 
   const handleRefreshAllCredits = async () => {
-    const ids = activeAccounts().map((account) => account.id);
+    const currentView = view();
+    if (!currentView) {
+      return;
+    }
+
+    const ids = nonFrozenAccountIds(currentView);
     await refreshCreditsForAccounts(ids, { trackAll: true });
     setNotice("All credits refreshed.");
+  };
+
+  const handleRefreshDepletedCredits = async () => {
+    const ids = depletedAccounts().map((account) => account.id);
+    if (ids.length === 0) {
+      setNotice("No depleted accounts to refresh.");
+      return;
+    }
+
+    await refreshCreditsForAccounts(ids);
+    setNotice("Depleted account credits refreshed.");
   };
 
   const refreshAccounts = async (initialLoad = false) => {
@@ -422,7 +776,9 @@ function App() {
     try {
       const next = await getAccounts();
       setViewState(next);
-      await refreshCreditsForAccounts(activeAccountIds(next), { quiet: initialLoad });
+      if (!initialLoad) {
+        await refreshCreditsForAccounts(quotaSyncAccountIds(next), { quiet: false });
+      }
     } catch (actionError) {
       const rendered = actionError instanceof Error ? actionError.message : String(actionError);
       setError(rendered);
@@ -473,7 +829,7 @@ function App() {
       }
       setNotice(login.output.length > 0 ? login.output : "ChatGPT login completed.");
 
-      await refreshCreditsForAccounts(activeAccountIds(login.view), { quiet: true });
+      await refreshCreditsForAccounts(quotaSyncAccountIds(login.view), { quiet: true });
     } catch (listenerError) {
       if (runId !== callbackListenRunId) {
         return;
@@ -540,7 +896,7 @@ function App() {
     }
     setNotice(login.output.length > 0 ? login.output : "API key login completed.");
 
-    await refreshCreditsForAccounts(activeAccountIds(login.view), { quiet: true });
+    await refreshCreditsForAccounts(quotaSyncAccountIds(login.view), { quiet: true });
   };
 
   const handleImportCurrent = async () => {
@@ -557,7 +913,7 @@ function App() {
     }
     setNotice("Imported active Codex auth into managed accounts.");
 
-    await refreshCreditsForAccounts(activeAccountIds(next), { quiet: true });
+    await refreshCreditsForAccounts(quotaSyncAccountIds(next), { quiet: true });
   };
 
   const handleSwitch = async (id: string) => {
@@ -572,26 +928,272 @@ function App() {
     await refreshAccountCredits(id);
   };
 
-  const handleArchive = async (id: string) => {
-    const next = await runAction("Archiving account", () => archiveAccount(id));
-
-    if (!next) {
-      return;
+  const accountsForBucket = (bucket: AccountBucket): AccountSummary[] => {
+    if (bucket === "active") {
+      return activeAccounts();
     }
-
-    setViewState(next);
-    setNotice("Account archived.");
+    if (bucket === "depleted") {
+      return depletedAccounts();
+    }
+    return frozenAccounts();
   };
 
-  const handleUnarchive = async (id: string) => {
-    const next = await runAction("Restoring account", () => unarchiveAccount(id));
+  const isDropBefore = (bucket: AccountBucket, targetId: string): boolean => {
+    const current = dragHover();
+    return Boolean(current && current.bucket === bucket && current.targetId === targetId);
+  };
+
+  const isDropAtEnd = (bucket: AccountBucket): boolean => {
+    const current = dragHover();
+    return Boolean(current && current.bucket === bucket && current.targetId === null);
+  };
+
+  const isDropBucketHovered = (bucket: AccountBucket): boolean => {
+    const current = dragHover();
+    return Boolean(current && current.bucket === bucket);
+  };
+
+  const moveAccountToBucket = async (id: string, bucket: AccountBucket, targetIndex: number) => {
+    const next = await runAction("Moving account", () =>
+      moveAccount(id, bucket, targetIndex, {
+        switchAwayFromMoved: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+      }),
+    );
 
     if (!next) {
       return;
     }
 
     setViewState(next);
-    setNotice("Account restored.");
+    setNotice("Account moved.");
+  };
+
+  const resolveDragId = (event: DragEvent): string | null => {
+    const inMemory = draggingAccountId();
+    if (inMemory) {
+      return inMemory;
+    }
+
+    const transfer = event.dataTransfer?.getData("text/plain");
+    return transfer && transfer.trim().length > 0 ? transfer : null;
+  };
+
+  const allowDrop = (event: DragEvent) => {
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "move";
+    }
+  };
+
+  const setDragHoverTarget = (bucket: AccountBucket, targetId: string | null) => {
+    const current = dragHover();
+    if (current && current.bucket === bucket && current.targetId === targetId) {
+      return;
+    }
+    setDragHover({ bucket, targetId });
+  };
+
+  const accountBucketForId = (accountId: string): AccountBucket | null => {
+    const account = view()?.accounts.find((entry) => entry.id === accountId);
+    if (!account) {
+      return null;
+    }
+    if (account.frozen) {
+      return "frozen";
+    }
+    if (account.archived) {
+      return "depleted";
+    }
+    return "active";
+  };
+
+  const canDropInBucket = (draggedId: string, bucket: AccountBucket): boolean => {
+    const sourceBucket = draggingBucket() ?? accountBucketForId(draggedId);
+    if (!sourceBucket) {
+      return false;
+    }
+    if (sourceBucket === "depleted" || bucket === "depleted") {
+      return sourceBucket === "depleted" && bucket === "depleted";
+    }
+    return true;
+  };
+
+  const handleDragOverBucket = (event: DragEvent, bucket: AccountBucket) => {
+    const draggedId = resolveDragId(event);
+    if (!draggedId) {
+      return;
+    }
+    if (!canDropInBucket(draggedId, bucket)) {
+      setDragHover(null);
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = "none";
+      }
+      return;
+    }
+    allowDrop(event);
+    setDragHoverTarget(bucket, null);
+  };
+
+  const handleDragOverAccount = (event: DragEvent, bucket: AccountBucket, targetId: string) => {
+    const draggedId = resolveDragId(event);
+    if (!draggedId) {
+      return;
+    }
+    if (!canDropInBucket(draggedId, bucket)) {
+      setDragHover(null);
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = "none";
+      }
+      return;
+    }
+    allowDrop(event);
+    if (draggedId === targetId) {
+      setDragHoverTarget(bucket, null);
+      return;
+    }
+    setDragHoverTarget(bucket, targetId);
+  };
+
+  const removeDragPreview = () => {
+    if (dragPreviewElement?.parentNode) {
+      dragPreviewElement.parentNode.removeChild(dragPreviewElement);
+    }
+    dragPreviewElement = undefined;
+  };
+
+  const createDragPreviewElement = (account: AccountSummary): HTMLDivElement => {
+    const element = document.createElement("div");
+    element.className = "drag-preview";
+
+    const title = document.createElement("div");
+    title.className = "drag-preview-title";
+    title.textContent = accountTitle(account);
+
+    const meta = accountMetaLine(account);
+    const sub = document.createElement("div");
+    sub.className = "drag-preview-meta";
+    sub.textContent = meta || accountMainIdentity(account);
+
+    element.appendChild(title);
+    element.appendChild(sub);
+    document.body.appendChild(element);
+    return element;
+  };
+
+  const dragStartBlocked = (target: EventTarget | null): boolean => {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+    return Boolean(target.closest("button, input, select, textarea, a, .account-copyable, .account-main-value"));
+  };
+
+  const handleDropOnBucket = async (event: DragEvent, bucket: AccountBucket) => {
+    event.preventDefault();
+    const draggedId = resolveDragId(event);
+    document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
+    setDraggingAccountId(null);
+    setDraggingBucket(null);
+    setDragHover(null);
+    removeDragPreview();
+    if (!draggedId) {
+      return;
+    }
+    if (!canDropInBucket(draggedId, bucket)) {
+      return;
+    }
+
+    const accounts = accountsForBucket(bucket).filter((account) => account.id !== draggedId);
+    await moveAccountToBucket(draggedId, bucket, accounts.length);
+  };
+
+  const handleDropBeforeAccount = async (event: DragEvent, bucket: AccountBucket, targetId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const draggedId = resolveDragId(event);
+    document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
+    setDraggingAccountId(null);
+    setDraggingBucket(null);
+    setDragHover(null);
+    removeDragPreview();
+    if (!draggedId || draggedId === targetId) {
+      return;
+    }
+    if (!canDropInBucket(draggedId, bucket)) {
+      return;
+    }
+
+    const accounts = accountsForBucket(bucket).filter((account) => account.id !== draggedId);
+    const targetIndex = accounts.findIndex((account) => account.id === targetId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    await moveAccountToBucket(draggedId, bucket, targetIndex);
+  };
+
+  const handleDragStart = (event: DragEvent, account: AccountSummary, bucket: AccountBucket) => {
+    if (dragStartBlocked(event.target)) {
+      event.preventDefault();
+      return;
+    }
+
+    const accountId = account.id;
+    document.body.classList.add(DRAG_SELECT_LOCK_CLASS);
+    setDraggingAccountId(accountId);
+    setDraggingBucket(bucket);
+    setDragHoverTarget(bucket, null);
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", accountId);
+      removeDragPreview();
+      dragPreviewElement = createDragPreviewElement(account);
+      event.dataTransfer.setDragImage(dragPreviewElement, 24, 18);
+    }
+  };
+
+  const handleDragEnd = () => {
+    document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
+    setDraggingAccountId(null);
+    setDraggingBucket(null);
+    setDragHover(null);
+    removeDragPreview();
+  };
+
+  const releaseDragSelectionLock = () => {
+    if (!draggingAccountId()) {
+      document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
+    }
+  };
+
+  const handleDragHandlePointerDown = () => {
+    // Keep text from being selected while still allowing native drag events in browsers.
+    document.body.classList.add(DRAG_SELECT_LOCK_CLASS);
+  };
+
+  const handleArchive = async (id: string) => {
+    const next = await runAction("Moving account to depleted", () =>
+      archiveAccount(id, {
+        switchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+      }),
+    );
+
+    if (!next) {
+      return;
+    }
+
+    setViewState(next);
+    setNotice("Account moved to depleted.");
+  };
+
+  const handleFreeze = async (id: string) => {
+    const targetIndex = frozenAccounts().filter((account) => account.id !== id).length;
+    await moveAccountToBucket(id, "frozen", targetIndex);
+  };
+
+  const handleThaw = async (id: string) => {
+    const targetIndex = activeAccounts().filter((account) => account.id !== id).length;
+    await moveAccountToBucket(id, "active", targetIndex);
     await refreshAccountCredits(id);
   };
 
@@ -613,6 +1215,7 @@ function App() {
       delete nextCredits[id];
       return nextCredits;
     });
+    schedulePersistEmbeddedState();
     setNotice("Account removed.");
   };
 
@@ -639,14 +1242,15 @@ function App() {
 
   const handleToggleFullscreen = async () => {
     try {
-      const next = await runWindowAction<boolean>(
+      await runWindowAction<boolean>(
         ["cm_window_toggle_fullscreen", "cm_window_toggle_maximize"],
         windowFullscreenToggler(),
       );
-      if (next === null) {
-        return;
-      }
-      setFullscreen(next);
+      const status = await runWindowAction<boolean>(
+        ["cm_window_is_fullscreen", "cm_window_is_maximized"],
+        windowFullscreenGetter(),
+      );
+      setFullscreen(Boolean(status));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError(`Fullscreen toggle failed: ${message}`);
@@ -662,19 +1266,20 @@ function App() {
     }
   };
 
+  const handleTitleBarDoubleClick = async (event: MouseEvent) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(".window-controls")) {
+      return;
+    }
+    await handleToggleFullscreen();
+  };
+
   const toggleTheme = () => {
     const nextTheme: Theme = theme() === "light" ? "dark" : "light";
     setTheme(nextTheme);
     applyTheme(nextTheme);
+    schedulePersistEmbeddedState();
     void saveTheme(nextTheme).catch(() => {});
-  };
-
-  const closeAddMenu = () => {
-    if (initializing() || activeAccounts().length === 0) {
-      return;
-    }
-
-    setAddMenuOpen(false);
   };
 
   onMount(async () => {
@@ -690,28 +1295,34 @@ function App() {
     }
     setTheme(initialTheme);
     applyTheme(initialTheme);
+    schedulePersistEmbeddedState();
     void saveTheme(initialTheme).catch(() => {});
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (!addMenuVisible()) {
-        return;
-      }
-
       const target = event.target as Node | null;
       if (!target) {
         return;
       }
 
-      if (addMenuRef?.contains(target) || addButtonRef?.contains(target)) {
-        return;
+      if (addMenuVisible()) {
+        if (!addMenuRef?.contains(target) && !addButtonRef?.contains(target)) {
+          setAddMenuOpen(false);
+        }
       }
-
-      setAddMenuOpen(false);
     };
 
     window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("pointerup", releaseDragSelectionLock);
+    window.addEventListener("pointercancel", releaseDragSelectionLock);
     onCleanup(() => {
       window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("pointerup", releaseDragSelectionLock);
+      window.removeEventListener("pointercancel", releaseDragSelectionLock);
+      document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
+      if (persistStateTimer !== undefined) {
+        window.clearTimeout(persistStateTimer);
+      }
+      removeDragPreview();
     });
 
     try {
@@ -724,7 +1335,7 @@ function App() {
   return (
     <div class="app-root">
       <Show when={SHOW_DESKTOP_TOP_BAR}>
-        <header class="window-bar reveal">
+        <header class="window-bar reveal" onDblClick={(event) => void handleTitleBarDoubleClick(event)}>
           <div class="window-title mono">
             Codex Account Manager
           </div>
@@ -768,8 +1379,8 @@ function App() {
 
         <div class="top-actions">
           <button class="icon-btn" type="button" onClick={toggleTheme} aria-label="Toggle theme" title="Toggle theme">
-            <Show when={theme() === "dark"} fallback={<IconMoon />}>
-              <IconSun />
+            <Show when={theme() === "dark"} fallback={<IconSun />}>
+              <IconMoon />
             </Show>
           </button>
           <div class="add-menu-wrap">
@@ -781,10 +1392,12 @@ function App() {
               type="button"
               disabled={initializing()}
               onClick={() => setAddMenuOpen((open) => !open)}
-              aria-label="Add account"
-              title="Add account"
+              aria-label={addMenuVisible() ? "Close add account menu" : "Add account"}
+              title={addMenuVisible() ? "Close add account menu" : "Add account"}
             >
-              <IconPlus />
+              <Show when={addMenuVisible()} fallback={<IconPlus />}>
+                <IconClose />
+              </Show>
             </button>
 
             <Show when={addMenuVisible()}>
@@ -796,17 +1409,6 @@ function App() {
               >
                 <header class="context-head">
                   <p class="label">Add Account</p>
-                  <Show when={activeAccounts().length > 0 && !initializing()}>
-                    <button
-                      class="icon-btn"
-                      type="button"
-                      onClick={closeAddMenu}
-                      aria-label="Close add account menu"
-                      title="Close"
-                    >
-                      <IconClose />
-                    </button>
-                  </Show>
                 </header>
 
                 <div class="context-actions">
@@ -890,7 +1492,13 @@ function App() {
               <Show
                 when={activeAccounts().length > 0}
                 fallback={
-                  <div class="empty-state">
+                  <div
+                    class={`empty-state drop-surface ${draggingAccountId() ? "drag-active" : ""} ${
+                      isDropBucketHovered("active") ? "drop-hot" : ""
+                    }`}
+                    onDragOver={(event) => handleDragOverBucket(event, "active")}
+                    onDrop={(event) => void handleDropOnBucket(event, "active")}
+                  >
                     <p class="mono muted">No accounts yet.</p>
                     <button type="button" onClick={() => setAddMenuOpen(true)}>
                       Add Account
@@ -898,21 +1506,41 @@ function App() {
                   </div>
                 }
               >
-                <div class="accounts-grid">
+                <div
+                  class={`accounts-grid drop-surface ${draggingAccountId() ? "drag-active" : ""} ${
+                    isDropAtEnd("active") ? "drop-tail" : ""
+                  } ${isDropBucketHovered("active") ? "drop-hot" : ""}`}
+                  onDragOver={(event) => handleDragOverBucket(event, "active")}
+                  onDrop={(event) => void handleDropOnBucket(event, "active")}
+                >
                   <For each={activeAccounts()}>
                     {(account) => {
                       const credits = () => creditsById()[account.id];
 
                       return (
-                        <article class={`account ${account.isActive ? "active" : ""}`}>
+                        <article
+                          class={`account ${account.isActive ? "active" : ""} ${
+                            draggingAccountId() === account.id ? "dragging" : ""
+                          } ${isDropBefore("active", account.id) ? "drop-before" : ""}${
+                            draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""
+                          }`}
+                          draggable
+                          onDragStart={(event) => handleDragStart(event, account, "active")}
+                          onDragEnd={handleDragEnd}
+                          onDragOver={(event) => handleDragOverAccount(event, "active", account.id)}
+                          onDrop={(event) => void handleDropBeforeAccount(event, "active", account.id)}
+                        >
                           <header class="account-head">
-                            <div>
-                              <p class="account-title">{accountTitle(account)}</p>
-                              <p class="mono muted">{account.email || account.accountId || account.id}</p>
+                            <span class="icon-btn drag-handle" aria-hidden="true" onPointerDown={handleDragHandlePointerDown}>
+                              <IconDragHandle />
+                            </span>
+                            <div class="account-main">
+                              <p class="account-title account-main-value">{accountTitle(account)}</p>
+                              <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
                             </div>
-                            <p class={`pill ${account.isActive ? "pill-active" : ""}`}>
-                              {account.isActive ? "ACTIVE" : "STANDBY"}
-                            </p>
+                            <Show when={account.isActive}>
+                              <p class="pill pill-active">ACTIVE</p>
+                            </Show>
                           </header>
 
                           <Show when={credits()?.isPaidPlan !== true}>
@@ -1005,10 +1633,19 @@ function App() {
                                 type="button"
                                 class="icon-btn action"
                                 onClick={() => handleArchive(account.id)}
-                                aria-label="Archive account"
-                                title="Archive account"
+                                aria-label="Move to depleted"
+                                title="Move to depleted"
                               >
                                 <IconArchive />
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn action"
+                                onClick={() => void handleFreeze(account.id)}
+                                aria-label="Freeze account"
+                                title="Freeze account"
+                              >
+                                <IconFrost />
                               </button>
                               <button
                                 type="button"
@@ -1029,34 +1666,239 @@ function App() {
               </Show>
             </section>
 
-            <Show when={archivedAccounts().length > 0}>
-              <section class="panel panel-archived reveal">
-                <div class="section-head">
-                  <h2>Archived Accounts</h2>
-                  <button type="button" onClick={() => setShowArchived((value) => !value)}>
-                    {showArchived() ? "Hide" : "Show"}
+            <section class="panel panel-depleted reveal">
+              <div class="section-head">
+                <h2>Depleted Accounts</h2>
+                <div class="section-actions">
+                  <Show when={depletedAccounts().length > 0}>
+                    <button type="button" onClick={handleRefreshDepletedCredits}>
+                      Refresh Depleted
+                    </button>
+                  </Show>
+                  <button type="button" onClick={() => setShowDepleted((value) => !value)}>
+                    {showDepleted() ? "Hide" : "Show"}
                   </button>
                 </div>
+              </div>
 
-                <Show when={showArchived()}>
-                  <div class="accounts-grid">
-                    <For each={archivedAccounts()}>
-                      {(account) => (
-                        <article class="account archived">
-                          <header class="account-head">
-                            <div>
-                              <p class="account-title">{accountTitle(account)}</p>
-                              <p class="mono muted">{account.email || account.accountId || account.id}</p>
+              <Show when={showDepleted()}>
+                <Show
+                  when={depletedAccounts().length > 0}
+                  fallback={
+                    <div
+                      class={`empty-state drop-surface ${draggingAccountId() ? "drag-active" : ""} ${
+                        isDropBucketHovered("depleted") ? "drop-hot" : ""
+                      }`}
+                      onDragOver={(event) => handleDragOverBucket(event, "depleted")}
+                      onDrop={(event) => void handleDropOnBucket(event, "depleted")}
+                    >
+                      <p class="mono muted">No depleted accounts.</p>
+                    </div>
+                  }
+                >
+                  <div
+                    class={`accounts-grid drop-surface ${draggingAccountId() ? "drag-active" : ""} ${
+                      isDropAtEnd("depleted") ? "drop-tail" : ""
+                    } ${isDropBucketHovered("depleted") ? "drop-hot" : ""}`}
+                    onDragOver={(event) => handleDragOverBucket(event, "depleted")}
+                    onDrop={(event) => void handleDropOnBucket(event, "depleted")}
+                  >
+                    <For each={depletedAccounts()}>
+                      {(account) => {
+                        const credits = () => creditsById()[account.id];
+
+                        return (
+                          <article
+                            class={`account account-depleted archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
+                              isDropBefore("depleted", account.id) ? "drop-before" : ""
+                            }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
+                            draggable
+                            onDragStart={(event) => handleDragStart(event, account, "depleted")}
+                            onDragEnd={handleDragEnd}
+                            onDragOver={(event) => handleDragOverAccount(event, "depleted", account.id)}
+                            onDrop={(event) => void handleDropBeforeAccount(event, "depleted", account.id)}
+                          >
+                            <header class="account-head">
+                              <span class="icon-btn drag-handle" aria-hidden="true" onPointerDown={handleDragHandlePointerDown}>
+                                <IconDragHandle />
+                              </span>
+                              <div class="account-main">
+                                <p class="account-title account-main-value">{accountTitle(account)}</p>
+                                <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
+                              </div>
+                            </header>
+
+                            <Show when={credits()}>
+                              <Show when={credits()?.isPaidPlan !== true}>
+                                <div class="credit-bars">
+                                  <div class="credit-bar-item">
+                                    <div class="credit-bar-head">
+                                      <p class="mono credit-value">
+                                        Available: {renderCreditValue(credits()?.available ?? null, credits())}
+                                      </p>
+                                      <p class="mono credit-value align-right">
+                                        Total: {renderCreditValue(credits()?.total ?? null, credits())}
+                                      </p>
+                                    </div>
+                                    <div class="progress-track">
+                                      <div
+                                        class="progress-fill progress-available"
+                                        style={{
+                                          width: `${percentFromCredits(credits())}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                              </Show>
+
+                              <Show when={credits()?.isPaidPlan}>
+                                <div class="rate-limits-grid">
+                                  <div class="rate-limits-item">
+                                    <div class="rate-limit-head">
+                                      <p class="label">Hourly Remaining</p>
+                                      <p class="mono">{percentOrDash(credits()?.hourlyRemainingPercent ?? null)}</p>
+                                    </div>
+                                    <div class="limit-track">
+                                      <div
+                                        class="limit-fill"
+                                        style={{
+                                          width: `${percentWidth(credits()?.hourlyRemainingPercent ?? null)}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                  <div class="rate-limits-item">
+                                    <div class="rate-limit-head">
+                                      <p class="label">Weekly Remaining</p>
+                                      <p class="mono">{percentOrDash(credits()?.weeklyRemainingPercent ?? null)}</p>
+                                    </div>
+                                    <div class="limit-track">
+                                      <div
+                                        class="limit-fill"
+                                        style={{
+                                          width: `${percentWidth(credits()?.weeklyRemainingPercent ?? null)}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                              </Show>
+                            </Show>
+
+                            <div class="card-actions">
+                              <button type="button" class="switch-btn" onClick={() => void handleThaw(account.id)}>
+                                Activate
+                              </button>
+
+                              <div class="icon-actions">
+                                <button
+                                  type="button"
+                                  class="icon-btn action"
+                                  onClick={() => void handleFreeze(account.id)}
+                                  aria-label="Freeze account"
+                                  title="Freeze account"
+                                >
+                                  <IconFrost />
+                                </button>
+                                <button
+                                  type="button"
+                                  class="icon-btn danger-icon"
+                                  onClick={() => handleRemove(account.id)}
+                                  aria-label="Delete account"
+                                  title="Delete account"
+                                >
+                                  <IconTrash />
+                                </button>
+                              </div>
                             </div>
-                            <p class="pill">ARCHIVED</p>
+                          </article>
+                        );
+                      }}
+                    </For>
+                  </div>
+                </Show>
+              </Show>
+            </section>
+
+            <section class="panel panel-frozen reveal">
+              <div class="section-head">
+                <h2>Frozen Accounts</h2>
+                <button type="button" onClick={() => setShowFrozen((value) => !value)}>
+                  {showFrozen() ? "Hide" : "Show"}
+                </button>
+              </div>
+
+              <Show when={showFrozen()}>
+                <Show
+                  when={frozenAccounts().length > 0}
+                  fallback={
+                    <div
+                      class={`empty-state drop-surface ${draggingAccountId() ? "drag-active" : ""} ${
+                        isDropBucketHovered("frozen") ? "drop-hot" : ""
+                      }`}
+                      onDragOver={(event) => handleDragOverBucket(event, "frozen")}
+                      onDrop={(event) => void handleDropOnBucket(event, "frozen")}
+                    >
+                      <p class="mono muted">No frozen accounts.</p>
+                    </div>
+                  }
+                >
+                  <div
+                    class={`accounts-grid drop-surface ${draggingAccountId() ? "drag-active" : ""} ${
+                      isDropAtEnd("frozen") ? "drop-tail" : ""
+                    } ${isDropBucketHovered("frozen") ? "drop-hot" : ""}`}
+                    onDragOver={(event) => handleDragOverBucket(event, "frozen")}
+                    onDrop={(event) => void handleDropOnBucket(event, "frozen")}
+                  >
+                    <For each={frozenAccounts()}>
+                      {(account) => (
+                        <article
+                          class={`account account-frozen archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
+                            isDropBefore("frozen", account.id) ? "drop-before" : ""
+                          }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
+                          draggable
+                          onDragStart={(event) => handleDragStart(event, account, "frozen")}
+                          onDragEnd={handleDragEnd}
+                          onDragOver={(event) => handleDragOverAccount(event, "frozen", account.id)}
+                          onDrop={(event) => void handleDropBeforeAccount(event, "frozen", account.id)}
+                        >
+                          <header class="account-head">
+                            <span class="icon-btn drag-handle" aria-hidden="true" onPointerDown={handleDragHandlePointerDown}>
+                              <IconDragHandle />
+                            </span>
+                            <div class="account-main">
+                              <p class="account-title account-main-value">{accountTitle(account)}</p>
+                              <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
+                            </div>
                           </header>
 
+                          <div class="mini-grid">
+                            <div>
+                              <p class="label">Updated</p>
+                              <p class="mono">{formatEpoch(account.updatedAt)}</p>
+                            </div>
+                            <div>
+                              <p class="label">Last used</p>
+                              <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
+                            </div>
+                          </div>
+
                           <div class="card-actions">
-                            <button type="button" class="switch-btn" onClick={() => handleUnarchive(account.id)}>
-                              Restore
+                            <button type="button" class="switch-btn" onClick={() => void handleThaw(account.id)}>
+                              Activate
                             </button>
 
                             <div class="icon-actions">
+                              <button
+                                type="button"
+                                class="icon-btn action"
+                                onClick={() => handleArchive(account.id)}
+                                aria-label="Move to depleted"
+                                title="Move to depleted"
+                              >
+                                <IconArchive />
+                              </button>
                               <button
                                 type="button"
                                 class="icon-btn danger-icon"
@@ -1073,8 +1915,8 @@ function App() {
                     </For>
                   </div>
                 </Show>
-              </section>
-            </Show>
+              </Show>
+            </section>
           </Show>
         </div>
       </main>

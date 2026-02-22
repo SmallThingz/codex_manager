@@ -1,4 +1,5 @@
 const STORE_FILE = "accounts.json";
+const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const CODEX_DIR = ".codex";
 const AUTH_FILE = "auth.json";
 
@@ -16,10 +17,13 @@ export type AccountSummary = {
   accountId: string | null;
   email: string | null;
   archived: boolean;
+  frozen: boolean;
   isActive: boolean;
   updatedAt: number;
   lastUsedAt: number | null;
 };
+
+export type AccountBucket = "active" | "depleted" | "frozen";
 
 export type AccountsView = {
   accounts: AccountSummary[];
@@ -63,6 +67,7 @@ type ManagedAccount = {
   accountId: string | null;
   email: string | null;
   archived: boolean;
+  frozen: boolean;
   auth: unknown;
   createdAt: number;
   updatedAt: number;
@@ -79,6 +84,17 @@ type Paths = {
   codexAuthPath: string;
   storeDir: string;
   storePath: string;
+  bootstrapStatePath: string;
+};
+
+export type EmbeddedBootstrapState = {
+  theme: "light" | "dark" | null;
+  autoArchiveZeroQuota: boolean;
+  autoUnarchiveNonZeroQuota: boolean;
+  autoSwitchAwayFromArchived: boolean;
+  view: AccountsView | null;
+  usageById: Record<string, CreditsInfo>;
+  savedAt: number;
 };
 
 type PendingBrowserLogin = {
@@ -800,12 +816,14 @@ const resolvePaths = async (): Promise<Paths> => {
       const codexAuthPath = await tauri.join(codexHome, AUTH_FILE);
       const storeDir = await tauri.appLocalDataDir();
       const storePath = await tauri.join(storeDir, STORE_FILE);
+      const bootstrapStatePath = await tauri.join(storeDir, BOOTSTRAP_STATE_FILE);
 
       return {
         codexHome,
         codexAuthPath,
         storeDir,
         storePath,
+        bootstrapStatePath,
       };
     })();
   }
@@ -828,6 +846,69 @@ const writeJsonFile = async (path: string, value: unknown): Promise<void> => {
   const tauri = await loadBackendApis();
   const text = JSON.stringify(value, null, 2);
   await tauri.writeTextFile(path, text);
+};
+
+const asBootstrapState = (value: unknown): EmbeddedBootstrapState | null => {
+  const parsed = asRecord(value);
+  if (!parsed) {
+    return null;
+  }
+
+  const themeRaw = parsed.theme;
+  const theme = themeRaw === "light" || themeRaw === "dark" ? themeRaw : null;
+  const viewRaw = parsed.view;
+  const view = asRecord(viewRaw) ? (viewRaw as AccountsView) : null;
+  const usageRaw = asRecord(parsed.usageById);
+  const usageById: Record<string, CreditsInfo> = {};
+  const legacyArchiveFolders = Array.isArray(parsed.archiveFolders) ? parsed.archiveFolders : [];
+  const legacyAutoArchiveEnabled = legacyArchiveFolders.some((entry) => {
+    const folder = asRecord(entry);
+    return valueAsBoolean(folder?.autoArchiveDepleted) === true;
+  });
+
+  if (usageRaw) {
+    for (const [id, credits] of Object.entries(usageRaw)) {
+      if (asRecord(credits)) {
+        usageById[id] = credits as CreditsInfo;
+      }
+    }
+  }
+
+  return {
+    theme,
+    autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? legacyAutoArchiveEnabled,
+    autoUnarchiveNonZeroQuota: valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? false,
+    autoSwitchAwayFromArchived: valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? true,
+    view,
+    usageById,
+    savedAt: valueAsNumber(parsed.savedAt) ?? nowEpoch(),
+  };
+};
+
+export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const encoded = window.__CM_BOOTSTRAP_STATE__;
+  if (!encoded || encoded === "REPLACE_THIS_VARIABLE_WHEN_SENDING") {
+    return null;
+  }
+
+  try {
+    const json = atob(encoded);
+    const parsed = JSON.parse(json);
+    return asBootstrapState(parsed);
+  } catch {
+    return null;
+  }
+};
+
+export const saveEmbeddedBootstrapState = async (state: EmbeddedBootstrapState): Promise<void> => {
+  const paths = await resolvePaths();
+  const tauri = await loadBackendApis();
+  await tauri.mkdir(paths.storeDir, { recursive: true });
+  await writeJsonFile(paths.bootstrapStatePath, state);
 };
 
 const readAuthFile = async (): Promise<unknown> => {
@@ -862,13 +943,15 @@ const sanitizeAccount = (value: unknown): ManagedAccount | null => {
   const createdAt = valueAsNumber(obj.createdAt) ?? nowEpoch();
   const updatedAt = valueAsNumber(obj.updatedAt) ?? createdAt;
   const lastUsedAt = valueAsNumber(obj.lastUsedAt);
+  const frozen = Boolean(obj.frozen);
 
   return {
     id,
     label: normalizeOptional(getString(obj, "label")),
     accountId: normalizeOptional(getString(obj, "accountId")),
     email: normalizeOptional(getString(obj, "email")),
-    archived: Boolean(obj.archived),
+    archived: Boolean(obj.archived) && !frozen,
+    frozen,
     auth: obj.auth,
     createdAt,
     updatedAt,
@@ -933,6 +1016,7 @@ const upsertAccount = (
     existing.label = normalizedLabel ?? existing.label;
     existing.auth = auth;
     existing.archived = false;
+    existing.frozen = false;
     existing.updatedAt = now;
 
     if (setActive) {
@@ -950,6 +1034,7 @@ const upsertAccount = (
     accountId,
     email,
     archived: false,
+    frozen: false,
     auth,
     createdAt: now,
     updatedAt: now,
@@ -975,7 +1060,7 @@ const moveActiveToFallback = async (store: AccountsStore, removedId?: string): P
     return;
   }
 
-  const next = store.accounts.find((account) => !account.archived && account.id !== removedId);
+  const next = store.accounts.find((account) => !account.archived && !account.frozen && account.id !== removedId);
   if (!next) {
     store.activeAccountId = null;
     return;
@@ -990,6 +1075,21 @@ const moveActiveToFallback = async (store: AccountsStore, removedId?: string): P
   store.activeAccountId = next.id;
 };
 
+const accountBucketOf = (account: Pick<ManagedAccount, "archived" | "frozen">): AccountBucket => {
+  if (account.frozen) {
+    return "frozen";
+  }
+  if (account.archived) {
+    return "depleted";
+  }
+  return "active";
+};
+
+const applyBucket = (account: ManagedAccount, bucket: AccountBucket) => {
+  account.archived = bucket === "depleted";
+  account.frozen = bucket === "frozen";
+};
+
 const buildView = async (store: AccountsStore): Promise<AccountsView> => {
   const paths = await resolvePaths();
   const activeAuth = await readJsonFile<unknown>(paths.codexAuthPath);
@@ -997,15 +1097,15 @@ const buildView = async (store: AccountsStore): Promise<AccountsView> => {
   const activeDiskEmail = activeAuth ? extractEmail(activeAuth) : null;
 
   const activeByAccountId = activeDiskAccountId
-    ? store.accounts.find((account) => !account.archived && account.accountId === activeDiskAccountId)
+    ? store.accounts.find((account) => !account.archived && !account.frozen && account.accountId === activeDiskAccountId)
     : null;
   const activeByEmail =
     !activeByAccountId && activeDiskEmail
-      ? store.accounts.find((account) => !account.archived && account.email === activeDiskEmail)
+      ? store.accounts.find((account) => !account.archived && !account.frozen && account.email === activeDiskEmail)
       : null;
   const activeFromStore =
     store.activeAccountId &&
-    store.accounts.some((account) => account.id === store.activeAccountId && !account.archived)
+    store.accounts.some((account) => account.id === store.activeAccountId && !account.archived && !account.frozen)
       ? store.activeAccountId
       : null;
 
@@ -1017,29 +1117,17 @@ const buildView = async (store: AccountsStore): Promise<AccountsView> => {
     await writeStore(store);
   }
 
-  const accounts = [...store.accounts]
-    .sort((a, b) => {
-      if (a.archived !== b.archived) {
-        return a.archived ? 1 : -1;
-      }
-      if (a.id === normalizedActiveId) {
-        return -1;
-      }
-      if (b.id === normalizedActiveId) {
-        return 1;
-      }
-      return b.updatedAt - a.updatedAt;
-    })
-    .map((account) => ({
-      id: account.id,
-      label: account.label,
-      accountId: account.accountId,
-      email: account.email,
-      archived: account.archived,
-      isActive: account.id === normalizedActiveId,
-      updatedAt: account.updatedAt,
-      lastUsedAt: account.lastUsedAt,
-    }));
+  const accounts = store.accounts.map((account) => ({
+    id: account.id,
+    label: account.label,
+    accountId: account.accountId,
+    email: account.email,
+    archived: account.archived,
+    frozen: account.frozen,
+    isActive: account.id === normalizedActiveId,
+    updatedAt: account.updatedAt,
+    lastUsedAt: account.lastUsedAt,
+  }));
 
   return {
     accounts,
@@ -1403,8 +1491,8 @@ export const switchAccount = async (id: string): Promise<AccountsView> => {
   }
 
   const account = store.accounts[index];
-  if (account.archived) {
-    throw new Error("Cannot switch to an archived account.");
+  if (account.archived || account.frozen) {
+    throw new Error("Cannot switch to a depleted or frozen account.");
   }
 
   validateAuth(account.auth);
@@ -1419,38 +1507,70 @@ export const switchAccount = async (id: string): Promise<AccountsView> => {
   return buildView(store);
 };
 
-export const archiveAccount = async (id: string): Promise<AccountsView> => {
+export const moveAccount = async (
+  id: string,
+  targetBucket: AccountBucket,
+  targetIndex: number,
+  options?: { switchAwayFromMoved?: boolean },
+): Promise<AccountsView> => {
   const store = await readStore();
-  const account = store.accounts.find((entry) => entry.id === id);
+  const sourceIndex = store.accounts.findIndex((entry) => entry.id === id);
 
+  if (sourceIndex < 0) {
+    throw new Error("Account not found.");
+  }
+
+  const [account] = store.accounts.splice(sourceIndex, 1);
   if (!account) {
     throw new Error("Account not found.");
   }
 
-  account.archived = true;
+  applyBucket(account, targetBucket);
   account.updatedAt = nowEpoch();
 
-  if (store.activeAccountId === id) {
-    await moveActiveToFallback(store, id);
+  if (store.activeAccountId === id && targetBucket !== "active") {
+    if (options?.switchAwayFromMoved ?? true) {
+      await moveActiveToFallback(store, id);
+    } else {
+      store.activeAccountId = null;
+    }
   }
+
+  const bucketIds = store.accounts
+    .filter((entry) => accountBucketOf(entry) === targetBucket)
+    .map((entry) => entry.id);
+  const normalizedIndex = Number.isFinite(targetIndex)
+    ? Math.max(0, Math.min(Math.floor(targetIndex), bucketIds.length))
+    : bucketIds.length;
+
+  let insertIndex = store.accounts.length;
+  if (normalizedIndex < bucketIds.length) {
+    const anchorId = bucketIds[normalizedIndex];
+    const anchorIndex = store.accounts.findIndex((entry) => entry.id === anchorId);
+    insertIndex = anchorIndex >= 0 ? anchorIndex : store.accounts.length;
+  } else if (bucketIds.length > 0) {
+    const tailId = bucketIds[bucketIds.length - 1];
+    const tailIndex = store.accounts.findIndex((entry) => entry.id === tailId);
+    insertIndex = tailIndex >= 0 ? tailIndex + 1 : store.accounts.length;
+  }
+
+  store.accounts.splice(insertIndex, 0, account);
 
   await writeStore(store);
   return buildView(store);
 };
 
+export const archiveAccount = async (
+  id: string,
+  options?: { switchAwayFromArchived?: boolean },
+): Promise<AccountsView> => {
+  return moveAccount(id, "depleted", Number.MAX_SAFE_INTEGER, {
+    switchAwayFromMoved: options?.switchAwayFromArchived,
+  });
+};
+
 export const unarchiveAccount = async (id: string): Promise<AccountsView> => {
-  const store = await readStore();
-  const account = store.accounts.find((entry) => entry.id === id);
-
-  if (!account) {
-    throw new Error("Account not found.");
-  }
-
-  account.archived = false;
-  account.updatedAt = nowEpoch();
-
-  await writeStore(store);
-  return buildView(store);
+  return moveAccount(id, "active", Number.MAX_SAFE_INTEGER);
 };
 
 export const clearAccountLabel = async (id: string): Promise<AccountsView> => {

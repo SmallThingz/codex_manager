@@ -9,6 +9,7 @@ interface ImportMeta {
 }
 
 interface Window {
+  __CM_BOOTSTRAP_STATE__?: string;
   cm_rpc?: (requestJson: string) => Promise<string> | string;
   cm_window_minimize?: () => Promise<void> | void;
   cm_window_toggle_fullscreen?: () => Promise<boolean> | boolean;
