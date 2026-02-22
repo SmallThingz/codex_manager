@@ -15,6 +15,7 @@ frontend/dist-desktop
 dist-ssr
 release
 zig-out
+.zig-out-matrix
 .zig-cache
 *.local
 
