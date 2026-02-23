@@ -1,0 +1,22 @@
+pkgbase = codex-manager-git
+	pkgdesc = Manage multiple Codex accounts with usage-aware switching (git version)
+	pkgver = 0.1.0.r0.gbc0d4c5
+	pkgrel = 1
+	url = https://github.com/SmallThingz/codex_manager
+	arch = x86_64
+	arch = aarch64
+	license = custom:unknown
+	makedepends = git
+	makedepends = zig
+	makedepends = nodejs
+	makedepends = npm
+	depends = curl
+	optdepends = webkit2gtk-4.1: desktop WebView mode on Linux
+	optdepends = gtk3: desktop WebView mode on Linux
+	optdepends = codex-cli: account import and auth.json switching support
+	provides = codex-manager
+	conflicts = codex-manager-bin
+	source = git+https://github.com/SmallThingz/codex_manager.git
+	sha256sums = SKIP
+
+pkgname = codex-manager-git

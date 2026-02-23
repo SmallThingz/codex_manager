@@ -1,0 +1,22 @@
+pkgbase = codex-manager-bin
+	pkgdesc = Manage multiple Codex accounts with usage-aware switching (prebuilt binary)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/SmallThingz/codex_manager
+	arch = x86_64
+	arch = aarch64
+	license = custom:unknown
+	depends = curl
+	optdepends = webkit2gtk-4.1: desktop WebView mode on Linux
+	optdepends = gtk3: desktop WebView mode on Linux
+	optdepends = codex-cli: account import and auth.json switching support
+	provides = codex-manager
+	conflicts = codex-manager-git
+	noextract = codex-manager-linux-x86_64
+	noextract = codex-manager-linux-aarch64
+	source_x86_64 = https://github.com/SmallThingz/codex_manager/releases/download/v0.1.0/codex-manager-linux-x86_64
+	sha256sums_x86_64 = cbbd59fb921d30cb35ae9638d95c71e383bf5ea47f5327cbf73d5d1e94209bc6
+	source_aarch64 = https://github.com/SmallThingz/codex_manager/releases/download/v0.1.0/codex-manager-linux-aarch64
+	sha256sums_aarch64 = 6b723ff6f691288188ede877f90ef1c5c07fd9c0fa139beea3e45fcb6ae5d6e5
+
+pkgname = codex-manager-bin
