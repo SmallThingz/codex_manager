@@ -1,0 +1,44 @@
+pkgname=codex-manager-git
+_repo_name=codex_manager
+pkgver=0.1.0.r0.gbc0d4c5
+pkgrel=1
+pkgdesc="Manage multiple Codex accounts with usage-aware switching (git version)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/SmallThingz/codex_manager"
+license=('custom:unknown')
+depends=('curl')
+makedepends=('git' 'zig' 'nodejs' 'npm')
+optdepends=(
+  'webkit2gtk-4.1: desktop WebView mode on Linux'
+  'gtk3: desktop WebView mode on Linux'
+  'codex-cli: account import and auth.json switching support'
+)
+provides=('codex-manager')
+conflicts=('codex-manager-bin')
+source=("git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${srcdir}/${_repo_name}"
+
+  local tag rev hash
+  tag="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+  if [[ -z "${tag}" ]]; then
+    tag="0.0.0"
+  fi
+  rev="$(git rev-list --count "v${tag}..HEAD" 2>/dev/null || echo 0)"
+  hash="$(git rev-parse --short=7 HEAD)"
+
+  printf '%s.r%s.g%s\n' "${tag}" "${rev}" "${hash}"
+}
+
+build() {
+  cd "${srcdir}/${_repo_name}"
+  zig build install -Doptimize=ReleaseFast
+}
+
+package() {
+  cd "${srcdir}/${_repo_name}"
+  install -Dm755 "zig-out/bin/codex-manager" "${pkgdir}/usr/bin/codex-manager"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

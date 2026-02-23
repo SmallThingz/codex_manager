@@ -1,0 +1,38 @@
+pkgname=codex-manager-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Manage multiple Codex accounts with usage-aware switching (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/SmallThingz/codex_manager"
+license=('custom:unknown')
+depends=('curl')
+optdepends=(
+  'webkit2gtk-4.1: desktop WebView mode on Linux'
+  'gtk3: desktop WebView mode on Linux'
+  'codex-cli: account import and auth.json switching support'
+)
+provides=('codex-manager')
+conflicts=('codex-manager-git')
+
+source_x86_64=("${url}/releases/download/v${pkgver}/codex-manager-linux-x86_64")
+source_aarch64=("${url}/releases/download/v${pkgver}/codex-manager-linux-aarch64")
+noextract=(
+  'codex-manager-linux-x86_64'
+  'codex-manager-linux-aarch64'
+)
+sha256sums_x86_64=('cbbd59fb921d30cb35ae9638d95c71e383bf5ea47f5327cbf73d5d1e94209bc6')
+sha256sums_aarch64=('6b723ff6f691288188ede877f90ef1c5c07fd9c0fa139beea3e45fcb6ae5d6e5')
+
+package() {
+  local _srcbin
+  case "${CARCH}" in
+    x86_64) _srcbin="codex-manager-linux-x86_64" ;;
+    aarch64) _srcbin="codex-manager-linux-aarch64" ;;
+    *)
+      echo "Unsupported architecture: ${CARCH}" >&2
+      return 1
+      ;;
+  esac
+
+  install -Dm755 "${srcdir}/${_srcbin}" "${pkgdir}/usr/bin/codex-manager"
+}
