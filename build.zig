@@ -96,6 +96,7 @@ fn addMatrixInstallCommand(
     ensure_macos_sdk_step: ?*std.Build.Step,
     frontend_prebuild_step: ?*std.Build.Step,
     optimize: std.builtin.OptimizeMode,
+    strip_symbols: bool,
 ) void {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(b.allocator);
@@ -108,6 +109,7 @@ fn addMatrixInstallCommand(
         "zig-out",
     }) catch @panic("OOM");
     argv.append(b.allocator, b.fmt("-Doptimize={s}", .{optimizeModeName(optimize)})) catch @panic("OOM");
+    argv.append(b.allocator, b.fmt("-Dstrip={}", .{strip_symbols})) catch @panic("OOM");
     argv.appendSlice(b.allocator, &.{"-Dskip_frontend=true"}) catch @panic("OOM");
 
     if (maybe_sysroot) |sysroot| {
@@ -130,6 +132,7 @@ fn addMatrixInstallCommand(
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip_symbols = b.option(bool, "strip", "Strip debug symbols from binaries.") orelse false;
     const matrix_name = b.option([]const u8, "matrix_name", "Override installed binary name");
     const skip_frontend = b.option(
         bool,
@@ -277,6 +280,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip_symbols,
             .imports = &.{
                 .{ .name = "webui", .module = webui_module },
             },
@@ -312,6 +316,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/rpc.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip_symbols,
         }),
     });
 
@@ -335,6 +340,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
             addMatrixInstallCommand(
                 b,
@@ -345,6 +351,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
             addMatrixInstallCommand(
                 b,
@@ -355,6 +362,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
             addMatrixInstallCommand(
                 b,
@@ -365,6 +373,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
 
             if (macos_sdk_path) |macos_sdk_root| {
@@ -378,6 +387,7 @@ pub fn build(b: *std.Build) void {
                         ensure_macos_sdk_step,
                         frontend_build_step,
                         optimize,
+                        strip_symbols,
                     );
                     addMatrixInstallCommand(
                         b,
@@ -388,6 +398,7 @@ pub fn build(b: *std.Build) void {
                         ensure_macos_sdk_step,
                         frontend_build_step,
                         optimize,
+                        strip_symbols,
                     );
                 }
             }
@@ -402,6 +413,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
             addMatrixInstallCommand(
                 b,
@@ -412,6 +424,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
         },
         .windows => {
@@ -424,6 +437,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
             addMatrixInstallCommand(
                 b,
@@ -434,6 +448,7 @@ pub fn build(b: *std.Build) void {
                 null,
                 frontend_build_step,
                 optimize,
+                strip_symbols,
             );
         },
         else => {},

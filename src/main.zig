@@ -10,8 +10,6 @@ const DEFAULT_HEIGHT: u32 = 760;
 const APP_ID = "com.codex.manager";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
-const DESKTOP_NATIVE_APPEAR_TIMEOUT_MS: i64 = 1800;
-const DESKTOP_BROWSER_APPEAR_TIMEOUT_MS: i64 = 1300;
 const DEFAULT_BOOTSTRAP_STATE_JSON =
     \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
 ;
@@ -24,10 +22,6 @@ const IndexTemplate = struct {
 const LaunchMode = enum {
     desktop,
     web,
-};
-
-const LaunchWatchState = struct {
-    websocket_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
@@ -51,20 +45,8 @@ pub fn main() !void {
     rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
     const launch_policy: webui.LaunchPolicy = switch (launch_mode) {
-        .web => .{
-            .preferred_transport = .browser,
-            .fallback_transport = .browser,
-            .browser_open_mode = .on_browser_transport,
-            .app_mode_required = false,
-            .allow_dual_surface = false,
-        },
-        .desktop => .{
-            .preferred_transport = .native_webview,
-            .fallback_transport = .browser,
-            .browser_open_mode = .never,
-            .app_mode_required = false,
-            .allow_dual_surface = false,
-        },
+        .web => webui.LaunchPolicy.webUrlOnly(),
+        .desktop => webui.LaunchPolicy.webviewFirst(),
     };
 
     const window_style: webui.WindowStyle = if (force_web_mode)
@@ -76,13 +58,12 @@ pub fn main() !void {
 
     const browser_launch: webui.BrowserLaunchOptions = switch (launch_mode) {
         .web => .{
-            .require_app_mode_window = false,
-            .allow_system_fallback = true,
-            .force_isolated_chromium_instance = false,
+            .surface_mode = .tab,
+            .fallback_mode = .allow_system,
         },
         .desktop => .{
-            .require_app_mode_window = true,
-            .allow_system_fallback = true,
+            .surface_mode = .native_webview_host,
+            .fallback_mode = .allow_system,
         },
     };
 
@@ -99,7 +80,14 @@ pub fn main() !void {
             .style = window_style,
         },
         .rpc = .{
+            // Use WebUI async RPC job runner so HTTP handlers do not block on
+            // filesystem/network-heavy backend work.
             .dispatcher_mode = .sync,
+            .execution_mode = .queued_async,
+            .threaded_poll_interval_ns = 1 * std.time.ns_per_ms,
+            .job_queue_capacity = 512,
+            .job_poll_min_ms = 60,
+            .job_poll_max_ms = 300,
             .bridge_options = .{
                 .namespace = "webui",
                 .script_route = "/webui.js",
@@ -109,17 +97,12 @@ pub fn main() !void {
     });
     defer service.deinit();
 
-    // Upstream Service lifecycle regression workaround (still present in latest):
-    // WindowState stores a pointer to diagnostic callback state captured before
-    // Service returns, so rebind callbacks to the live service.app storage.
-    for (service.app.windows.items) |*state| {
-        state.diagnostic_callback = &service.app.diagnostic_callback;
-    }
-
-    var launch_watch = LaunchWatchState{};
-    service.onDiagnostic(onWebUiDiagnostic, &launch_watch);
-
     try service.show(.{ .html = page_html });
+    if (launch_mode == .web) {
+        service.openInBrowserWithOptions(browser_launch) catch |err| {
+            std.debug.print("Codex Manager web mode browser launch failed: {s}\n", .{@errorName(err)});
+        };
+    }
 
     const local_url = service.browserUrl() catch null;
     defer if (local_url) |url| allocator.free(url);
@@ -133,59 +116,10 @@ pub fn main() !void {
     }
 
     try service.run();
-    var desktop_app_fallback_launched = false;
-    var desktop_tab_fallback_launched = false;
-    const native_visibility_deadline_ms = std.time.milliTimestamp() + DESKTOP_NATIVE_APPEAR_TIMEOUT_MS;
-    var desktop_browser_deadline_ms: i64 = 0;
-
     while (!service.shouldExit()) {
-        if (launch_mode == .desktop and !launch_watch.websocket_connected.load(.acquire)) {
-            const now_ms = std.time.milliTimestamp();
-
-            if (!desktop_app_fallback_launched) {
-                const render_state = service.runtimeRenderState();
-                if (render_state.active_transport == .browser_fallback or now_ms >= native_visibility_deadline_ms) {
-                    triggerDesktopBrowserFallback(&service);
-                    desktop_app_fallback_launched = true;
-                    desktop_browser_deadline_ms = now_ms + DESKTOP_BROWSER_APPEAR_TIMEOUT_MS;
-                }
-            } else if (!desktop_tab_fallback_launched and now_ms >= desktop_browser_deadline_ms) {
-                triggerDesktopTabFallback(&service);
-                desktop_tab_fallback_launched = true;
-            }
-        }
-
+        try service.run();
         std.Thread.sleep(16 * std.time.ns_per_ms);
     }
-}
-
-fn onWebUiDiagnostic(context: ?*anyopaque, diagnostic: *const webui.Diagnostic) void {
-    if (context == null) return;
-    if (diagnostic.category != .websocket) return;
-    if (!std.mem.eql(u8, diagnostic.code, "websocket.connected")) return;
-
-    const state: *LaunchWatchState = @ptrCast(@alignCast(context.?));
-    state.websocket_connected.store(true, .release);
-}
-
-fn triggerDesktopBrowserFallback(service: *webui.Service) void {
-    service.openInBrowserWithOptions(.{
-        .require_app_mode_window = true,
-        .allow_system_fallback = false,
-    }) catch {
-        triggerDesktopTabFallback(service);
-    };
-}
-
-fn triggerDesktopTabFallback(service: *webui.Service) void {
-    service.applyStyle(.{}) catch {};
-    service.openInBrowserWithOptions(.{
-        .require_app_mode_window = false,
-        .allow_system_fallback = true,
-        .force_isolated_chromium_instance = false,
-    }) catch |err| {
-        std.debug.print("Codex Manager tab fallback launch failed: {s}\n", .{@errorName(err)});
-    };
 }
 
 fn hasArg(args: []const []const u8, needle: []const u8) bool {

@@ -226,6 +226,59 @@ const usageRefreshEpoch = (credits: CreditsInfo | undefined, currentEpoch: numbe
   return null;
 };
 
+type UsageRefreshRow = {
+  label: string | null;
+  value: string;
+};
+
+const refreshEpochFromWindow = (
+  refreshAt: number | null | undefined,
+  checkedAt: number,
+  fallbackWindowSeconds: number,
+  hasRemainingData: boolean,
+): number | null => {
+  if (refreshAt !== null && refreshAt !== undefined && Number.isFinite(refreshAt) && refreshAt > 0) {
+    return Math.floor(refreshAt);
+  }
+
+  if (hasRemainingData && Number.isFinite(checkedAt) && checkedAt > 0) {
+    return Math.floor(checkedAt) + fallbackWindowSeconds;
+  }
+
+  return null;
+};
+
+const usageRefreshRows = (
+  credits: CreditsInfo | undefined,
+  currentEpoch: number,
+  mode: UsageRefreshDisplayMode,
+): UsageRefreshRow[] => {
+  const formatValue = (epoch: number | null): string =>
+    mode === "remaining" ? formatUsageRefreshRemaining(epoch, currentEpoch) : formatUsageRefreshDateTime(epoch);
+
+  if (credits?.isPaidPlan) {
+    const hourlyEpoch = refreshEpochFromWindow(
+      credits.hourlyRefreshAt,
+      credits.checkedAt,
+      3600,
+      credits.hourlyRemainingPercent !== null,
+    );
+    const weeklyEpoch = refreshEpochFromWindow(
+      credits.weeklyRefreshAt,
+      credits.checkedAt,
+      7 * 24 * 3600,
+      credits.weeklyRemainingPercent !== null,
+    );
+
+    return [
+      { label: "Hourly", value: formatValue(hourlyEpoch) },
+      { label: "Weekly", value: formatValue(weeklyEpoch) },
+    ];
+  }
+
+  return [{ label: null, value: formatValue(usageRefreshEpoch(credits, currentEpoch)) }];
+};
+
 const accountTitle = (account: AccountSummary): string => {
   return account.label || account.email || account.accountId || account.id;
 };
@@ -1713,7 +1766,7 @@ function App() {
                   <For each={activeAccounts()}>
                     {(account) => {
                       const credits = () => creditsById()[account.id];
-                      const refreshEpoch = () => usageRefreshEpoch(credits(), nowTick());
+                      const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                       return (
                         <article
@@ -1796,11 +1849,21 @@ function App() {
                             <div>
                               <div class="usage-refresh-head">
                                 <p class="label">Usage refreshes</p>
-                                <p class="mono usage-refresh-value">
-                                  {usageRefreshDisplayMode() === "remaining"
-                                    ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
-                                    : formatUsageRefreshDateTime(refreshEpoch())}
-                                </p>
+                                <Show
+                                  when={refreshRows().length > 1}
+                                  fallback={<p class="mono usage-refresh-value">{refreshRows()[0]?.value ?? "Unknown"}</p>}
+                                >
+                                  <div class="usage-refresh-list">
+                                    <For each={refreshRows()}>
+                                      {(row) => (
+                                        <p class="mono usage-refresh-item">
+                                          <span class="usage-refresh-item-label">{row.label}</span>
+                                          <span class="usage-refresh-item-value">{row.value}</span>
+                                        </p>
+                                      )}
+                                    </For>
+                                  </div>
+                                </Show>
                               </div>
                             </div>
                           </div>
@@ -1896,7 +1959,7 @@ function App() {
                     <For each={depletedAccounts()}>
                       {(account) => {
                         const credits = () => creditsById()[account.id];
-                        const refreshEpoch = () => usageRefreshEpoch(credits(), nowTick());
+                        const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                         return (
                           <article
@@ -1980,11 +2043,21 @@ function App() {
                               <div>
                                 <div class="usage-refresh-head">
                                   <p class="label">Usage refreshes</p>
-                                  <p class="mono usage-refresh-value">
-                                    {usageRefreshDisplayMode() === "remaining"
-                                      ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
-                                      : formatUsageRefreshDateTime(refreshEpoch())}
-                                  </p>
+                                  <Show
+                                    when={refreshRows().length > 1}
+                                    fallback={<p class="mono usage-refresh-value">{refreshRows()[0]?.value ?? "Unknown"}</p>}
+                                  >
+                                    <div class="usage-refresh-list">
+                                      <For each={refreshRows()}>
+                                        {(row) => (
+                                          <p class="mono usage-refresh-item">
+                                            <span class="usage-refresh-item-label">{row.label}</span>
+                                            <span class="usage-refresh-item-value">{row.value}</span>
+                                          </p>
+                                        )}
+                                      </For>
+                                    </div>
+                                  </Show>
                                 </div>
                               </div>
                             </div>
@@ -2068,7 +2141,7 @@ function App() {
                       {(account) => {
                         const credits = () => creditsById()[account.id];
                         const availablePercent = () => quotaRemainingPercent(credits());
-                        const refreshEpoch = () => usageRefreshEpoch(credits(), nowTick());
+                        const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                         return (
                           <article
@@ -2109,11 +2182,21 @@ function App() {
                               <div>
                                 <div class="usage-refresh-head">
                                   <p class="label">Usage refreshes</p>
-                                  <p class="mono usage-refresh-value">
-                                    {usageRefreshDisplayMode() === "remaining"
-                                      ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
-                                      : formatUsageRefreshDateTime(refreshEpoch())}
-                                  </p>
+                                  <Show
+                                    when={refreshRows().length > 1}
+                                    fallback={<p class="mono usage-refresh-value">{refreshRows()[0]?.value ?? "Unknown"}</p>}
+                                  >
+                                    <div class="usage-refresh-list">
+                                      <For each={refreshRows()}>
+                                        {(row) => (
+                                          <p class="mono usage-refresh-item">
+                                            <span class="usage-refresh-item-label">{row.label}</span>
+                                            <span class="usage-refresh-item-value">{row.value}</span>
+                                          </p>
+                                        )}
+                                      </For>
+                                    </div>
+                                  </Show>
                                 </div>
                               </div>
                             </div>

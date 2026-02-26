@@ -840,6 +840,37 @@ select {
   white-space: nowrap;
 }
 
+.usage-refresh-list {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 0.16rem;
+}
+
+.usage-refresh-item {
+  margin: 0;
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  gap: 0.45rem;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.usage-refresh-item-label {
+  flex: none;
+  font-size: 0.67rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.usage-refresh-item-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .account-copyable {
   user-select: text;
   -webkit-user-select: text;
