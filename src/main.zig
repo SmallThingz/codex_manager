@@ -35,14 +35,20 @@ pub fn main() !void {
     initIndexTemplates();
     rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
+    const launch_policy: webui.LaunchPolicy = .{
+        .preferred_transport = if (force_web_mode) .browser else .native_webview,
+        .fallback_transport = .browser,
+        .browser_open_mode = .on_browser_transport,
+        .app_mode_required = true,
+        .allow_dual_surface = false,
+    };
+
     const page_html = makeDynamicIndexHtml(allocator) orelse return error.IndexHtmlUnavailable;
     defer allocator.free(page_html);
 
     var service = try webui.Service.init(allocator, rpc_webui.RpcBridgeMethods, .{
         .app = .{
-            .transport_mode = if (force_web_mode) .browser_fallback else .native_webview,
-            .auto_open_browser = false,
-            .browser_fallback_on_native_failure = true,
+            .launch_policy = launch_policy,
         },
         .window = .{
             .title = "Codex Manager",
@@ -61,28 +67,23 @@ pub fn main() !void {
     });
     defer service.deinit();
 
-    try service.show(.{ .html = page_html });
-
-    const should_open_browser = blk: {
-        if (force_web_mode) {
-            break :blk true;
-        }
-
-        const warning = service.lastWarning() orelse break :blk false;
-        break :blk std.mem.indexOf(u8, warning, "falling back to browser") != null;
-    };
-
-    if (should_open_browser) {
-        service.openInBrowserWithOptions(.{
-            .require_app_mode_window = true,
-        }) catch {};
+    // Upstream regression workaround: Service.init() currently copies App by value,
+    // leaving each WindowState.diagnostic_callback pointing at stale stack storage.
+    // Rebind window callback pointers to the live service.app instance.
+    for (service.app.windows.items) |*state| {
+        state.diagnostic_callback = &service.app.diagnostic_callback;
     }
+
+    try service.show(.{ .html = page_html });
 
     const local_url = service.browserUrl() catch null;
     defer if (local_url) |url| allocator.free(url);
 
     if (local_url) |url| {
-        const mode_label = if (force_web_mode) "web" else "desktop";
+        const mode_label = switch (service.runtimeRenderState().active_transport) {
+            .browser_fallback => "web",
+            .native_webview => "desktop",
+        };
         std.debug.print("Codex Manager {s} mode URL: {s}\n", .{ mode_label, url });
     }
 

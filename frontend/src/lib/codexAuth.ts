@@ -192,19 +192,28 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
 
     if (window.location.protocol === "http:" || window.location.protocol === "https:") {
       try {
+        const rpcPayload = JSON.stringify({
+          name: "call",
+          args: ["cm_rpc", request],
+        });
         const response = await fetch("/rpc", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: request,
+          body: rpcPayload,
           cache: "no-store",
         });
         if (!response.ok) {
           lastBridgeError = `HTTP bridge request failed (${response.status}).`;
         } else {
           const rawResponse = await response.text();
-          const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
+          const rpcResponse = JSON.parse(rawResponse) as { value?: string };
+          if (typeof rpcResponse.value !== "string") {
+            throw new Error(`Backend bridge call failed for op "${op}".`);
+          }
+
+          const parsed = JSON.parse(rpcResponse.value) as BridgeResult<T>;
           if (!parsed.ok) {
             throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
           }
