@@ -1,130 +1,87 @@
 # WebUI Post-Update Feedback Report
 
-## Scope
-This report updates prior feedback after upgrading `SmallThingz/webui` to:
-- `7e62b2c823c727e435cea95233f845ba5b7b3fd5`
+## Evaluated Versions
+- Previous: `7e62b2c823c727e435cea95233f845ba5b7b3fd5`
+- Latest: `8e771c5580d6d147ef1f3be12be84b97ff3af34b`
 
-It reflects integration results in this project (desktop + web fallback, bridge RPC, OAuth flow, runtime smoke checks).
+This report reflects the latest integration pass against `8e771c...`.
 
 ## Executive Summary
-A meaningful portion of prior feedback has been implemented upstream. The new API direction is substantially better and closer to a stable app platform:
-- Deterministic launch policy is now first-class.
-- Runtime render state introspection exists.
-- Runtime requirements probing exists.
-- Typed diagnostics exist.
-- Async RPC jobs now exist (`queued_async` mode + poll/cancel APIs).
+The major API improvements introduced in the previous update are still present and useful:
+- Deterministic `LaunchPolicy`
+- Runtime render introspection (`runtimeRenderState`)
+- Runtime requirement probing (`listRuntimeRequirements`)
+- Typed diagnostics (`onDiagnostic`)
+- Async RPC job model (`queued_async`, poll/cancel)
 
-This is a strong improvement over the previous contract.
+However, the critical `Service` lifecycle regression still exists in this latest commit and still requires a local workaround in this app.
 
-However, one critical regression remains in current `Service` lifecycle behavior:
-- `Service.init` leaves window diagnostic callback pointers stale after `App` value move.
-- This causes runtime crashes (segfault/GPF) on normal diagnostic emission paths (e.g. websocket connect, rpc dispatch error).
+## What Changed In This Latest Update
 
-The regression is severe enough to block clean adoption without a local workaround.
+## 1. Public API impact (for this app)
+For our integration path, no additional public API removals were observed between `7e62b2c...` and `8e771c...`.
+- Build-level API migration from old fields (like `transport_mode`) was already handled in the prior pass.
+- The current app still compiles against latest with the same adapted API usage.
 
-## What Improved (And Why It Matters)
+## 2. Critical runtime status
+The same runtime crash regression is still reproducible without workaround:
+- crash on diagnostic emission path (e.g. websocket connected event)
+- stack points to `emitDiagnostic` callback invocation from `Service`-created window state
 
-## 1. Deterministic launch policy
-New `LaunchPolicy` (`preferred_transport`, `fallback_transport`, `browser_open_mode`, `allow_dual_surface`, `app_mode_required`) is exactly the kind of API unification needed.
+Status:
+- **Not fixed upstream yet** (as of `8e771c...`).
 
-Impact:
-- Reduced ambiguity between native and browser modes.
-- Cleaner app startup code.
-- Better reasoning about dual-surface behavior.
+## 3. Bridge compatibility status
+Bridge envelope contract remains required for `/rpc` fallback traffic.
+- Our local envelope adaptation is still necessary and valid.
 
-## 2. Runtime render introspection
-`runtimeRenderState()` with `active_transport`, `fallback_applied`, `fallback_reason`, and browser process metadata is a major upgrade.
+## Current Local Implementation (Updated)
 
-Impact:
-- Eliminates warning-string parsing for transport/fallback decisions.
-- Allows deterministic telemetry and mode-aware behavior.
+## Dependency update
+`build.zig.zon` now pins:
+- `webui` URL: `git+https://github.com/SmallThingz/webui.git#8e771c5580d6d147ef1f3be12be84b97ff3af34b`
+- hash: `webui-0.0.0-NV0cf5MDBwA9QZygQDPoPVxmhDbZqIUgaMcWyMogw-Qu`
 
-## 3. Runtime requirement probing
-`listRuntimeRequirements()` addresses packaging and environment discovery pain directly.
+## Workaround retained (required)
+In `src/main.zig`, after `Service.init`, we rebind each `WindowState.diagnostic_callback` pointer to live `service.app` storage.
 
-Impact:
-- Better install/runtime diagnostics before showing UI.
-- Easier Linux support and release QA.
+Reason:
+- Without this, `zig build dev --` and `zig build dev -- --web` crash at runtime in latest commit.
 
-## 4. Typed diagnostics
-`onDiagnostic` + structured diagnostic payloads provide machine-readable signals.
+## Runtime/bridge adaptation retained
+In `frontend/src/lib/codexAuth.ts`, HTTP fallback now wraps payloads as bridge RPC envelopes (`{name,args}`) and decodes returned `value` string.
 
-Impact:
-- Better observability and error handling.
-- Better separation of transport/browser/rpc/lifecycle classes.
+Reason:
+- Required by current `/rpc` bridge protocol.
 
-## 5. Async RPC jobs
-`RpcOptions.execution_mode = .queued_async`, plus poll/cancel APIs and push updates, is a strong foundation for non-blocking backend operations.
+## Validation Results (Latest Commit)
+With current implementation + workaround:
+- `zig build` passes.
+- `zig test src/rpc.zig` passes.
+- `zig build dev --` runs (desktop URL printed, no crash during smoke window).
+- `zig build dev -- --web` runs (web URL printed, no crash during smoke window).
 
-Impact:
-- This maps well to long-running tasks.
-- Reduces need for app-authored ad-hoc threading/polling.
+Without workaround:
+- both desktop and web dev runs crash in `emitDiagnostic` path.
 
-## Remaining Issues (Priority Ordered)
+## Remaining Issues (Priority)
 
-## P0: `Service.init` diagnostic callback pointer lifetime bug
-Observed behavior in this project after update:
-- Crash in `root.zig` on `state.emitDiagnostic(...)` in websocket/rpc paths.
-- Stack consistently points to diagnostic callback invocation.
+## P0: `Service` diagnostic callback lifetime regression
+Likely root cause remains unchanged:
+- `WindowState` stores pointer to diagnostic callback state created before `Service` returns.
+- App value move in `Service.init` invalidates that pointer.
 
-Likely root cause:
-- `WindowState` stores `diagnostic_callback: *DiagnosticCallbackState`.
-- `Service.init` creates local `app`, creates windows with pointer to `&app.diagnostic_callback`, then returns `Service{ .app = app }` (value move).
-- Stored pointers remain bound to stale stack storage.
+Recommended upstream fix:
+1. Make callback storage address-stable across `Service.init` return.
+2. Add regression test that creates `Service`, emits websocket/rpc diagnostics, and verifies no invalid callback pointer access.
 
-Severity:
-- Critical runtime crash.
-- Reproducible in both desktop and web modes.
+## P1: Migration/compat guidance for bridge route
+Current route expects bridge envelope. Projects with custom `cm_rpc` wrappers need explicit migration examples.
 
-Temporary local workaround used here:
-- After `Service.init`, rebind each `WindowState.diagnostic_callback` to `&service.app.diagnostic_callback`.
-
-Required upstream fix:
-- Ensure callback storage has stable address across `Service.init`.
-- Options:
-1. Make `Service` hold `*App` (heap-allocated app) instead of value-copying `App`.
-2. Rebind window diagnostic pointers internally after moving `App` into `Service`.
-3. Avoid raw pointer storage for this callback path and route via owning app lookup.
-
-## P1: Bridge protocol compatibility guidance
-The RPC HTTP route now expects bridge payload envelope (`{name,args}`), not app-native payloads.
-
-Observed integration issue:
-- App-side fallback code that posted raw backend payloads to `/rpc` hit error paths.
-
-Fix applied locally:
-- Wrapped fallback requests into bridge envelope targeting `call("cm_rpc", request)`.
-
-Requested improvement:
-- Explicit compatibility/migration notes for bridge route payload format changes.
-- Optional “raw passthrough” route pattern for projects that embed a generic `cm_rpc` bridge.
-
-## P1: Service/API migration docs
-`AppOptions.transport_mode` style usage was replaced by `launch_policy` (good change), but migration guidance should explicitly map old field names to new fields and expected defaults.
-
-Requested improvement:
-- A concise migration table in `MIGRATION.md` for field-level changes.
-- Mention default behavior differences (e.g., app mode requirement/dual surface defaults).
-
-## P2: Strengthen release notes with regression callouts
-Given the crash severity above, release notes should include known regressions and suggested mitigations when discovered.
-
-Requested improvement:
-- Add “Known Issues” section per release.
-
-## Validation Summary In This Project
-After upgrading and adapting app code:
-- Build: `zig build` passes.
-- Unit tests: `zig test src/rpc.zig` passes.
-- Runtime smoke: `zig build dev --` and `zig build dev -- --web` run without crash after local `Service` pointer workaround.
-
-## Recommended Upstream Actions
-1. Fix `Service.init` pointer lifetime bug immediately (P0).
-2. Add regression test that validates diagnostics emission through `Service`-constructed windows after init return.
-3. Expand migration docs for bridge payload + launch policy mapping.
-4. Keep pushing current direction: launch policy, introspection, requirements, typed diagnostics, async jobs.
+## P1: Release notes clarity
+Include known runtime regressions and workarounds directly in release notes.
 
 ## Bottom Line
-This update is a substantial API improvement and aligns strongly with prior feedback.
+Latest update is usable in this project **only with local workaround still in place**.
 
-The current release is very close to being a strong long-term base, but the `Service` callback lifetime regression is a hard blocker that must be fixed upstream for safe default adoption.
+The API direction remains strong, but the `Service` diagnostic pointer bug is still the blocker for clean, workaround-free adoption.

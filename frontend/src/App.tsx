@@ -1559,7 +1559,11 @@ function App() {
                   </div>
                   <div class="settings-field">
                     <p class="label">Usage Refreshes Display</p>
-                    <select value={usageRefreshDisplayMode()} onChange={handleUsageRefreshDisplayModeChange}>
+                    <select
+                      class="settings-select"
+                      value={usageRefreshDisplayMode()}
+                      onChange={handleUsageRefreshDisplayModeChange}
+                    >
                       <option value="date">Refresh Date/Time</option>
                       <option value="remaining">Time Remaining</option>
                     </select>

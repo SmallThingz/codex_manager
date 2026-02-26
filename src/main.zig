@@ -10,6 +10,8 @@ const DEFAULT_HEIGHT: u32 = 760;
 const APP_ID = "com.codex.manager";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
+const DESKTOP_NATIVE_APPEAR_TIMEOUT_MS: i64 = 1800;
+const DESKTOP_BROWSER_APPEAR_TIMEOUT_MS: i64 = 1300;
 const DEFAULT_BOOTSTRAP_STATE_JSON =
     \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
 ;
@@ -17,6 +19,15 @@ const DEFAULT_BOOTSTRAP_STATE_JSON =
 const IndexTemplate = struct {
     prefix: []const u8,
     suffix: []const u8,
+};
+
+const LaunchMode = enum {
+    desktop,
+    web,
+};
+
+const LaunchWatchState = struct {
+    websocket_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
@@ -31,16 +42,48 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const force_web_mode = hasArg(args, "--web") and !hasArg(args, "--desktop");
+    const launch_mode: LaunchMode = if (hasArg(args, "--web") and !hasArg(args, "--desktop"))
+        .web
+    else
+        .desktop;
+    const force_web_mode = launch_mode == .web;
     initIndexTemplates();
     rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
-    const launch_policy: webui.LaunchPolicy = .{
-        .preferred_transport = if (force_web_mode) .browser else .native_webview,
-        .fallback_transport = .browser,
-        .browser_open_mode = .on_browser_transport,
-        .app_mode_required = true,
-        .allow_dual_surface = false,
+    const launch_policy: webui.LaunchPolicy = switch (launch_mode) {
+        .web => .{
+            .preferred_transport = .browser,
+            .fallback_transport = .browser,
+            .browser_open_mode = .on_browser_transport,
+            .app_mode_required = false,
+            .allow_dual_surface = false,
+        },
+        .desktop => .{
+            .preferred_transport = .native_webview,
+            .fallback_transport = .browser,
+            .browser_open_mode = .never,
+            .app_mode_required = false,
+            .allow_dual_surface = false,
+        },
+    };
+
+    const window_style: webui.WindowStyle = if (force_web_mode)
+        .{}
+    else
+        .{
+            .size = .{ .width = DEFAULT_WIDTH, .height = DEFAULT_HEIGHT },
+        };
+
+    const browser_launch: webui.BrowserLaunchOptions = switch (launch_mode) {
+        .web => .{
+            .require_app_mode_window = false,
+            .allow_system_fallback = true,
+            .force_isolated_chromium_instance = false,
+        },
+        .desktop => .{
+            .require_app_mode_window = true,
+            .allow_system_fallback = true,
+        },
     };
 
     const page_html = makeDynamicIndexHtml(allocator) orelse return error.IndexHtmlUnavailable;
@@ -49,12 +92,11 @@ pub fn main() !void {
     var service = try webui.Service.init(allocator, rpc_webui.RpcBridgeMethods, .{
         .app = .{
             .launch_policy = launch_policy,
+            .browser_launch = browser_launch,
         },
         .window = .{
             .title = "Codex Manager",
-            .style = .{
-                .size = .{ .width = DEFAULT_WIDTH, .height = DEFAULT_HEIGHT },
-            },
+            .style = window_style,
         },
         .rpc = .{
             .dispatcher_mode = .sync,
@@ -67,12 +109,15 @@ pub fn main() !void {
     });
     defer service.deinit();
 
-    // Upstream regression workaround: Service.init() currently copies App by value,
-    // leaving each WindowState.diagnostic_callback pointing at stale stack storage.
-    // Rebind window callback pointers to the live service.app instance.
+    // Upstream Service lifecycle regression workaround (still present in latest):
+    // WindowState stores a pointer to diagnostic callback state captured before
+    // Service returns, so rebind callbacks to the live service.app storage.
     for (service.app.windows.items) |*state| {
         state.diagnostic_callback = &service.app.diagnostic_callback;
     }
+
+    var launch_watch = LaunchWatchState{};
+    service.onDiagnostic(onWebUiDiagnostic, &launch_watch);
 
     try service.show(.{ .html = page_html });
 
@@ -80,17 +125,67 @@ pub fn main() !void {
     defer if (local_url) |url| allocator.free(url);
 
     if (local_url) |url| {
-        const mode_label = switch (service.runtimeRenderState().active_transport) {
-            .browser_fallback => "web",
-            .native_webview => "desktop",
+        const mode_label = switch (launch_mode) {
+            .web => "web",
+            .desktop => "desktop",
         };
         std.debug.print("Codex Manager {s} mode URL: {s}\n", .{ mode_label, url });
     }
 
     try service.run();
+    var desktop_app_fallback_launched = false;
+    var desktop_tab_fallback_launched = false;
+    const native_visibility_deadline_ms = std.time.milliTimestamp() + DESKTOP_NATIVE_APPEAR_TIMEOUT_MS;
+    var desktop_browser_deadline_ms: i64 = 0;
+
     while (!service.shouldExit()) {
+        if (launch_mode == .desktop and !launch_watch.websocket_connected.load(.acquire)) {
+            const now_ms = std.time.milliTimestamp();
+
+            if (!desktop_app_fallback_launched) {
+                const render_state = service.runtimeRenderState();
+                if (render_state.active_transport == .browser_fallback or now_ms >= native_visibility_deadline_ms) {
+                    triggerDesktopBrowserFallback(&service);
+                    desktop_app_fallback_launched = true;
+                    desktop_browser_deadline_ms = now_ms + DESKTOP_BROWSER_APPEAR_TIMEOUT_MS;
+                }
+            } else if (!desktop_tab_fallback_launched and now_ms >= desktop_browser_deadline_ms) {
+                triggerDesktopTabFallback(&service);
+                desktop_tab_fallback_launched = true;
+            }
+        }
+
         std.Thread.sleep(16 * std.time.ns_per_ms);
     }
+}
+
+fn onWebUiDiagnostic(context: ?*anyopaque, diagnostic: *const webui.Diagnostic) void {
+    if (context == null) return;
+    if (diagnostic.category != .websocket) return;
+    if (!std.mem.eql(u8, diagnostic.code, "websocket.connected")) return;
+
+    const state: *LaunchWatchState = @ptrCast(@alignCast(context.?));
+    state.websocket_connected.store(true, .release);
+}
+
+fn triggerDesktopBrowserFallback(service: *webui.Service) void {
+    service.openInBrowserWithOptions(.{
+        .require_app_mode_window = true,
+        .allow_system_fallback = false,
+    }) catch {
+        triggerDesktopTabFallback(service);
+    };
+}
+
+fn triggerDesktopTabFallback(service: *webui.Service) void {
+    service.applyStyle(.{}) catch {};
+    service.openInBrowserWithOptions(.{
+        .require_app_mode_window = false,
+        .allow_system_fallback = true,
+        .force_isolated_chromium_instance = false,
+    }) catch |err| {
+        std.debug.print("Codex Manager tab fallback launch failed: {s}\n", .{@errorName(err)});
+    };
 }
 
 fn hasArg(args: []const []const u8, needle: []const u8) bool {
