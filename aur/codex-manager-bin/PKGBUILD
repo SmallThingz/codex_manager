@@ -7,8 +7,8 @@ url="https://github.com/SmallThingz/codex_manager"
 license=('custom:unknown')
 depends=('curl')
 optdepends=(
-  'webkit2gtk-4.1: desktop WebView mode on Linux'
-  'gtk3: desktop WebView mode on Linux'
+  'webkitgtk-6.0: desktop WebView mode on Linux'
+  'gtk4: desktop WebView mode on Linux'
   'codex-cli: account import and auth.json switching support'
 )
 provides=('codex-manager')

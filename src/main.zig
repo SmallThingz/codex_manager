@@ -1,9 +1,6 @@
 const std = @import("std");
 const webui = @import("webui");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("stdlib.h");
-});
 
 const assets = @import("assets.zig");
 const rpc_webui = @import("rpc_webui.zig");
@@ -23,71 +20,61 @@ const IndexTemplate = struct {
 };
 
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
-var active_bundle: assets.Bundle = .web;
 var templates_initialized = false;
 var index_template: ?IndexTemplate = null;
 
 pub fn main() !void {
-    const allocator = std.heap.c_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     const force_web_mode = hasArg(args, "--web") and !hasArg(args, "--desktop");
-
-    if (builtin.os.tag == .linux and !force_web_mode) {
-        // Work around flaky EGL/DMABUF paths on some Linux+WebKitGTK stacks.
-        _ = c.setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 0);
-        _ = c.setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", 0);
-    }
-
-    var window = webui.newWindow();
     initIndexTemplates();
+    rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
-    webui.setConfig(.multi_client, true);
-    webui.setConfig(.use_cookies, true);
-    // Allow concurrent RPC handling; long-running operations (OAuth listener)
-    // must not block unrelated commands such as credits refresh.
-    webui.setConfig(.ui_event_blocking, false);
+    const page_html = makeDynamicIndexHtml(allocator) orelse return error.IndexHtmlUnavailable;
+    defer allocator.free(page_html);
 
-    // Keep browser/profile storage persistent across runs (theme, local state).
-    window.setProfile("codex-manager", ".codex-manager-profile");
-    window.setSize(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-    window.setEventBlocking(false);
+    var service = try webui.Service.init(allocator, rpc_webui.RpcBridgeMethods, .{
+        .app = .{
+            .transport_mode = if (force_web_mode) .browser_fallback else .native_webview,
+            .auto_open_browser = true,
+            .browser_fallback_on_native_failure = true,
+        },
+        .window = .{
+            .title = "Codex Manager",
+            .style = .{
+                .size = .{ .width = DEFAULT_WIDTH, .height = DEFAULT_HEIGHT },
+            },
+        },
+        .rpc = .{
+            .dispatcher_mode = .sync,
+            .bridge_options = .{
+                .namespace = "webui",
+                .script_route = "/webui.js",
+                .rpc_route = "/rpc",
+            },
+        },
+    });
+    defer service.deinit();
 
-    _ = try window.bind("cm_rpc", cmRpc);
+    try service.show(.{ .html = page_html });
 
-    // Serve app assets from a single embedded frontend bundle.
-    window.setFileHandler(customFileHandler);
-    _ = window.setPort(14555) catch {};
-    const url = try window.startServer("index.html");
-    const loopback_owned: ?[]const u8 = toLoopbackUrl(allocator, url) catch null;
-    const loopback_url = loopback_owned orelse url;
-    defer if (loopback_owned) |value| allocator.free(value);
-    const loopback_url_z = try allocator.dupeZ(u8, loopback_url);
-    defer allocator.free(loopback_url_z);
+    const local_url = service.browserUrl() catch null;
+    defer if (local_url) |url| allocator.free(url);
 
-    if (force_web_mode) {
-        active_bundle = .web;
-        std.debug.print("Codex Manager web mode URL: {s}\n", .{loopback_url});
-        webui.openUrl(loopback_url_z);
-    } else {
-        // Default mode is desktop; if WebView dependencies are unavailable, fall back to browser.
-        active_bundle = .desktop;
-        window.setCloseHandlerWv(cmWindowCloseHandler);
-
-        std.debug.print("Codex Manager desktop URL: {s}\n", .{loopback_url});
-        window.showWv(loopback_url_z) catch |err| {
-            active_bundle = .web;
-            std.debug.print(
-                "Desktop WebView unavailable ({s}); falling back to browser mode at {s}\n",
-                .{ @errorName(err), loopback_url },
-            );
-            webui.openUrl(loopback_url_z);
-        };
+    if (local_url) |url| {
+        const mode_label = if (force_web_mode) "web" else "desktop";
+        std.debug.print("Codex Manager {s} mode URL: {s}\n", .{ mode_label, url });
     }
 
-    webui.wait();
-    webui.clean();
+    try service.run();
+    while (!service.shouldExit()) {
+        std.Thread.sleep(16 * std.time.ns_per_ms);
+    }
 }
 
 fn hasArg(args: []const []const u8, needle: []const u8) bool {
@@ -98,17 +85,6 @@ fn hasArg(args: []const []const u8, needle: []const u8) bool {
     }
 
     return false;
-}
-
-fn toLoopbackUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
-    const parsed = std.Uri.parse(url) catch return error.InvalidUrl;
-    const port = parsed.port orelse return error.InvalidUrl;
-    const path = if (parsed.path.percent_encoded.len == 0) "/index.html" else parsed.path.percent_encoded;
-    return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}{s}", .{ port, path });
-}
-
-fn cmRpc(e: *webui.Event) void {
-    rpc_webui.handleRpcEvent(e, std.heap.c_allocator, &oauth_listener_cancel);
 }
 
 fn initIndexTemplates() void {
@@ -128,17 +104,6 @@ fn splitIndexTemplate(html: []const u8) ?IndexTemplate {
         .prefix = html[0..marker_index],
         .suffix = html[marker_index + BOOTSTRAP_PLACEHOLDER.len ..],
     };
-}
-
-fn stripQuery(path: []const u8) []const u8 {
-    const q = std.mem.indexOfScalar(u8, path, '?') orelse return path;
-    return path[0..q];
-}
-
-fn isIndexPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/") or
-        std.mem.eql(u8, path, "/index.html") or
-        std.mem.eql(u8, path, "index.html");
 }
 
 fn pathExists(path: []const u8) bool {
@@ -218,9 +183,8 @@ fn fallbackBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
 }
 
-fn makeDynamicIndexResponse(_: assets.Bundle) ?[]const u8 {
+fn makeDynamicIndexHtml(allocator: std.mem.Allocator) ?[]u8 {
     const template = index_template orelse return null;
-    const allocator = std.heap.c_allocator;
 
     const state_json = loadBootstrapStateJson(allocator) catch return null;
     defer allocator.free(state_json);
@@ -254,56 +218,32 @@ fn makeDynamicIndexResponse(_: assets.Bundle) ?[]const u8 {
     }) catch return null;
     defer allocator.free(html);
 
-    return makeHttpResponse("200 OK", "text/html; charset=utf-8", html);
+    return ensureModuleWebUiScript(allocator, html) catch null;
 }
 
-fn toWebUiManaged(bytes: []const u8) ?[]const u8 {
-    const out = webui.malloc(bytes.len) catch return null;
-    std.mem.copyForwards(u8, out, bytes);
-    return out;
-}
+fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
+    const module_tag = "<script type=\"module\" src=\"/webui.js\"></script>";
+    const legacy_tag = "<script src=\"/webui.js\"></script>";
 
-fn makeHttpResponse(status: []const u8, content_type: []const u8, body: []const u8) ?[]const u8 {
-    const allocator = std.heap.c_allocator;
-    const header = std.fmt.allocPrint(
-        allocator,
-        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        .{ status, content_type, body.len },
-    ) catch return null;
-    defer allocator.free(header);
-
-    const merged = std.fmt.allocPrint(allocator, "{s}{s}", .{ header, body }) catch return null;
-    defer allocator.free(merged);
-
-    return toWebUiManaged(merged);
-}
-
-fn customFileHandler(filename: []const u8) ?[]const u8 {
-    const path = stripQuery(filename);
-
-    if (isIndexPath(path)) {
-        if (makeDynamicIndexResponse(active_bundle)) |response| {
-            return response;
-        }
+    if (std.mem.indexOf(u8, html, module_tag) != null) {
+        return allocator.dupe(u8, html);
     }
 
-    if (assets.assetForPath(path)) |asset| {
-        return makeHttpResponse("200 OK", asset.content_type, asset.body);
+    if (std.mem.indexOf(u8, html, legacy_tag)) |legacy_idx| {
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+            html[0..legacy_idx],
+            module_tag,
+            html[legacy_idx + legacy_tag.len ..],
+        });
     }
 
-    if (std.mem.eql(u8, path, "/webui.js")) {
-        // Let WebUI serve its runtime bridge script.
-        return null;
+    if (std.mem.indexOf(u8, html, "</head>")) |head_idx| {
+        return std.fmt.allocPrint(allocator, "{s}{s}\n{s}", .{
+            html[0..head_idx],
+            module_tag,
+            html[head_idx..],
+        });
     }
 
-    // Let WebUI handle internal endpoints such as websocket transport.
-    return null;
-}
-
-fn cmWindowCloseHandler(_: usize) bool {
-    exitNow();
-}
-
-fn exitNow() noreturn {
-    std.process.exit(0);
+    return std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ html, module_tag });
 }

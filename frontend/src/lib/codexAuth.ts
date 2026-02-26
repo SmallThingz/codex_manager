@@ -10,6 +10,9 @@ const CODEX_ORIGINATOR = "codex_cli_rs";
 const CODEX_SCOPE = "openid profile email offline_access";
 const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token";
+const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
+const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC = 15;
+const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
 
 export type AccountSummary = {
   id: string;
@@ -56,6 +59,8 @@ export type CreditsInfo = {
   isPaidPlan: boolean;
   hourlyRemainingPercent: number | null;
   weeklyRemainingPercent: number | null;
+  hourlyRefreshAt: number | null;
+  weeklyRefreshAt: number | null;
   status: "available" | "unavailable" | "error";
   message: string;
   checkedAt: number;
@@ -92,6 +97,9 @@ export type EmbeddedBootstrapState = {
   autoArchiveZeroQuota: boolean;
   autoUnarchiveNonZeroQuota: boolean;
   autoSwitchAwayFromArchived: boolean;
+  autoRefreshActiveEnabled: boolean;
+  autoRefreshActiveIntervalSec: number;
+  usageRefreshDisplayMode: "date" | "remaining";
   view: AccountsView | null;
   usageById: Record<string, CreditsInfo>;
   savedAt: number;
@@ -431,6 +439,19 @@ const valueAsNumber = (value: unknown): number | null => {
   return null;
 };
 
+const normalizeAutoRefreshIntervalSec = (value: unknown): number => {
+  const parsed = valueAsNumber(value);
+  if (parsed === null) {
+    return AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC;
+  }
+
+  const normalized = Math.floor(parsed);
+  return Math.max(
+    AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC,
+    Math.min(AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC, normalized),
+  );
+};
+
 const parseCreditsPayload = (
   payload: Record<string, unknown>,
 ): { available: number | null; used: number | null; total: number | null } | null => {
@@ -448,55 +469,121 @@ const parseCreditsPayload = (
 };
 
 const parseRateLimitUsedPercent = (payload: Record<string, unknown>): number | null => {
-  const rateLimit = asRecord(payload.rate_limit);
-  const primaryWindow = asRecord(rateLimit?.primary_window);
-  return valueAsNumber(primaryWindow?.used_percent);
+  const rateLimit = asRecord(payload.rate_limit) ?? asRecord(payload.rateLimit);
+  const primaryWindow = asRecord(rateLimit?.primary_window) ?? asRecord(rateLimit?.primaryWindow);
+  return valueAsNumber(primaryWindow?.used_percent) ?? valueAsNumber(primaryWindow?.usedPercent);
 };
 
 type RateLimitWindowInfo = {
   usedPercent: number;
   windowSeconds: number;
+  refreshAt: number | null;
+};
+
+const parseEpochSeconds = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value > 1_000_000_000_000) {
+      return Math.floor(value / 1000);
+    }
+    return Math.floor(value);
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const asNumber = Number.parseFloat(trimmed);
+    if (Number.isFinite(asNumber)) {
+      if (asNumber > 1_000_000_000_000) {
+        return Math.floor(asNumber / 1000);
+      }
+      return Math.floor(asNumber);
+    }
+
+    const parsedDate = Date.parse(trimmed);
+    if (Number.isFinite(parsedDate)) {
+      return Math.floor(parsedDate / 1000);
+    }
+  }
+
+  return null;
 };
 
 const clampPercent = (value: number): number => Math.max(0, Math.min(100, value));
 
-const parseRateLimitWindows = (rateLimit: Record<string, unknown> | null): RateLimitWindowInfo[] => {
+const parseRateLimitWindows = (
+  rateLimit: Record<string, unknown> | null,
+  checkedAt: number,
+): RateLimitWindowInfo[] => {
   if (!rateLimit) {
     return [];
   }
 
   const windows: RateLimitWindowInfo[] = [];
 
-  for (const key of ["primary_window", "secondary_window"]) {
+  for (const key of ["primary_window", "secondary_window", "primaryWindow", "secondaryWindow"]) {
     const window = asRecord(rateLimit[key]);
-    const usedPercent = valueAsNumber(window?.used_percent);
-    const windowSeconds = valueAsNumber(window?.limit_window_seconds);
+    const usedPercent = valueAsNumber(window?.used_percent) ?? valueAsNumber(window?.usedPercent);
+    const windowSeconds = valueAsNumber(window?.limit_window_seconds) ?? valueAsNumber(window?.limitWindowSeconds);
 
     if (usedPercent === null || windowSeconds === null) {
       continue;
     }
 
+    const refreshAt =
+      parseEpochSeconds(window?.next_reset_at) ??
+      parseEpochSeconds(window?.nextResetAt) ??
+      parseEpochSeconds(window?.reset_at) ??
+      parseEpochSeconds(window?.resetAt) ??
+      parseEpochSeconds(window?.resets_at) ??
+      parseEpochSeconds(window?.resetsAt) ??
+      parseEpochSeconds(window?.window_reset_at) ??
+      parseEpochSeconds(window?.windowResetAt) ??
+      parseEpochSeconds(window?.next_refresh_at) ??
+      parseEpochSeconds(window?.nextRefreshAt) ??
+      parseEpochSeconds(window?.refresh_at) ??
+      parseEpochSeconds(window?.refreshAt) ??
+      (() => {
+        const resetInSeconds =
+          valueAsNumber(window?.seconds_until_reset) ??
+          valueAsNumber(window?.secondsUntilReset) ??
+          valueAsNumber(window?.reset_in_seconds) ??
+          valueAsNumber(window?.resetInSeconds) ??
+          valueAsNumber(window?.time_until_reset_seconds) ??
+          valueAsNumber(window?.timeUntilResetSeconds) ??
+          valueAsNumber(window?.window_remaining_seconds);
+        if (resetInSeconds === null || resetInSeconds < 0) {
+          return null;
+        }
+        return checkedAt + Math.floor(resetInSeconds);
+      })();
+
     windows.push({
       usedPercent: clampPercent(usedPercent),
       windowSeconds,
+      refreshAt,
     });
   }
 
   return windows;
 };
 
-const collectAllRateLimitWindows = (payload: Record<string, unknown>): RateLimitWindowInfo[] => {
+const collectAllRateLimitWindows = (payload: Record<string, unknown>, checkedAt: number): RateLimitWindowInfo[] => {
   const windows: RateLimitWindowInfo[] = [];
-  windows.push(...parseRateLimitWindows(asRecord(payload.rate_limit)));
+  windows.push(...parseRateLimitWindows(asRecord(payload.rate_limit) ?? asRecord(payload.rateLimit), checkedAt));
 
-  const additional = payload.additional_rate_limits;
+  const additional = payload.additional_rate_limits ?? payload.additionalRateLimits;
   if (!Array.isArray(additional)) {
     return windows;
   }
 
   for (const entry of additional) {
     const record = asRecord(entry);
-    windows.push(...parseRateLimitWindows(asRecord(record?.rate_limit)));
+    windows.push(
+      ...parseRateLimitWindows(asRecord(record?.rate_limit) ?? asRecord(record?.rateLimit), checkedAt),
+    );
   }
 
   return windows;
@@ -508,6 +595,22 @@ const remainingFromWindow = (window: RateLimitWindowInfo | null): number | null 
   }
 
   return clampPercent(100 - window.usedPercent);
+};
+
+const refreshAtFromWindow = (window: RateLimitWindowInfo | null, checkedAt: number): number | null => {
+  if (!window) {
+    return null;
+  }
+
+  if (window.refreshAt !== null) {
+    return window.refreshAt;
+  }
+
+  if (window.windowSeconds > 0) {
+    return checkedAt + Math.floor(window.windowSeconds);
+  }
+
+  return null;
 };
 
 const pickWeeklyWindow = (windows: RateLimitWindowInfo[]): RateLimitWindowInfo | null => {
@@ -559,6 +662,7 @@ const pickHourlyWindow = (
 
 const parseWhamCredits = (
   payload: Record<string, unknown>,
+  checkedAt: number,
 ): {
   balance: number | null;
   hasCredits: boolean | null;
@@ -568,6 +672,8 @@ const parseWhamCredits = (
   isPaidPlan: boolean;
   hourlyRemainingPercent: number | null;
   weeklyRemainingPercent: number | null;
+  hourlyRefreshAt: number | null;
+  weeklyRefreshAt: number | null;
 } => {
   const credits = asRecord(payload.credits);
   const balance = valueAsNumber(credits?.balance);
@@ -576,11 +682,13 @@ const parseWhamCredits = (
   const usedPercent = parseRateLimitUsedPercent(payload);
   const planType = normalizeOptional(getString(payload, "plan_type"));
   const isPaidPlan = Boolean(planType && planType.toLowerCase() !== "free");
-  const windows = collectAllRateLimitWindows(payload);
-  const weeklyWindow = isPaidPlan ? pickWeeklyWindow(windows) : null;
-  const hourlyWindow = isPaidPlan ? pickHourlyWindow(windows, weeklyWindow) : null;
+  const windows = collectAllRateLimitWindows(payload, checkedAt);
+  const weeklyWindow = pickWeeklyWindow(windows);
+  const hourlyWindow = pickHourlyWindow(windows, weeklyWindow);
   const hourlyRemainingPercent = isPaidPlan ? remainingFromWindow(hourlyWindow) : null;
   const weeklyRemainingPercent = isPaidPlan ? remainingFromWindow(weeklyWindow) : null;
+  const hourlyRefreshAt = refreshAtFromWindow(hourlyWindow, checkedAt);
+  const weeklyRefreshAt = refreshAtFromWindow(weeklyWindow, checkedAt);
 
   return {
     balance,
@@ -591,6 +699,8 @@ const parseWhamCredits = (
     isPaidPlan,
     hourlyRemainingPercent,
     weeklyRemainingPercent,
+    hourlyRefreshAt,
+    weeklyRefreshAt,
   };
 };
 
@@ -904,6 +1014,9 @@ const asBootstrapState = (value: unknown): EmbeddedBootstrapState | null => {
     autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? legacyAutoArchiveEnabled,
     autoUnarchiveNonZeroQuota: valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? false,
     autoSwitchAwayFromArchived: valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? true,
+    autoRefreshActiveEnabled: valueAsBoolean(parsed.autoRefreshActiveEnabled) ?? false,
+    autoRefreshActiveIntervalSec: normalizeAutoRefreshIntervalSec(parsed.autoRefreshActiveIntervalSec),
+    usageRefreshDisplayMode: getString(parsed, "usageRefreshDisplayMode") === "remaining" ? "remaining" : "date",
     view,
     usageById,
     savedAt: valueAsNumber(parsed.savedAt) ?? nowEpoch(),
@@ -1221,6 +1334,8 @@ const fetchLegacyCreditsFromApiKey = async (apiKey: string, checkedAt: number): 
         isPaidPlan: false,
         hourlyRemainingPercent: null,
         weeklyRemainingPercent: null,
+        hourlyRefreshAt: null,
+        weeklyRefreshAt: null,
         status: "available",
         message: "Remaining credits loaded from billing endpoint.",
         checkedAt,
@@ -1243,6 +1358,8 @@ const fetchLegacyCreditsFromApiKey = async (apiKey: string, checkedAt: number): 
     isPaidPlan: false,
     hourlyRemainingPercent: null,
     weeklyRemainingPercent: null,
+    hourlyRefreshAt: null,
+    weeklyRefreshAt: null,
     status: "error",
     message: lastError,
     checkedAt,
@@ -1278,6 +1395,8 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
           isPaidPlan: false,
           hourlyRemainingPercent: null,
           weeklyRemainingPercent: null,
+          hourlyRefreshAt: null,
+          weeklyRefreshAt: null,
           status: "error",
           message: `Usage endpoint ${endpoint} returned ${usage.status}.${detail}`,
           checkedAt,
@@ -1298,13 +1417,15 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
           isPaidPlan: false,
           hourlyRemainingPercent: null,
           weeklyRemainingPercent: null,
+          hourlyRefreshAt: null,
+          weeklyRefreshAt: null,
           status: "error",
           message: `Usage endpoint ${endpoint} returned invalid JSON.`,
           checkedAt,
         };
       }
 
-      const parsed = parseWhamCredits(payload);
+      const parsed = parseWhamCredits(payload, checkedAt);
 
       if (parsed.balance !== null) {
         return {
@@ -1319,6 +1440,8 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
           isPaidPlan: parsed.isPaidPlan,
           hourlyRemainingPercent: parsed.hourlyRemainingPercent,
           weeklyRemainingPercent: parsed.weeklyRemainingPercent,
+          hourlyRefreshAt: parsed.hourlyRefreshAt,
+          weeklyRefreshAt: parsed.weeklyRefreshAt,
           status: "available",
           message: "Remaining credits loaded from Codex usage endpoint.",
           checkedAt,
@@ -1339,6 +1462,8 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
           isPaidPlan: parsed.isPaidPlan,
           hourlyRemainingPercent: parsed.hourlyRemainingPercent,
           weeklyRemainingPercent: parsed.weeklyRemainingPercent,
+          hourlyRefreshAt: parsed.hourlyRefreshAt,
+          weeklyRefreshAt: parsed.weeklyRefreshAt,
           status: "available",
           message: "Usage fallback loaded from rate-limit percent.",
           checkedAt,
@@ -1362,6 +1487,8 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
         isPaidPlan: parsed.isPaidPlan,
         hourlyRemainingPercent: parsed.hourlyRemainingPercent,
         weeklyRemainingPercent: parsed.weeklyRemainingPercent,
+        hourlyRefreshAt: parsed.hourlyRefreshAt,
+        weeklyRefreshAt: parsed.weeklyRefreshAt,
         status: "error",
         message: `Usage endpoint returned no balance or rate-limit usage data (${flags}).`,
         checkedAt,
@@ -1380,6 +1507,8 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
         isPaidPlan: false,
         hourlyRemainingPercent: null,
         weeklyRemainingPercent: null,
+        hourlyRefreshAt: null,
+        weeklyRefreshAt: null,
         status: "error",
         message: `Failed to fetch usage from ${endpoint}: ${detail}`,
         checkedAt,
@@ -1404,6 +1533,8 @@ const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
     isPaidPlan: false,
     hourlyRemainingPercent: null,
     weeklyRemainingPercent: null,
+    hourlyRefreshAt: null,
+    weeklyRefreshAt: null,
     status: "unavailable",
     message: "No access token available for this account.",
     checkedAt,
@@ -1650,6 +1781,8 @@ export const getRemainingCredits = async (): Promise<CreditsInfo> => {
       isPaidPlan: false,
       hourlyRemainingPercent: null,
       weeklyRemainingPercent: null,
+      hourlyRefreshAt: null,
+      weeklyRefreshAt: null,
       status: "unavailable",
       message,
       checkedAt: nowEpoch(),
@@ -1676,6 +1809,8 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
       isPaidPlan: false,
       hourlyRemainingPercent: null,
       weeklyRemainingPercent: null,
+      hourlyRefreshAt: null,
+      weeklyRefreshAt: null,
       status: "unavailable",
       message: "Account not found.",
       checkedAt: nowEpoch(),

@@ -1,31 +1,39 @@
 const std = @import("std");
-const webui = @import("webui");
 const rpc = @import("rpc.zig");
 
-pub fn handleRpcEvent(e: *webui.Event, allocator: std.mem.Allocator, cancel_ptr: *std.atomic.Value(bool)) void {
-    const response = rpc.handleRpcText(allocator, e.getString(), cancel_ptr) catch {
-        return sendError(e, allocator, "internal RPC failure");
-    };
-    defer allocator.free(response);
-    returnJsonToEvent(e, allocator, response);
-}
+pub const RpcBridgeMethods = struct {
+    pub fn call(target_fn: []const u8, request_text: []const u8) []const u8 {
+        if (!std.mem.eql(u8, target_fn, "cm_rpc")) {
+            return "{\"ok\":false,\"error\":\"unknown bridge function\"}";
+        }
 
-fn returnJsonToEvent(e: *webui.Event, allocator: std.mem.Allocator, json_text: []const u8) void {
-    const json_z = allocator.dupeZ(u8, json_text) catch {
-        e.returnString("{\"ok\":false,\"error\":\"internal allocation error\"}");
-        return;
-    };
-    defer allocator.free(json_z);
-    e.returnString(json_z);
-}
+        const cancel_ptr = bridge_cancel_ptr orelse {
+            return "{\"ok\":false,\"error\":\"RPC bridge not initialized\"}";
+        };
 
-fn sendError(e: *webui.Event, allocator: std.mem.Allocator, message: []const u8) void {
-    const json = std.fmt.allocPrint(allocator, "{f}", .{
-        std.json.fmt(.{ .ok = false, .@"error" = message }, .{}),
-    }) catch {
-        e.returnString("{\"ok\":false,\"error\":\"internal serialization error\"}");
-        return;
-    };
-    defer allocator.free(json);
-    returnJsonToEvent(e, allocator, json);
+        const rpc_response = rpc.handleRpcText(std.heap.page_allocator, request_text, cancel_ptr) catch {
+            return "{\"ok\":false,\"error\":\"internal RPC failure\"}";
+        };
+        defer std.heap.page_allocator.free(rpc_response);
+
+        bridge_response_lock.lock();
+        defer bridge_response_lock.unlock();
+
+        if (rpc_response.len > bridge_response_storage.len) {
+            return "{\"ok\":false,\"error\":\"RPC response exceeds bridge buffer\"}";
+        }
+
+        @memcpy(bridge_response_storage[0..rpc_response.len], rpc_response);
+        bridge_response_len = rpc_response.len;
+        return bridge_response_storage[0..bridge_response_len];
+    }
+};
+
+var bridge_cancel_ptr: ?*std.atomic.Value(bool) = null;
+var bridge_response_lock: std.Thread.Mutex = .{};
+var bridge_response_storage: [8 * 1024 * 1024]u8 = undefined;
+var bridge_response_len: usize = 0;
+
+pub fn setCancelPointer(cancel_ptr: *std.atomic.Value(bool)) void {
+    bridge_cancel_ptr = cancel_ptr;
 }

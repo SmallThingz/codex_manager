@@ -214,13 +214,14 @@ pub fn build(b: *std.Build) void {
         frontend_build_step = &frontend_build.step;
     }
 
-    const zig_webui = b.dependency("zig_webui", .{
+    const webui_dep = b.dependency("webui", .{
         .target = target,
         .optimize = optimize,
-        .enable_tls = false,
-        .is_static = true,
+        .dynamic = false,
+        .@"enable-tls" = false,
+        .@"enable-webui-log" = false,
     });
-    const webui_module = zig_webui.module("webui");
+    const webui_module = webui_dep.module("webui");
     if (target.result.os.tag == .macos) {
         if (b.sysroot) |sysroot| {
             const frameworks_path = b.fmt("{s}/System/Library/Frameworks", .{sysroot});

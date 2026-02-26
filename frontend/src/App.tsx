@@ -28,20 +28,81 @@ import "./App.css";
 type CreditsByAccount = Record<string, CreditsInfo | undefined>;
 
 type Theme = "light" | "dark";
+type UsageRefreshDisplayMode = "date" | "remaining";
 const QUOTA_EPSILON = 0.0001;
 const DRAG_SELECT_LOCK_CLASS = "drag-select-lock";
 const AUTO_ARCHIVE_ZERO_QUOTA = true;
 const AUTO_UNARCHIVE_NON_ZERO_QUOTA = true;
 const AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN = true;
+const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC = 15;
+const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
+const AUTO_REFRESH_ACTIVE_STEP_SEC = 15;
+const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
+const AUTO_REFRESH_DEPLETED_COOLDOWN_SEC = 30;
 
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
-const formatEpoch = (epoch: number | null | undefined): string => {
-  if (!epoch) {
-    return "Never";
+const pad2 = (value: number): string => String(value).padStart(2, "0");
+
+const normalizeAutoRefreshIntervalSec = (value: number | null | undefined): number => {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC;
   }
 
-  return new Date(epoch * 1000).toLocaleString();
+  const normalized = Math.floor(value);
+  return Math.max(
+    AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC,
+    Math.min(AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC, normalized),
+  );
+};
+
+const formatAutoRefreshInterval = (intervalSec: number): string => {
+  const hours = Math.floor(intervalSec / 3600);
+  const minutes = Math.floor((intervalSec % 3600) / 60);
+  const seconds = intervalSec % 60;
+  if (hours > 0) {
+    return `${hours}h ${pad2(minutes)}m ${pad2(seconds)}s`;
+  }
+  return `${minutes}m ${pad2(seconds)}s`;
+};
+
+const formatUsageRefreshDateTime = (epoch: number | null | undefined): string => {
+  if (!epoch) {
+    return "Unknown";
+  }
+
+  const value = new Date(epoch * 1000);
+  const month = pad2(value.getMonth() + 1);
+  const day = pad2(value.getDate());
+  const year = pad2(value.getFullYear() % 100);
+  const hours = pad2(value.getHours());
+  const minutes = pad2(value.getMinutes());
+  const seconds = pad2(value.getSeconds());
+  return `${month}/${day}/${year} ${hours}:${minutes}:${seconds}`;
+};
+
+const formatUsageRefreshRemaining = (
+  epoch: number | null | undefined,
+  currentEpoch: number,
+): string => {
+  if (!epoch) {
+    return "Unknown";
+  }
+
+  const remaining = Math.max(0, Math.floor(epoch - currentEpoch));
+  const days = Math.floor(remaining / 86400);
+  const hours = Math.floor((remaining % 86400) / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const seconds = remaining % 60;
+  return `${days}d ${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}`;
+};
+
+const normalizeUsageRefreshDisplayMode = (value: string | null | undefined): UsageRefreshDisplayMode => {
+  if (value === "remaining") {
+    return "remaining";
+  }
+
+  return "date";
 };
 
 const numberOrDash = (value: number | null): string => {
@@ -134,6 +195,37 @@ const hasNonZeroQuotaRemaining = (credits: CreditsInfo | undefined): boolean => 
   return remaining !== null && remaining > QUOTA_EPSILON;
 };
 
+const usageRefreshEpoch = (credits: CreditsInfo | undefined, currentEpoch: number): number | null => {
+  if (!credits || credits.status !== "available") {
+    return null;
+  }
+
+  const candidates = [credits.hourlyRefreshAt ?? null, credits.weeklyRefreshAt ?? null].filter(
+    (value): value is number => value !== null && Number.isFinite(value) && value > 0,
+  );
+
+  const upcoming = candidates.filter((value) => value >= currentEpoch);
+  if (upcoming.length > 0) {
+    return Math.min(...upcoming);
+  }
+
+  if (candidates.length > 0) {
+    return Math.min(...candidates);
+  }
+
+  // Fallback for older cached entries that predate explicit refresh timestamps.
+  if (Number.isFinite(credits.checkedAt) && credits.checkedAt > 0) {
+    if (credits.hourlyRemainingPercent !== null) {
+      return Math.floor(credits.checkedAt) + 3600;
+    }
+    if (credits.weeklyRemainingPercent !== null) {
+      return Math.floor(credits.checkedAt) + 7 * 24 * 3600;
+    }
+  }
+
+  return null;
+};
+
 const accountTitle = (account: AccountSummary): string => {
   return account.label || account.email || account.accountId || account.id;
 };
@@ -172,6 +264,12 @@ const IconSun = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <circle cx="12" cy="12" r="4" />
     <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+  </svg>
+);
+
+const IconSettings = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.57 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
   </svg>
 );
 
@@ -264,7 +362,17 @@ function App() {
   const [browserStart, setBrowserStart] = createSignal<BrowserLoginStart | null>(null);
   const [apiKeyDraft, setApiKeyDraft] = createSignal("");
   const [theme, setTheme] = createSignal<Theme>(embeddedState?.theme === "dark" ? "dark" : "light");
+  const [autoRefreshActiveEnabled, setAutoRefreshActiveEnabled] = createSignal(
+    embeddedState?.autoRefreshActiveEnabled === true,
+  );
+  const [autoRefreshActiveIntervalSec, setAutoRefreshActiveIntervalSec] = createSignal(
+    normalizeAutoRefreshIntervalSec(embeddedState?.autoRefreshActiveIntervalSec),
+  );
+  const [usageRefreshDisplayMode, setUsageRefreshDisplayMode] = createSignal<UsageRefreshDisplayMode>(
+    normalizeUsageRefreshDisplayMode(embeddedState?.usageRefreshDisplayMode),
+  );
   const [addMenuOpen, setAddMenuOpen] = createSignal(false);
+  const [settingsMenuOpen, setSettingsMenuOpen] = createSignal(false);
   const [isListeningForCallback, setIsListeningForCallback] = createSignal(false);
   const [showDepleted, setShowDepleted] = createSignal(false);
   const [showFrozen, setShowFrozen] = createSignal(false);
@@ -273,17 +381,25 @@ function App() {
   const [dragHover, setDragHover] = createSignal<{ bucket: AccountBucket; targetId: string | null } | null>(null);
   const [refreshingById, setRefreshingById] = createSignal<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = createSignal(false);
+  const [nowTick, setNowTick] = createSignal(nowEpoch());
   const [initializing, setInitializing] = createSignal(!hasEmbeddedState);
   const [busy, setBusy] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
   let callbackListenRunId = 0;
   let autoQuotaSyncInFlight = false;
+  let autoDepletedRefreshInFlight = false;
+  let autoActiveRefreshInFlight = false;
+  let lastActiveAutoRefreshAt = 0;
+  let depletedAutoRefreshCooldownUntil = 0;
   let persistStateTimer: number | undefined;
   let addMenuRef: HTMLDivElement | undefined;
   let addButtonRef: HTMLButtonElement | undefined;
+  let settingsMenuRef: HTMLDivElement | undefined;
+  let settingsButtonRef: HTMLButtonElement | undefined;
   let dragPreviewElement: HTMLDivElement | undefined;
   let contentScrollRef: HTMLElement | undefined;
+  let nowTickInterval: number | undefined;
 
   const activeAccounts = createMemo(
     () => view()?.accounts.filter((account) => !account.archived && !account.frozen) || [],
@@ -296,6 +412,9 @@ function App() {
   );
   const addMenuVisible = createMemo(
     () => !initializing() && addMenuOpen(),
+  );
+  const settingsMenuVisible = createMemo(
+    () => !initializing() && settingsMenuOpen(),
   );
   const visibleNotice = createMemo(() => {
     if (initializing()) {
@@ -380,6 +499,9 @@ function App() {
         autoArchiveZeroQuota: AUTO_ARCHIVE_ZERO_QUOTA,
         autoUnarchiveNonZeroQuota: AUTO_UNARCHIVE_NON_ZERO_QUOTA,
         autoSwitchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+        autoRefreshActiveEnabled: autoRefreshActiveEnabled(),
+        autoRefreshActiveIntervalSec: autoRefreshActiveIntervalSec(),
+        usageRefreshDisplayMode: usageRefreshDisplayMode(),
         view: currentView,
         usageById: normalizedCreditsCache(),
         savedAt: nowEpoch(),
@@ -676,6 +798,98 @@ function App() {
 
     await refreshCreditsForAccounts(ids);
     setNotice("Frozen account credits refreshed.");
+  };
+
+  const maybeAutoRefreshDepleted = async (currentEpoch: number) => {
+    if (autoDepletedRefreshInFlight || currentEpoch < depletedAutoRefreshCooldownUntil) {
+      return;
+    }
+
+    const refreshing = refreshingById();
+    const cachedCredits = creditsById();
+    const dueIds = depletedAccounts()
+      .map((account) => account.id)
+      .filter((id) => {
+        if (refreshing[id]) {
+          return false;
+        }
+
+        const refreshAt = usageRefreshEpoch(cachedCredits[id], currentEpoch);
+        return refreshAt !== null && refreshAt <= currentEpoch;
+      });
+
+    if (dueIds.length === 0) {
+      return;
+    }
+
+    autoDepletedRefreshInFlight = true;
+    depletedAutoRefreshCooldownUntil = currentEpoch + AUTO_REFRESH_DEPLETED_COOLDOWN_SEC;
+    try {
+      await refreshCreditsForAccounts(dueIds, { quiet: true });
+    } finally {
+      autoDepletedRefreshInFlight = false;
+    }
+  };
+
+  const maybeAutoRefreshActive = async (currentEpoch: number) => {
+    if (!autoRefreshActiveEnabled() || autoActiveRefreshInFlight) {
+      return;
+    }
+
+    const intervalSec = normalizeAutoRefreshIntervalSec(autoRefreshActiveIntervalSec());
+    if (currentEpoch - lastActiveAutoRefreshAt < intervalSec) {
+      return;
+    }
+
+    const refreshing = refreshingById();
+    const ids = activeAccounts()
+      .map((account) => account.id)
+      .filter((id) => !refreshing[id]);
+    if (ids.length === 0) {
+      lastActiveAutoRefreshAt = currentEpoch;
+      return;
+    }
+
+    autoActiveRefreshInFlight = true;
+    lastActiveAutoRefreshAt = currentEpoch;
+    try {
+      await refreshCreditsForAccounts(ids, { quiet: true });
+    } finally {
+      autoActiveRefreshInFlight = false;
+    }
+  };
+
+  const handleToggleAutoRefreshActive = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement | null;
+    const next = input ? input.checked : !autoRefreshActiveEnabled();
+    setAutoRefreshActiveEnabled(next);
+    if (next) {
+      lastActiveAutoRefreshAt = 0;
+    }
+    schedulePersistEmbeddedState();
+  };
+
+  const handleAutoRefreshIntervalInput = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement | null;
+    if (!input) {
+      return;
+    }
+
+    const parsed = Number.parseInt(input.value, 10);
+    const next = normalizeAutoRefreshIntervalSec(Number.isFinite(parsed) ? parsed : null);
+    setAutoRefreshActiveIntervalSec(next);
+    schedulePersistEmbeddedState();
+  };
+
+  const handleUsageRefreshDisplayModeChange = (event: Event) => {
+    const select = event.currentTarget as HTMLSelectElement | null;
+    if (!select) {
+      return;
+    }
+
+    const next = normalizeUsageRefreshDisplayMode(select.value);
+    setUsageRefreshDisplayMode(next);
+    schedulePersistEmbeddedState();
   };
 
   const refreshAccounts = async (initialLoad = false) => {
@@ -1232,15 +1446,30 @@ function App() {
           setAddMenuOpen(false);
         }
       }
+
+      if (settingsMenuVisible()) {
+        if (!settingsMenuRef?.contains(target) && !settingsButtonRef?.contains(target)) {
+          setSettingsMenuOpen(false);
+        }
+      }
     };
 
     window.addEventListener("pointerdown", handlePointerDown);
     window.addEventListener("pointerup", releaseDragSelectionLock);
     window.addEventListener("pointercancel", releaseDragSelectionLock);
+    nowTickInterval = window.setInterval(() => {
+      const currentEpoch = nowEpoch();
+      setNowTick(currentEpoch);
+      void maybeAutoRefreshDepleted(currentEpoch);
+      void maybeAutoRefreshActive(currentEpoch);
+    }, 1000);
     onCleanup(() => {
       window.removeEventListener("pointerdown", handlePointerDown);
       window.removeEventListener("pointerup", releaseDragSelectionLock);
       window.removeEventListener("pointercancel", releaseDragSelectionLock);
+      if (nowTickInterval !== undefined) {
+        window.clearInterval(nowTickInterval);
+      }
       document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
       if (persistStateTimer !== undefined) {
         window.clearTimeout(persistStateTimer);
@@ -1269,6 +1498,76 @@ function App() {
               <IconMoon />
             </Show>
           </button>
+          <div class="settings-wrap">
+            <button
+              class="icon-btn"
+              ref={(element) => {
+                settingsButtonRef = element;
+              }}
+              type="button"
+              disabled={initializing()}
+              onClick={() => {
+                setSettingsMenuOpen((open) => !open);
+                setAddMenuOpen(false);
+              }}
+              aria-label={settingsMenuVisible() ? "Close settings menu" : "Open settings menu"}
+              title={settingsMenuVisible() ? "Close settings menu" : "Open settings menu"}
+            >
+              <Show when={settingsMenuVisible()} fallback={<IconSettings />}>
+                <IconClose />
+              </Show>
+            </button>
+
+            <Show when={settingsMenuVisible()}>
+              <div
+                class="context-menu settings-menu reveal"
+                ref={(element) => {
+                  settingsMenuRef = element;
+                }}
+              >
+                <header class="context-head">
+                  <p class="label">Settings</p>
+                </header>
+
+                <section class="settings-section">
+                  <div class="auto-refresh-controls">
+                    <label class="auto-refresh-toggle">
+                      <input
+                        type="checkbox"
+                        checked={autoRefreshActiveEnabled()}
+                        onChange={handleToggleAutoRefreshActive}
+                        disabled={initializing()}
+                      />
+                      <span>Auto refresh active accounts</span>
+                    </label>
+                    <div class="auto-refresh-slider">
+                      <div class="auto-refresh-slider-head">
+                        <p class="label">Interval</p>
+                        <p class="mono muted">{formatAutoRefreshInterval(autoRefreshActiveIntervalSec())}</p>
+                      </div>
+                      <input
+                        class="themed-slider"
+                        type="range"
+                        min={AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC}
+                        max={AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC}
+                        step={AUTO_REFRESH_ACTIVE_STEP_SEC}
+                        value={autoRefreshActiveIntervalSec()}
+                        onInput={handleAutoRefreshIntervalInput}
+                        disabled={!autoRefreshActiveEnabled() || initializing()}
+                      />
+                    </div>
+                  </div>
+                  <div class="settings-field">
+                    <p class="label">Usage Refreshes Display</p>
+                    <select value={usageRefreshDisplayMode()} onChange={handleUsageRefreshDisplayModeChange}>
+                      <option value="date">Refresh Date/Time</option>
+                      <option value="remaining">Time Remaining</option>
+                    </select>
+                  </div>
+                </section>
+              </div>
+            </Show>
+          </div>
           <div class="add-menu-wrap">
             <button
               class="icon-btn"
@@ -1277,7 +1576,10 @@ function App() {
               }}
               type="button"
               disabled={initializing()}
-              onClick={() => setAddMenuOpen((open) => !open)}
+              onClick={() => {
+                setAddMenuOpen((open) => !open);
+                setSettingsMenuOpen(false);
+              }}
               aria-label={addMenuVisible() ? "Close add account menu" : "Add account"}
               title={addMenuVisible() ? "Close add account menu" : "Add account"}
             >
@@ -1407,6 +1709,7 @@ function App() {
                   <For each={activeAccounts()}>
                     {(account) => {
                       const credits = () => creditsById()[account.id];
+                      const refreshEpoch = () => usageRefreshEpoch(credits(), nowTick());
 
                       return (
                         <article
@@ -1427,7 +1730,6 @@ function App() {
                             </span>
                             <div class="account-main">
                               <p class="account-title account-main-value">{accountTitle(account)}</p>
-                              <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
                             </div>
                             <Show when={account.isActive}>
                               <p class="pill pill-active">ACTIVE</p>
@@ -1486,14 +1788,14 @@ function App() {
                             </div>
                           </Show>
 
-                          <div class="mini-grid">
+                          <div class="mini-grid mini-grid-full">
                             <div>
-                              <p class="label">Updated</p>
-                              <p class="mono">{formatEpoch(account.updatedAt)}</p>
-                            </div>
-                            <div>
-                              <p class="label">Last used</p>
-                              <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
+                              <p class="label">Usage refreshes</p>
+                              <p class="mono usage-refresh-value">
+                                {usageRefreshDisplayMode() === "remaining"
+                                  ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
+                                  : formatUsageRefreshDateTime(refreshEpoch())}
+                              </p>
                             </div>
                           </div>
 
@@ -1588,6 +1890,7 @@ function App() {
                     <For each={depletedAccounts()}>
                       {(account) => {
                         const credits = () => creditsById()[account.id];
+                        const refreshEpoch = () => usageRefreshEpoch(credits(), nowTick());
 
                         return (
                           <article
@@ -1606,7 +1909,6 @@ function App() {
                               </span>
                               <div class="account-main">
                                 <p class="account-title account-main-value">{accountTitle(account)}</p>
-                                <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
                               </div>
                             </header>
 
@@ -1668,6 +1970,17 @@ function App() {
                               </Show>
                             </Show>
 
+                            <div class="mini-grid mini-grid-full">
+                              <div>
+                                <p class="label">Usage refreshes</p>
+                                <p class="mono usage-refresh-value">
+                                  {usageRefreshDisplayMode() === "remaining"
+                                    ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
+                                    : formatUsageRefreshDateTime(refreshEpoch())}
+                                </p>
+                              </div>
+                            </div>
+
                             <div class="card-actions">
                               <button type="button" class="switch-btn" onClick={() => void handleThaw(account.id)}>
                                 Activate
@@ -1677,11 +1990,14 @@ function App() {
                                 <button
                                   type="button"
                                   class="icon-btn action"
-                                  onClick={() => void handleFreeze(account.id)}
-                                  aria-label="Freeze account"
-                                  title="Freeze account"
+                                  onClick={() => refreshAccountCredits(account.id)}
+                                  disabled={Boolean(refreshingById()[account.id])}
+                                  aria-label="Refresh credits"
+                                  title="Refresh credits"
                                 >
-                                  <IconFrost />
+                                  <Show when={refreshingById()[account.id]} fallback={<IconRefresh />}>
+                                    <IconRefreshing />
+                                  </Show>
                                 </button>
                                 <button
                                   type="button"
@@ -1744,6 +2060,7 @@ function App() {
                       {(account) => {
                         const credits = () => creditsById()[account.id];
                         const availablePercent = () => quotaRemainingPercent(credits());
+                        const refreshEpoch = () => usageRefreshEpoch(credits(), nowTick());
 
                         return (
                           <article
@@ -1762,7 +2079,6 @@ function App() {
                               </span>
                               <div class="account-main">
                                 <p class="account-title account-main-value">{accountTitle(account)}</p>
-                                <p class="mono muted account-copyable">{accountMainIdentity(account)}</p>
                               </div>
                             </header>
 
@@ -1781,14 +2097,14 @@ function App() {
                               </div>
                             </div>
 
-                            <div class="mini-grid">
+                            <div class="mini-grid mini-grid-full">
                               <div>
-                                <p class="label">Updated</p>
-                                <p class="mono">{formatEpoch(account.updatedAt)}</p>
-                              </div>
-                              <div>
-                                <p class="label">Last used</p>
-                                <p class="mono">{formatEpoch(account.lastUsedAt)}</p>
+                                <p class="label">Usage refreshes</p>
+                                <p class="mono usage-refresh-value">
+                                  {usageRefreshDisplayMode() === "remaining"
+                                    ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
+                                    : formatUsageRefreshDateTime(refreshEpoch())}
+                                </p>
                               </div>
                             </div>
 
