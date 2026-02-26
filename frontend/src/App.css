@@ -820,21 +820,24 @@ select {
 }
 
 .usage-refresh-value {
+  margin: 0;
+  min-width: 0;
+  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  text-align: right;
 }
 
 .usage-refresh-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 0.45rem;
 }
 
-.usage-refresh-remaining {
-  margin-top: 0;
-  text-align: right;
+.usage-refresh-head .label {
+  white-space: nowrap;
 }
 
 .account-copyable {

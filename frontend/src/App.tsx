@@ -1790,12 +1790,14 @@ function App() {
 
                           <div class="mini-grid mini-grid-full">
                             <div>
-                              <p class="label">Usage refreshes</p>
-                              <p class="mono usage-refresh-value">
-                                {usageRefreshDisplayMode() === "remaining"
-                                  ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
-                                  : formatUsageRefreshDateTime(refreshEpoch())}
-                              </p>
+                              <div class="usage-refresh-head">
+                                <p class="label">Usage refreshes</p>
+                                <p class="mono usage-refresh-value">
+                                  {usageRefreshDisplayMode() === "remaining"
+                                    ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
+                                    : formatUsageRefreshDateTime(refreshEpoch())}
+                                </p>
+                              </div>
                             </div>
                           </div>
 
@@ -1972,12 +1974,14 @@ function App() {
 
                             <div class="mini-grid mini-grid-full">
                               <div>
-                                <p class="label">Usage refreshes</p>
-                                <p class="mono usage-refresh-value">
-                                  {usageRefreshDisplayMode() === "remaining"
-                                    ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
-                                    : formatUsageRefreshDateTime(refreshEpoch())}
-                                </p>
+                                <div class="usage-refresh-head">
+                                  <p class="label">Usage refreshes</p>
+                                  <p class="mono usage-refresh-value">
+                                    {usageRefreshDisplayMode() === "remaining"
+                                      ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
+                                      : formatUsageRefreshDateTime(refreshEpoch())}
+                                  </p>
+                                </div>
                               </div>
                             </div>
 
@@ -2099,12 +2103,14 @@ function App() {
 
                             <div class="mini-grid mini-grid-full">
                               <div>
-                                <p class="label">Usage refreshes</p>
-                                <p class="mono usage-refresh-value">
-                                  {usageRefreshDisplayMode() === "remaining"
-                                    ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
-                                    : formatUsageRefreshDateTime(refreshEpoch())}
-                                </p>
+                                <div class="usage-refresh-head">
+                                  <p class="label">Usage refreshes</p>
+                                  <p class="mono usage-refresh-value">
+                                    {usageRefreshDisplayMode() === "remaining"
+                                      ? formatUsageRefreshRemaining(refreshEpoch(), nowTick())
+                                      : formatUsageRefreshDateTime(refreshEpoch())}
+                                  </p>
+                                </div>
                               </div>
                             </div>
 

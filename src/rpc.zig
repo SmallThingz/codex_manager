@@ -2,6 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const APP_ID = "com.codex.manager";
+const CODEX_DIR = ".codex";
+const AUTH_FILE = "auth.json";
+const STORE_FILE = "accounts.json";
+const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const OAUTH_CALLBACK_SUCCESS_HTML =
     \\<!doctype html>
     \\<html lang="en">
@@ -89,8 +93,39 @@ const UsageResult = struct {
     body: []const u8,
 };
 
-var oauth_listener_lock = std.Thread.Mutex{};
-var oauth_listener_running = false;
+const ManagedPaths = struct {
+    codexHome: []u8,
+    codexAuthPath: []u8,
+    storeDir: []u8,
+    storePath: []u8,
+    bootstrapStatePath: []u8,
+
+    fn deinit(self: *ManagedPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.codexHome);
+        allocator.free(self.codexAuthPath);
+        allocator.free(self.storeDir);
+        allocator.free(self.storePath);
+        allocator.free(self.bootstrapStatePath);
+    }
+};
+
+const OAuthListenerState = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    thread: ?std.Thread = null,
+    running: bool = false,
+    callback_url: ?[]u8 = null,
+    error_name: ?[]u8 = null,
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+const OAuthPollResult = struct {
+    status: []const u8,
+    callbackUrl: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+};
+
+var oauth_listener_state = OAuthListenerState{};
 
 pub fn handleRpcText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     return rpcFromText(allocator, request_text, cancel_ptr);
@@ -244,9 +279,93 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
     if (std.mem.startsWith(u8, request.op, "invoke:")) {
         const command = request.op["invoke:".len..];
 
+        if (std.mem.eql(u8, command, "get_managed_paths")) {
+            var managed_paths = getManagedPaths(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            defer managed_paths.deinit(allocator);
+
+            return jsonOk(allocator, .{
+                .codexHome = managed_paths.codexHome,
+                .codexAuthPath = managed_paths.codexAuthPath,
+                .storeDir = managed_paths.storeDir,
+                .storePath = managed_paths.storePath,
+                .bootstrapStatePath = managed_paths.bootstrapStatePath,
+            });
+        }
+
+        if (std.mem.eql(u8, command, "read_managed_store")) {
+            const raw = readManagedStore(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            defer if (raw) |text| allocator.free(text);
+            return jsonOk(allocator, raw);
+        }
+
+        if (std.mem.eql(u8, command, "write_managed_store")) {
+            const contents = request.contents orelse return jsonError(allocator, "write_managed_store requires contents");
+            writeManagedStore(contents, allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            return jsonOk(allocator, @as(?u8, null));
+        }
+
+        if (std.mem.eql(u8, command, "read_codex_auth")) {
+            const raw = readCodexAuth(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            defer if (raw) |text| allocator.free(text);
+            return jsonOk(allocator, raw);
+        }
+
+        if (std.mem.eql(u8, command, "write_codex_auth")) {
+            const contents = request.contents orelse return jsonError(allocator, "write_codex_auth requires contents");
+            writeCodexAuth(contents, allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            return jsonOk(allocator, @as(?u8, null));
+        }
+
+        if (std.mem.eql(u8, command, "read_bootstrap_state")) {
+            const raw = readBootstrapState(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            defer if (raw) |text| allocator.free(text);
+            return jsonOk(allocator, raw);
+        }
+
+        if (std.mem.eql(u8, command, "write_bootstrap_state")) {
+            const contents = request.contents orelse return jsonError(allocator, "write_bootstrap_state requires contents");
+            writeBootstrapState(contents, allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            return jsonOk(allocator, @as(?u8, null));
+        }
+
+        if (std.mem.eql(u8, command, "start_oauth_callback_listener")) {
+            const timeout_seconds = request.timeoutSeconds orelse 180;
+            startOAuthCallbackListener(timeout_seconds, cancel_ptr) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            return jsonOk(allocator, true);
+        }
+
+        if (std.mem.eql(u8, command, "poll_oauth_callback_listener")) {
+            const polled = pollOAuthCallbackListener() catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+            return jsonOk(allocator, polled);
+        }
+
         if (std.mem.eql(u8, command, "wait_for_oauth_callback")) {
             const timeout_seconds = request.timeoutSeconds orelse 180;
-            const callback_url = waitForOAuthCallback(allocator, timeout_seconds, cancel_ptr) catch |err| {
+            startOAuthCallbackListener(timeout_seconds, cancel_ptr) catch |err| {
+                if (err != error.CallbackListenerAlreadyRunning) {
+                    return jsonError(allocator, @errorName(err));
+                }
+            };
+
+            const callback_url = waitForOAuthCallbackResult(allocator) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
             defer allocator.free(callback_url);
@@ -254,6 +373,7 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
         }
 
         if (std.mem.eql(u8, command, "cancel_oauth_callback_listener")) {
+            cancelOAuthCallbackListener(cancel_ptr);
             cancel_ptr.store(true, .seq_cst);
             return jsonOk(allocator, true);
         }
@@ -307,6 +427,78 @@ fn getThemeSettingsPath(allocator: std.mem.Allocator) ![]u8 {
     const app_dir = try getAppLocalDataDir(allocator);
     defer allocator.free(app_dir);
     return std.fs.path.join(allocator, &.{ app_dir, "ui-theme.txt" });
+}
+
+fn getManagedPaths(allocator: std.mem.Allocator) !ManagedPaths {
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+
+    const codex_home = try std.fs.path.join(allocator, &.{ home, CODEX_DIR });
+    errdefer allocator.free(codex_home);
+
+    const codex_auth_path = try std.fs.path.join(allocator, &.{ codex_home, AUTH_FILE });
+    errdefer allocator.free(codex_auth_path);
+
+    const store_dir = try getAppLocalDataDir(allocator);
+    errdefer allocator.free(store_dir);
+
+    const store_path = try std.fs.path.join(allocator, &.{ store_dir, STORE_FILE });
+    errdefer allocator.free(store_path);
+
+    const bootstrap_state_path = try std.fs.path.join(allocator, &.{ store_dir, BOOTSTRAP_STATE_FILE });
+    errdefer allocator.free(bootstrap_state_path);
+
+    return .{
+        .codexHome = codex_home,
+        .codexAuthPath = codex_auth_path,
+        .storeDir = store_dir,
+        .storePath = store_path,
+        .bootstrapStatePath = bootstrap_state_path,
+    };
+}
+
+fn readOptionalTextFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    if (!pathExists(path)) {
+        return null;
+    }
+    const text = try readTextFile(allocator, path);
+    return text;
+}
+
+fn readManagedStore(allocator: std.mem.Allocator) !?[]u8 {
+    var paths = try getManagedPaths(allocator);
+    defer paths.deinit(allocator);
+    return readOptionalTextFile(allocator, paths.storePath);
+}
+
+fn writeManagedStore(contents: []const u8, allocator: std.mem.Allocator) !void {
+    var paths = try getManagedPaths(allocator);
+    defer paths.deinit(allocator);
+    try writeTextFile(paths.storePath, contents);
+}
+
+fn readCodexAuth(allocator: std.mem.Allocator) !?[]u8 {
+    var paths = try getManagedPaths(allocator);
+    defer paths.deinit(allocator);
+    return readOptionalTextFile(allocator, paths.codexAuthPath);
+}
+
+fn writeCodexAuth(contents: []const u8, allocator: std.mem.Allocator) !void {
+    var paths = try getManagedPaths(allocator);
+    defer paths.deinit(allocator);
+    try writeTextFile(paths.codexAuthPath, contents);
+}
+
+fn readBootstrapState(allocator: std.mem.Allocator) !?[]u8 {
+    var paths = try getManagedPaths(allocator);
+    defer paths.deinit(allocator);
+    return readOptionalTextFile(allocator, paths.bootstrapStatePath);
+}
+
+fn writeBootstrapState(contents: []const u8, allocator: std.mem.Allocator) !void {
+    var paths = try getManagedPaths(allocator);
+    defer paths.deinit(allocator);
+    try writeTextFile(paths.bootstrapStatePath, contents);
 }
 
 fn readTextFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -430,25 +622,146 @@ fn extractRequestTarget(request: []const u8) ?[]const u8 {
     return target;
 }
 
+const OAuthThreadArgs = struct {
+    timeout_seconds: u64,
+    external_cancel: *std.atomic.Value(bool),
+};
+
+fn clearOAuthListenerResultLocked() void {
+    if (oauth_listener_state.callback_url) |url| {
+        std.heap.page_allocator.free(url);
+        oauth_listener_state.callback_url = null;
+    }
+    if (oauth_listener_state.error_name) |err_name| {
+        std.heap.page_allocator.free(err_name);
+        oauth_listener_state.error_name = null;
+    }
+}
+
+fn joinOAuthListenerThreadLocked() void {
+    if (oauth_listener_state.thread) |thread| {
+        thread.join();
+        oauth_listener_state.thread = null;
+    }
+}
+
+fn startOAuthCallbackListener(timeout_seconds: u64, external_cancel: *std.atomic.Value(bool)) !void {
+    oauth_listener_state.mutex.lock();
+    defer oauth_listener_state.mutex.unlock();
+
+    if (oauth_listener_state.running) {
+        return error.CallbackListenerAlreadyRunning;
+    }
+
+    joinOAuthListenerThreadLocked();
+    clearOAuthListenerResultLocked();
+
+    oauth_listener_state.cancel.store(false, .seq_cst);
+    external_cancel.store(false, .seq_cst);
+    oauth_listener_state.running = true;
+
+    const args = OAuthThreadArgs{
+        .timeout_seconds = timeout_seconds,
+        .external_cancel = external_cancel,
+    };
+
+    oauth_listener_state.thread = std.Thread.spawn(.{}, oauthCallbackThreadMain, .{args}) catch |err| {
+        oauth_listener_state.running = false;
+        return err;
+    };
+}
+
+fn pollOAuthCallbackListener() !OAuthPollResult {
+    oauth_listener_state.mutex.lock();
+    defer oauth_listener_state.mutex.unlock();
+
+    if (oauth_listener_state.running) {
+        return .{ .status = "running" };
+    }
+    joinOAuthListenerThreadLocked();
+
+    if (oauth_listener_state.callback_url) |url| {
+        return .{
+            .status = "ready",
+            .callbackUrl = url,
+        };
+    }
+
+    if (oauth_listener_state.error_name) |err_name| {
+        return .{
+            .status = "error",
+            .@"error" = err_name,
+        };
+    }
+
+    return .{ .status = "idle" };
+}
+
+fn waitForOAuthCallbackResult(allocator: std.mem.Allocator) ![]u8 {
+    oauth_listener_state.mutex.lock();
+    defer oauth_listener_state.mutex.unlock();
+
+    while (oauth_listener_state.running) {
+        oauth_listener_state.cond.wait(&oauth_listener_state.mutex);
+    }
+    joinOAuthListenerThreadLocked();
+
+    if (oauth_listener_state.callback_url) |url| {
+        return allocator.dupe(u8, url);
+    }
+
+    if (oauth_listener_state.error_name) |err_name| {
+        if (std.mem.eql(u8, err_name, "CallbackListenerStopped")) {
+            return error.CallbackListenerStopped;
+        }
+        if (std.mem.eql(u8, err_name, "CallbackListenerTimeout")) {
+            return error.CallbackListenerTimeout;
+        }
+        if (std.mem.eql(u8, err_name, "CallbackListenerSocketError")) {
+            return error.CallbackListenerSocketError;
+        }
+        return error.CallbackListenerFailed;
+    }
+
+    return error.CallbackListenerUnavailable;
+}
+
+fn cancelOAuthCallbackListener(external_cancel: *std.atomic.Value(bool)) void {
+    oauth_listener_state.cancel.store(true, .seq_cst);
+    external_cancel.store(true, .seq_cst);
+}
+
+fn oauthCallbackThreadMain(args: OAuthThreadArgs) void {
+    const callback_url = waitForOAuthCallback(
+        std.heap.page_allocator,
+        args.timeout_seconds,
+        &oauth_listener_state.cancel,
+    ) catch |err| {
+        oauth_listener_state.mutex.lock();
+        clearOAuthListenerResultLocked();
+        oauth_listener_state.error_name = std.heap.page_allocator.dupe(u8, @errorName(err)) catch null;
+        oauth_listener_state.running = false;
+        oauth_listener_state.cond.broadcast();
+        oauth_listener_state.mutex.unlock();
+        args.external_cancel.store(false, .seq_cst);
+        return;
+    };
+
+    oauth_listener_state.mutex.lock();
+    clearOAuthListenerResultLocked();
+    oauth_listener_state.callback_url = callback_url;
+    oauth_listener_state.running = false;
+    oauth_listener_state.cond.broadcast();
+    oauth_listener_state.mutex.unlock();
+
+    args.external_cancel.store(false, .seq_cst);
+}
+
 fn waitForOAuthCallback(
     allocator: std.mem.Allocator,
     timeout_seconds: u64,
     cancel_ptr: *std.atomic.Value(bool),
 ) ![]u8 {
-    oauth_listener_lock.lock();
-    if (oauth_listener_running) {
-        oauth_listener_lock.unlock();
-        return error.CallbackListenerAlreadyRunning;
-    }
-    oauth_listener_running = true;
-    oauth_listener_lock.unlock();
-    defer {
-        oauth_listener_lock.lock();
-        oauth_listener_running = false;
-        oauth_listener_lock.unlock();
-        cancel_ptr.store(false, .seq_cst);
-    }
-
     cancel_ptr.store(false, .seq_cst);
 
     const address = try std.net.Address.parseIp4("127.0.0.1", 1455);

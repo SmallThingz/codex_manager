@@ -1,8 +1,3 @@
-const STORE_FILE = "accounts.json";
-const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
-const CODEX_DIR = ".codex";
-const AUTH_FILE = "auth.json";
-
 const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
@@ -125,19 +120,25 @@ type WhamUsageResponse = {
   body: unknown;
 };
 
+type OAuthCallbackPollResponse = {
+  status: "idle" | "running" | "ready" | "error";
+  callbackUrl?: string | null;
+  error?: string | null;
+};
+
 let pathsPromise: Promise<Paths> | null = null;
 let pendingBrowserLogin: PendingBrowserLogin | null = null;
 
 type BackendApis = {
   invoke: <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
-  appLocalDataDir: () => Promise<string>;
-  homeDir: () => Promise<string>;
-  join: (...paths: string[]) => Promise<string>;
-  exists: (path: string) => Promise<boolean>;
-  mkdir: (path: string, options?: { recursive?: boolean }) => Promise<void>;
-  readTextFile: (path: string) => Promise<string>;
-  writeTextFile: (path: string, contents: string) => Promise<void>;
   openUrl: (url: string) => Promise<void>;
+  getManagedPaths: () => Promise<Paths>;
+  readManagedStore: () => Promise<string | null>;
+  writeManagedStore: (contents: string) => Promise<void>;
+  readCodexAuth: () => Promise<string | null>;
+  writeCodexAuth: (contents: string) => Promise<void>;
+  readBootstrapState: () => Promise<string | null>;
+  writeBootstrapState: (contents: string) => Promise<void>;
 };
 
 type BridgeResult<T> = {
@@ -240,22 +241,21 @@ const loadBackendApis = async (): Promise<BackendApis> => {
     backendApisPromise = Promise.resolve({
       invoke: async <T>(command: string, payload: Record<string, unknown> = {}) =>
         callBridge<T>(`invoke:${command}`, payload),
-      appLocalDataDir: async () => callBridge<string>("path:app_local_data_dir"),
-      homeDir: async () => callBridge<string>("path:home_dir"),
-      join: async (...paths: string[]) => callBridge<string>("path:join", { paths }),
-      exists: async (path: string) => callBridge<boolean>("fs:exists", { path }),
-      mkdir: async (path: string, options?: { recursive?: boolean }) => {
-        await callBridge<null>("fs:mkdir", {
-          path,
-          recursive: Boolean(options?.recursive),
-        });
-      },
-      readTextFile: async (path: string) => callBridge<string>("fs:read_text", { path }),
-      writeTextFile: async (path: string, contents: string) => {
-        await callBridge<null>("fs:write_text", { path, contents });
-      },
       openUrl: async (url: string) => {
         await callBridge<null>("shell:open_url", { url });
+      },
+      getManagedPaths: async () => callBridge<Paths>("invoke:get_managed_paths"),
+      readManagedStore: async () => callBridge<string | null>("invoke:read_managed_store"),
+      writeManagedStore: async (contents: string) => {
+        await callBridge<null>("invoke:write_managed_store", { contents });
+      },
+      readCodexAuth: async () => callBridge<string | null>("invoke:read_codex_auth"),
+      writeCodexAuth: async (contents: string) => {
+        await callBridge<null>("invoke:write_codex_auth", { contents });
+      },
+      readBootstrapState: async () => callBridge<string | null>("invoke:read_bootstrap_state"),
+      writeBootstrapState: async (contents: string) => {
+        await callBridge<null>("invoke:write_bootstrap_state", { contents });
       },
     });
   }
@@ -808,16 +808,43 @@ const parseCallbackInput = (callbackInput: string): { code: string; state: strin
 
 const waitForOAuthCallbackFromBrowser = async (): Promise<string> => {
   const tauri = await loadBackendApis();
-  const callbackUrl = await tauri.invoke<string>("wait_for_oauth_callback", {
+  await tauri.invoke<boolean>("start_oauth_callback_listener", {
     timeoutSeconds: 180,
   });
 
-  const normalized = normalizeOptional(callbackUrl);
-  if (!normalized) {
-    throw new Error("Callback listener returned an empty redirect URL.");
-  }
+  const renderCallbackError = (errorCode: string): string => {
+    if (errorCode === "CallbackListenerStopped") {
+      return "Callback listener stopped.";
+    }
+    if (errorCode === "CallbackListenerTimeout") {
+      return "Callback listener timed out.";
+    }
+    if (errorCode === "AddressInUse") {
+      return "Callback listener port 1455 is already in use.";
+    }
+    return errorCode;
+  };
 
-  return normalized;
+  while (true) {
+    const status = await tauri.invoke<OAuthCallbackPollResponse>("poll_oauth_callback_listener");
+
+    if (status.status === "ready") {
+      const normalized = normalizeOptional(status.callbackUrl);
+      if (!normalized) {
+        throw new Error("Callback listener returned an empty redirect URL.");
+      }
+      return normalized;
+    }
+
+    if (status.status === "error") {
+      const errorCode = normalizeOptional(status.error) || "Callback listener failed.";
+      throw new Error(renderCallbackError(errorCode));
+    }
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 250);
+    });
+  }
 };
 
 const fetchWhamUsageViaTauri = async (
@@ -946,41 +973,11 @@ const resolvePaths = async (): Promise<Paths> => {
   if (!pathsPromise) {
     pathsPromise = (async () => {
       const tauri = await loadBackendApis();
-      const home = await tauri.homeDir();
-      const codexHome = await tauri.join(home, CODEX_DIR);
-      const codexAuthPath = await tauri.join(codexHome, AUTH_FILE);
-      const storeDir = await tauri.appLocalDataDir();
-      const storePath = await tauri.join(storeDir, STORE_FILE);
-      const bootstrapStatePath = await tauri.join(storeDir, BOOTSTRAP_STATE_FILE);
-
-      return {
-        codexHome,
-        codexAuthPath,
-        storeDir,
-        storePath,
-        bootstrapStatePath,
-      };
+      return tauri.getManagedPaths();
     })();
   }
 
   return pathsPromise;
-};
-
-const readJsonFile = async <T>(path: string): Promise<T | null> => {
-  const tauri = await loadBackendApis();
-  const fileExists = await tauri.exists(path);
-  if (!fileExists) {
-    return null;
-  }
-
-  const raw = await tauri.readTextFile(path);
-  return JSON.parse(raw) as T;
-};
-
-const writeJsonFile = async (path: string, value: unknown): Promise<void> => {
-  const tauri = await loadBackendApis();
-  const text = JSON.stringify(value, null, 2);
-  await tauri.writeTextFile(path, text);
 };
 
 const asBootstrapState = (value: unknown): EmbeddedBootstrapState | null => {
@@ -1043,28 +1040,25 @@ export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
 };
 
 export const saveEmbeddedBootstrapState = async (state: EmbeddedBootstrapState): Promise<void> => {
-  const paths = await resolvePaths();
   const tauri = await loadBackendApis();
-  await tauri.mkdir(paths.storeDir, { recursive: true });
-  await writeJsonFile(paths.bootstrapStatePath, state);
+  await tauri.writeBootstrapState(JSON.stringify(state, null, 2));
 };
 
 const readAuthFile = async (): Promise<unknown> => {
   const paths = await resolvePaths();
-  const auth = await readJsonFile<unknown>(paths.codexAuthPath);
+  const tauri = await loadBackendApis();
+  const rawAuth = await tauri.readCodexAuth();
 
-  if (auth === null) {
+  if (rawAuth === null) {
     throw new Error(`Codex auth not found at ${paths.codexAuthPath}`);
   }
 
-  return auth;
+  return JSON.parse(rawAuth);
 };
 
 const writeAuthFile = async (auth: unknown): Promise<void> => {
-  const paths = await resolvePaths();
   const tauri = await loadBackendApis();
-  await tauri.mkdir(paths.codexHome, { recursive: true });
-  await writeJsonFile(paths.codexAuthPath, auth);
+  await tauri.writeCodexAuth(JSON.stringify(auth, null, 2));
 };
 
 const sanitizeAccount = (value: unknown): ManagedAccount | null => {
@@ -1098,14 +1092,12 @@ const sanitizeAccount = (value: unknown): ManagedAccount | null => {
 };
 
 const readStore = async (): Promise<AccountsStore> => {
-  const paths = await resolvePaths();
   const tauri = await loadBackendApis();
-  await tauri.mkdir(paths.storeDir, { recursive: true });
-
-  const store = await readJsonFile<AccountsStore>(paths.storePath);
-  if (!store) {
+  const rawStore = await tauri.readManagedStore();
+  if (!rawStore) {
     return { activeAccountId: null, accounts: [] };
   }
+  const store = JSON.parse(rawStore) as AccountsStore;
 
   const rawAccounts = Array.isArray(store.accounts) ? store.accounts : [];
   const accounts = rawAccounts
@@ -1124,10 +1116,8 @@ const readStore = async (): Promise<AccountsStore> => {
 };
 
 const writeStore = async (store: AccountsStore): Promise<void> => {
-  const paths = await resolvePaths();
   const tauri = await loadBackendApis();
-  await tauri.mkdir(paths.storeDir, { recursive: true });
-  await writeJsonFile(paths.storePath, store);
+  await tauri.writeManagedStore(JSON.stringify(store, null, 2));
 };
 
 const upsertAccount = (
@@ -1230,7 +1220,9 @@ const applyBucket = (account: ManagedAccount, bucket: AccountBucket) => {
 
 const buildView = async (store: AccountsStore): Promise<AccountsView> => {
   const paths = await resolvePaths();
-  const activeAuth = await readJsonFile<unknown>(paths.codexAuthPath);
+  const tauri = await loadBackendApis();
+  const activeAuthRaw = await tauri.readCodexAuth();
+  const activeAuth = activeAuthRaw ? (JSON.parse(activeAuthRaw) as unknown) : null;
   const activeDiskAccountId = activeAuth ? extractAccountId(activeAuth) : null;
   const activeDiskEmail = activeAuth ? extractEmail(activeAuth) : null;
 

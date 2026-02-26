@@ -41,7 +41,7 @@ pub fn main() !void {
     var service = try webui.Service.init(allocator, rpc_webui.RpcBridgeMethods, .{
         .app = .{
             .transport_mode = if (force_web_mode) .browser_fallback else .native_webview,
-            .auto_open_browser = true,
+            .auto_open_browser = false,
             .browser_fallback_on_native_failure = true,
         },
         .window = .{
@@ -62,6 +62,21 @@ pub fn main() !void {
     defer service.deinit();
 
     try service.show(.{ .html = page_html });
+
+    const should_open_browser = blk: {
+        if (force_web_mode) {
+            break :blk true;
+        }
+
+        const warning = service.lastWarning() orelse break :blk false;
+        break :blk std.mem.indexOf(u8, warning, "falling back to browser") != null;
+    };
+
+    if (should_open_browser) {
+        service.openInBrowserWithOptions(.{
+            .require_app_mode_window = true,
+        }) catch {};
+    }
 
     const local_url = service.browserUrl() catch null;
     defer if (local_url) |url| allocator.free(url);
