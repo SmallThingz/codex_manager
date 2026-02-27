@@ -1,24 +1,12 @@
 const std = @import("std");
 const webui = @import("webui");
-const builtin = @import("builtin");
 
-const assets = @import("assets.zig");
+const embedded_index = @import("embedded_index.zig");
 const rpc_webui = @import("rpc_webui.zig");
 
 const DEFAULT_WIDTH: u32 = 1000;
 const DEFAULT_HEIGHT: u32 = 760;
-const APP_ID = "com.codex.manager";
-const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
-const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
 const BROWSER_IDLE_SHUTDOWN_DELAY_MS: i64 = 3000;
-const DEFAULT_BOOTSTRAP_STATE_JSON =
-    \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
-;
-
-const IndexTemplate = struct {
-    prefix: []const u8,
-    suffix: []const u8,
-};
 
 const LaunchRequest = struct {
     surfaces: [3]?webui.LaunchSurface = .{ null, null, null },
@@ -40,8 +28,6 @@ const LaunchRequest = struct {
 };
 
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
-var templates_initialized = false;
-var index_template: ?IndexTemplate = null;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -52,17 +38,16 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const launch_request = try parseLaunchRequest(args);
-    initIndexTemplates();
     rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
     const window_style: webui.WindowStyle = .{
         .size = .{ .width = DEFAULT_WIDTH, .height = DEFAULT_HEIGHT },
     };
 
-    const page_html = makeDynamicIndexHtml(allocator) orelse return error.IndexHtmlUnavailable;
-    defer allocator.free(page_html);
+    const live_index_path = try embedded_index.refreshLiveIndexFromBootstrapFile(allocator);
+    defer allocator.free(live_index_path);
 
-    try runModeService(allocator, page_html, window_style, launch_request);
+    try runModeService(allocator, live_index_path, window_style, launch_request);
 }
 
 fn parseLaunchRequest(args: []const []const u8) !LaunchRequest {
@@ -101,7 +86,7 @@ fn parseLaunchRequest(args: []const []const u8) !LaunchRequest {
 
 fn runModeService(
     allocator: std.mem.Allocator,
-    page_html: []const u8,
+    page_file_path: []const u8,
     window_style: webui.WindowStyle,
     launch_request: LaunchRequest,
 ) !void {
@@ -143,7 +128,7 @@ fn runModeService(
     });
     defer service.deinit();
 
-    try service.show(.{ .html = page_html });
+    try service.show(.{ .file = page_file_path });
 
     const render_state = service.runtimeRenderState();
     if (launch_request.len == 1 and first_surface == .native_webview and render_state.active_surface != .native_webview) {
@@ -195,183 +180,4 @@ fn runModeService(
 
         break;
     }
-}
-
-fn initIndexTemplates() void {
-    if (templates_initialized) {
-        return;
-    }
-    templates_initialized = true;
-
-    if (assets.assetForPath("index.html")) |asset| {
-        index_template = splitIndexTemplate(asset.body);
-    }
-}
-
-fn splitIndexTemplate(html: []const u8) ?IndexTemplate {
-    const marker_index = std.mem.indexOf(u8, html, BOOTSTRAP_PLACEHOLDER) orelse return null;
-    return .{
-        .prefix = html[0..marker_index],
-        .suffix = html[marker_index + BOOTSTRAP_PLACEHOLDER.len ..],
-    };
-}
-
-fn pathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
-}
-
-fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
-    if (builtin.os.tag == .windows) {
-        return std.process.getEnvVarOwned(allocator, "USERPROFILE");
-    }
-
-    return std.process.getEnvVarOwned(allocator, "HOME");
-}
-
-fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
-    if (builtin.os.tag == .windows) {
-        const appdata = try std.process.getEnvVarOwned(allocator, "APPDATA");
-        defer allocator.free(appdata);
-        return std.fs.path.join(allocator, &.{ appdata, APP_ID });
-    }
-
-    const home = try getHomeDir(allocator);
-    defer allocator.free(home);
-
-    if (builtin.os.tag == .macos) {
-        return std.fs.path.join(allocator, &.{ home, "Library", "Application Support", APP_ID });
-    }
-
-    return std.fs.path.join(allocator, &.{ home, ".local", "share", APP_ID });
-}
-
-fn getBootstrapStatePath(allocator: std.mem.Allocator) ![]u8 {
-    const app_dir = try getAppLocalDataDir(allocator);
-    defer allocator.free(app_dir);
-    return std.fs.path.join(allocator, &.{ app_dir, BOOTSTRAP_STATE_FILE });
-}
-
-fn loadBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
-    const state_path = getBootstrapStatePath(allocator) catch {
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    };
-    defer allocator.free(state_path);
-
-    if (!pathExists(state_path)) {
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    }
-
-    const file = std.fs.openFileAbsolute(state_path, .{}) catch {
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    };
-    defer file.close();
-
-    const raw = file.readToEndAlloc(allocator, 8 * 1024 * 1024) catch {
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    };
-
-    const trimmed = std.mem.trim(u8, raw, " \r\n\t");
-    if (trimmed.len == 0) {
-        allocator.free(raw);
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    }
-
-    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) {
-        return raw;
-    }
-
-    const normalized = allocator.dupe(u8, trimmed) catch {
-        allocator.free(raw);
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    };
-    allocator.free(raw);
-    return normalized;
-}
-
-fn fallbackBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
-    return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-}
-
-fn makeDynamicIndexHtml(allocator: std.mem.Allocator) ?[]u8 {
-    const template = index_template orelse return null;
-
-    const state_json = loadBootstrapStateJson(allocator) catch return null;
-    defer allocator.free(state_json);
-
-    const injected_state_json = blk: {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, state_json, .{}) catch {
-            break :blk fallbackBootstrapStateJson(allocator) catch return null;
-        };
-        defer parsed.deinit();
-
-        switch (parsed.value) {
-            .object => {},
-            else => break :blk fallbackBootstrapStateJson(allocator) catch return null,
-        }
-
-        break :blk std.fmt.allocPrint(allocator, "{f}", .{
-            std.json.fmt(parsed.value, .{}),
-        }) catch return null;
-    };
-    defer allocator.free(injected_state_json);
-
-    const encoded_len = std.base64.standard.Encoder.calcSize(injected_state_json.len);
-    const encoded_state = allocator.alloc(u8, encoded_len) catch return null;
-    defer allocator.free(encoded_state);
-    _ = std.base64.standard.Encoder.encode(encoded_state, injected_state_json);
-
-    const html = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        template.prefix,
-        encoded_state,
-        template.suffix,
-    }) catch return null;
-    defer allocator.free(html);
-
-    return ensureModuleWebUiScript(allocator, html) catch null;
-}
-
-fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
-    const script_tag = "<script src=\"/webui_bridge.js\"></script>";
-    const legacy_module_tag = "<script type=\"module\" src=\"/webui_bridge.js\"></script>";
-    const legacy_old_tag = "<script src=\"/webui.js\"></script>";
-    const legacy_old_module_tag = "<script type=\"module\" src=\"/webui.js\"></script>";
-
-    if (std.mem.indexOf(u8, html, script_tag) != null) {
-        return allocator.dupe(u8, html);
-    }
-
-    if (std.mem.indexOf(u8, html, legacy_module_tag)) |legacy_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            html[0..legacy_idx],
-            script_tag,
-            html[legacy_idx + legacy_module_tag.len ..],
-        });
-    }
-
-    if (std.mem.indexOf(u8, html, legacy_old_tag)) |legacy_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            html[0..legacy_idx],
-            script_tag,
-            html[legacy_idx + legacy_old_tag.len ..],
-        });
-    }
-
-    if (std.mem.indexOf(u8, html, legacy_old_module_tag)) |legacy_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            html[0..legacy_idx],
-            script_tag,
-            html[legacy_idx + legacy_old_module_tag.len ..],
-        });
-    }
-
-    if (std.mem.indexOf(u8, html, "</head>")) |head_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}\n{s}", .{
-            html[0..head_idx],
-            script_tag,
-            html[head_idx..],
-        });
-    }
-
-    return std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ html, script_tag });
 }

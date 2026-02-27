@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const embedded_index = @import("embedded_index.zig");
 
 const APP_ID = "com.codex.manager";
 const CODEX_DIR = ".codex";
@@ -497,6 +498,24 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
 
         if (std.mem.eql(u8, command, "get_app_state")) {
             return handleGetAppStateCommand(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+        }
+
+        if (std.mem.eql(u8, command, "get_accounts_view")) {
+            return handleGetAccountsViewCommand(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+        }
+
+        if (std.mem.eql(u8, command, "get_usage_cache")) {
+            return handleGetUsageCacheCommand(allocator) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+        }
+
+        if (std.mem.eql(u8, command, "get_ui_preferences")) {
+            return handleGetUiPreferencesCommand(allocator) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
         }
@@ -1559,6 +1578,23 @@ fn buildUiPreferencesResponseJson(allocator: std.mem.Allocator, preferences: *co
     return buffer.toOwnedSlice(allocator);
 }
 
+fn buildUsageCacheJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+    const writer = buffer.writer(allocator);
+
+    try writer.writeByte('{');
+    for (state.usage_by_id.items, 0..) |entry, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writeJsonString(writer, entry.account_id);
+        try writer.writeByte(':');
+        try writeCreditsInfoJson(writer, &entry.credits);
+    }
+    try writer.writeByte('}');
+
+    return buffer.toOwnedSlice(allocator);
+}
+
 fn persistStateFilesOnly(allocator: std.mem.Allocator, state: *AppState) !void {
     state.saved_at = nowEpochSeconds();
 
@@ -1569,6 +1605,8 @@ fn persistStateFilesOnly(allocator: std.mem.Allocator, state: *AppState) !void {
     const snapshot_json = try buildSnapshotJson(allocator, state);
     defer allocator.free(snapshot_json);
     try writeTextFileAtomic(allocator, state.paths.bootstrapStatePath, snapshot_json);
+    const live_index_path = try embedded_index.writeLiveIndexFromBootstrapJson(allocator, snapshot_json);
+    defer allocator.free(live_index_path);
 }
 
 fn buildRefreshUsageResponseJson(
@@ -2132,15 +2170,43 @@ fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, remove
 }
 
 fn handleGetAppStateCommand(allocator: std.mem.Allocator) ![]u8 {
+    return jsonError(allocator, "get_app_state is deprecated; use get_accounts_view, get_usage_cache, and get_ui_preferences");
+}
+
+fn handleGetAccountsViewCommand(allocator: std.mem.Allocator) ![]u8 {
     managed_files_mutex.lock();
     defer managed_files_mutex.unlock();
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
 
-    const snapshot = try buildSnapshotJson(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
+}
+
+fn handleGetUsageCacheCommand(allocator: std.mem.Allocator) ![]u8 {
+    managed_files_mutex.lock();
+    defer managed_files_mutex.unlock();
+
+    var state = try loadAppState(allocator);
+    defer state.deinit(allocator);
+
+    const usage_json = try buildUsageCacheJson(allocator, &state);
+    defer allocator.free(usage_json);
+    return jsonOkRaw(allocator, usage_json);
+}
+
+fn handleGetUiPreferencesCommand(allocator: std.mem.Allocator) ![]u8 {
+    managed_files_mutex.lock();
+    defer managed_files_mutex.unlock();
+
+    var state = try loadAppState(allocator);
+    defer state.deinit(allocator);
+
+    const preferences_json = try buildUiPreferencesResponseJson(allocator, &state.preferences);
+    defer allocator.free(preferences_json);
+    return jsonOkRaw(allocator, preferences_json);
 }
 
 fn handleSwitchAccountCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {

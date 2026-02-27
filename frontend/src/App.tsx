@@ -6,9 +6,9 @@ import {
   completeCodexLogin,
   getAccounts,
   getEmbeddedBootstrapState,
-  getLatestSnapshot,
   getRemainingCreditsForAccount,
   getSavedTheme,
+  getUsageCache,
   importCurrentAccount,
   listenForCodexCallback,
   moveAccount,
@@ -918,10 +918,8 @@ function App() {
     try {
       const next = await getAccounts();
       setViewState(next);
-      const snapshot = getLatestSnapshot();
-      if (snapshot) {
-        setCreditsById(snapshot.usageById);
-      }
+      const usageById = await getUsageCache();
+      setCreditsById(usageById);
       if (!initialLoad) {
         await refreshCreditsForAccounts(quotaSyncAccountIds(next), { quiet: false });
       }

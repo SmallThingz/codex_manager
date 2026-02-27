@@ -105,7 +105,6 @@ type BackendApis = {
 
 let backendApisPromise: Promise<BackendApis> | null = null;
 let pendingBrowserLogin: PendingBrowserLogin | null = null;
-let lastSnapshot: AppStateSnapshot | null = null;
 const inflightRefreshByAccountId = new Map<string, Promise<CreditsInfo>>();
 
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
@@ -401,71 +400,38 @@ const loadBackendApis = async (): Promise<BackendApis> => {
   return backendApisPromise;
 };
 
-const refreshSnapshot = async (): Promise<AppStateSnapshot> => {
-  const tauri = await loadBackendApis();
-  const snapshot = asSnapshot(await tauri.invoke<unknown>("get_app_state"));
-  lastSnapshot = snapshot;
-  return snapshot;
-};
-
-const emptyView = (): AccountsView => ({
-  accounts: [],
-  activeAccountId: null,
-  activeDiskAccountId: null,
-  codexAuthExists: false,
-  codexAuthPath: "",
-  storePath: "",
-});
-
-const updateLastSnapshotView = (view: AccountsView): void => {
-  if (!lastSnapshot) {
-    return;
-  }
-
-  lastSnapshot = {
-    ...lastSnapshot,
-    view,
-    savedAt: nowEpoch(),
-  };
-};
-
-const updateLastSnapshotPreferences = (value: unknown): void => {
-  if (!lastSnapshot) {
-    return;
-  }
-
-  const parsed = asRecord(value);
-  if (!parsed) {
-    return;
-  }
-
-  lastSnapshot = {
-    ...lastSnapshot,
-    theme: parsed.theme === "light" || parsed.theme === "dark" ? parsed.theme : lastSnapshot.theme,
-    autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? lastSnapshot.autoArchiveZeroQuota,
-    autoUnarchiveNonZeroQuota:
-      valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? lastSnapshot.autoUnarchiveNonZeroQuota,
-    autoSwitchAwayFromArchived:
-      valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? lastSnapshot.autoSwitchAwayFromArchived,
-    autoRefreshActiveEnabled: valueAsBoolean(parsed.autoRefreshActiveEnabled) ?? lastSnapshot.autoRefreshActiveEnabled,
-    autoRefreshActiveIntervalSec: normalizeAutoRefreshIntervalSec(
-      parsed.autoRefreshActiveIntervalSec ?? lastSnapshot.autoRefreshActiveIntervalSec,
-    ),
-    usageRefreshDisplayMode: normalizeUsageRefreshDisplayMode(
-      parsed.usageRefreshDisplayMode ?? lastSnapshot.usageRefreshDisplayMode,
-    ),
-    savedAt: nowEpoch(),
-  };
-};
-
 const parseAccountsViewResponse = (payload: unknown, opName: string): AccountsView => {
   const view = asAccountsView(payload);
   if (view) {
-    updateLastSnapshotView(view);
     return view;
   }
 
   throw new Error(`Unexpected ${opName} response from backend.`);
+};
+
+const parseThemeFromPreferencesResponse = (payload: unknown): "light" | "dark" | null => {
+  const parsed = asRecord(payload);
+  if (!parsed) {
+    throw new Error("Unexpected get_ui_preferences response from backend.");
+  }
+
+  return parsed.theme === "light" || parsed.theme === "dark" ? parsed.theme : null;
+};
+
+const parseUsageCacheResponse = (payload: unknown): Record<string, CreditsInfo> => {
+  const parsed = asRecord(payload);
+  if (!parsed) {
+    throw new Error("Unexpected get_usage_cache response from backend.");
+  }
+
+  const usageById: Record<string, CreditsInfo> = {};
+  for (const [id, creditsRaw] of Object.entries(parsed)) {
+    const credits = asCreditsInfo(creditsRaw);
+    if (credits) {
+      usageById[id] = credits;
+    }
+  }
+  return usageById;
 };
 
 const randomBase64Url = (size: number): string => {
@@ -719,14 +685,14 @@ export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
 };
 
 export const getSavedTheme = async (): Promise<"light" | "dark" | null> => {
-  const snapshot = await refreshSnapshot();
-  return snapshot.theme;
+  const tauri = await loadBackendApis();
+  const response = await tauri.invoke<unknown>("get_ui_preferences");
+  return parseThemeFromPreferencesResponse(response);
 };
 
 export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
   const tauri = await loadBackendApis();
-  const response = await tauri.invoke<unknown>("update_ui_preferences", { theme });
-  updateLastSnapshotPreferences(response);
+  await tauri.invoke<unknown>("update_ui_preferences", { theme });
 };
 
 export const updateUiPreferences = async (
@@ -738,13 +704,19 @@ export const updateUiPreferences = async (
   }>,
 ): Promise<void> => {
   const tauri = await loadBackendApis();
-  const response = await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
-  updateLastSnapshotPreferences(response);
+  await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
 };
 
 export const getAccounts = async (): Promise<AccountsView> => {
-  const snapshot = await refreshSnapshot();
-  return snapshot.view ?? emptyView();
+  const tauri = await loadBackendApis();
+  const view = await tauri.invoke<unknown>("get_accounts_view");
+  return parseAccountsViewResponse(view, "get_accounts_view");
+};
+
+export const getUsageCache = async (): Promise<Record<string, CreditsInfo>> => {
+  const tauri = await loadBackendApis();
+  const usage = await tauri.invoke<unknown>("get_usage_cache");
+  return parseUsageCacheResponse(usage);
 };
 
 export const importCurrentAccount = async (label?: string): Promise<AccountsView> => {
@@ -904,26 +876,6 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
     if (record) {
       const credits = asCreditsInfo(record.credits);
       if (credits) {
-        if (lastSnapshot) {
-          const email = normalizeOptional(typeof record.email === "string" ? record.email : null);
-          const nextView = lastSnapshot.view
-            ? {
-                ...lastSnapshot.view,
-                accounts: lastSnapshot.view.accounts.map((account) =>
-                  account.id === id && email && !account.email ? { ...account, email } : account,
-                ),
-              }
-            : lastSnapshot.view;
-          lastSnapshot = {
-            ...lastSnapshot,
-            view: nextView,
-            usageById: {
-              ...lastSnapshot.usageById,
-              [id]: credits,
-            },
-            savedAt: nowEpoch(),
-          };
-        }
         return credits;
       }
     }
@@ -940,5 +892,3 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
     }
   }
 };
-
-export const getLatestSnapshot = (): AppStateSnapshot | null => lastSnapshot;
