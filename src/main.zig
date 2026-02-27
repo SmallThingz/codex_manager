@@ -19,9 +19,23 @@ const IndexTemplate = struct {
     suffix: []const u8,
 };
 
-const LaunchMode = enum {
-    desktop,
-    web,
+const LaunchRequest = struct {
+    surfaces: [3]?webui.LaunchSurface = .{ null, null, null },
+    len: usize = 0,
+
+    fn append(self: *LaunchRequest, surface: webui.LaunchSurface) void {
+        if (self.contains(surface)) return;
+        if (self.len >= self.surfaces.len) return;
+        self.surfaces[self.len] = surface;
+        self.len += 1;
+    }
+
+    fn contains(self: *const LaunchRequest, surface: webui.LaunchSurface) bool {
+        for (self.surfaces[0..self.len]) |entry| {
+            if (entry == surface) return true;
+        }
+        return false;
+    }
 };
 
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
@@ -36,39 +50,80 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const launch_mode: LaunchMode = if (hasArg(args, "--web") and !hasArg(args, "--desktop"))
-        .web
-    else
-        .desktop;
-    const force_web_mode = launch_mode == .web;
+    const launch_request = try parseLaunchRequest(args);
     initIndexTemplates();
     rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
-    const launch_policy: webui.LaunchPolicy = switch (launch_mode) {
-        .web => webui.LaunchPolicy.webUrlOnly(),
-        .desktop => webui.LaunchPolicy.webviewFirst(),
-    };
-
-    const window_style: webui.WindowStyle = if (force_web_mode)
-        .{}
-    else
-        .{
-            .size = .{ .width = DEFAULT_WIDTH, .height = DEFAULT_HEIGHT },
-        };
-
-    const browser_launch: webui.BrowserLaunchOptions = switch (launch_mode) {
-        .web => .{
-            .surface_mode = .tab,
-            .fallback_mode = .allow_system,
-        },
-        .desktop => .{
-            .surface_mode = .native_webview_host,
-            .fallback_mode = .allow_system,
-        },
+    const window_style: webui.WindowStyle = .{
+        .size = .{ .width = DEFAULT_WIDTH, .height = DEFAULT_HEIGHT },
     };
 
     const page_html = makeDynamicIndexHtml(allocator) orelse return error.IndexHtmlUnavailable;
     defer allocator.free(page_html);
+
+    try runModeService(allocator, page_html, window_style, launch_request);
+}
+
+fn parseLaunchRequest(args: []const []const u8) !LaunchRequest {
+    var request: LaunchRequest = .{};
+
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--webview")) {
+            request.append(.native_webview);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--browser")) {
+            request.append(.browser_window);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--web")) {
+            request.append(.web_url);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print(
+                "Unsupported flag: {s}. Supported launch flags: --webview --browser --web\n",
+                .{arg},
+            );
+            return error.InvalidLaunchFlag;
+        }
+    }
+
+    if (request.len == 0) {
+        request.append(.native_webview);
+        request.append(.browser_window);
+        request.append(.web_url);
+    }
+
+    return request;
+}
+
+fn runModeService(
+    allocator: std.mem.Allocator,
+    page_html: []const u8,
+    window_style: webui.WindowStyle,
+    launch_request: LaunchRequest,
+) !void {
+    const first_surface = launch_request.surfaces[0] orelse .native_webview;
+    const launch_policy: webui.LaunchPolicy = .{
+        .first = first_surface,
+        .second = launch_request.surfaces[1],
+        .third = launch_request.surfaces[2],
+        // Keep strict app-mode requirement only for explicit native-only mode.
+        .app_mode_required = launch_request.len == 1 and first_surface == .native_webview,
+    };
+
+    const browser_launch: webui.BrowserLaunchOptions = .{
+        .surface_mode = switch (first_surface) {
+            .native_webview => .native_webview_host,
+            .browser_window => .app_window,
+            .web_url => .tab,
+        },
+        .fallback_mode = if (launch_request.len == 1 and first_surface == .native_webview)
+            .strict
+        else
+            .allow_system,
+    };
 
     var service = try webui.Service.init(allocator, rpc_webui.RpcBridgeMethods, .{
         .app = .{
@@ -88,9 +143,23 @@ pub fn main() !void {
     defer service.deinit();
 
     try service.show(.{ .html = page_html });
-    if (launch_mode == .web) {
-        service.openInBrowserWithOptions(browser_launch) catch |err| {
-            std.debug.print("Codex Manager web mode browser launch failed: {s}\n", .{@errorName(err)});
+
+    const render_state = service.runtimeRenderState();
+    if (launch_request.len == 1 and first_surface == .native_webview and render_state.active_surface != .native_webview) {
+        std.debug.print(
+            "Codex Manager native webview launch failed: active_surface={s} fallback_applied={any}\n",
+            .{ @tagName(render_state.active_surface), render_state.fallback_applied },
+        );
+        return error.NativeWebviewUnavailable;
+    }
+
+    // `web_url` requires explicit browser open; native/browser-window modes are managed by webui.
+    if (render_state.active_surface == .web_url) {
+        service.openInBrowserWithOptions(.{
+            .surface_mode = .tab,
+            .fallback_mode = .allow_system,
+        }) catch |err| {
+            std.debug.print("Codex Manager web URL launch failed: {s}\n", .{@errorName(err)});
         };
     }
 
@@ -98,28 +167,13 @@ pub fn main() !void {
     defer if (local_url) |url| allocator.free(url);
 
     if (local_url) |url| {
-        const mode_label = switch (launch_mode) {
-            .web => "web",
-            .desktop => "desktop",
-        };
-        std.debug.print("Codex Manager {s} mode URL: {s}\n", .{ mode_label, url });
+        std.debug.print("Codex Manager URL: {s}\n", .{url});
     }
 
-    try service.run();
     while (!service.shouldExit()) {
         try service.run();
         std.Thread.sleep(16 * std.time.ns_per_ms);
     }
-}
-
-fn hasArg(args: []const []const u8, needle: []const u8) bool {
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, needle)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 fn initIndexTemplates() void {

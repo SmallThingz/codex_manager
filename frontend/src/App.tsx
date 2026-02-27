@@ -39,6 +39,7 @@ const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
 const AUTO_REFRESH_ACTIVE_STEP_SEC = 15;
 const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
 const AUTO_REFRESH_DEPLETED_COOLDOWN_SEC = 30;
+const AUTO_REFRESH_DEPLETED_GRACE_SEC = 5;
 
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
@@ -513,9 +514,6 @@ function App() {
     return [...ids];
   };
 
-  const nonFrozenAccountIds = (nextView: AccountsView): string[] =>
-    nextView.accounts.filter((account) => !account.frozen).map((account) => account.id);
-
   const newlyAddedAccountIds = (previousView: AccountsView | null, nextView: AccountsView): string[] => {
     const previousIds = new Set((previousView?.accounts ?? []).map((account) => account.id));
     return nextView.accounts
@@ -826,7 +824,7 @@ function App() {
       return;
     }
 
-    const ids = nonFrozenAccountIds(currentView);
+    const ids = activeAccountIds(currentView);
     await refreshCreditsForAccounts(ids, { trackAll: true });
     setNotice("All credits refreshed.");
   };
@@ -868,7 +866,7 @@ function App() {
         }
 
         const refreshAt = usageRefreshEpoch(cachedCredits[id], currentEpoch);
-        return refreshAt !== null && refreshAt <= currentEpoch;
+        return refreshAt !== null && refreshAt + AUTO_REFRESH_DEPLETED_GRACE_SEC <= currentEpoch;
       });
 
     if (dueIds.length === 0) {
