@@ -3,7 +3,6 @@ import {
   archiveAccount,
   beginCodexLogin,
   codexLoginWithApiKey,
-  completeCodexLogin,
   getEmbeddedBootstrapState,
   getRemainingCreditsForAccount,
   importCurrentAccount,
@@ -626,6 +625,21 @@ function App() {
     };
   };
 
+  const applyOAuthLoginAccountInView = (
+    currentView: AccountsView,
+    account: AccountSummary,
+  ): AccountsView => {
+    const remaining = currentView.accounts.filter((entry) => entry.id !== account.id);
+    const nextAccounts = [...remaining, account];
+    return {
+      ...currentView,
+      accounts: nextAccounts,
+      activeAccountId: account.id,
+      activeDiskAccountId: account.accountId ?? null,
+      codexAuthExists: true,
+    };
+  };
+
   const markRefreshing = (accountIds: string[], refreshing: boolean) => {
     setRefreshingById((previous) => {
       let changed = false;
@@ -1028,29 +1042,21 @@ function App() {
     setNotice("Listening for callback. Click again to stop.");
 
     try {
-      const callbackUrl = await listenForCodexCallback();
+      const login = await listenForCodexCallback();
       if (runId !== callbackListenRunId) {
         return;
       }
 
-      const login = await completeCodexLogin(callbackUrl);
-      if (runId !== callbackListenRunId) {
-        return;
-      }
-
-      const previousView = view();
-      setViewState(login.view);
+      const currentView = view() ?? emptyAccountsView();
+      const nextView = applyOAuthLoginAccountInView(currentView, login.account);
+      setViewState(nextView);
       setBrowserStart(null);
       setApiKeyDraft("");
-      if (activeAccountIds(login.view).length > 0) {
+      if (activeAccountIds(nextView).length > 0) {
         setAddMenuOpen(false);
       }
       setNotice(login.output.length > 0 ? login.output : "ChatGPT login completed.");
-
-      const addedIds = newlyAddedAccountIds(previousView, login.view);
-      if (addedIds.length > 0) {
-        await refreshCreditsForAccounts(addedIds, { quiet: true });
-      }
+      await refreshCreditsForAccounts([login.account.id], { quiet: true });
     } catch (listenerError) {
       if (runId !== callbackListenRunId) {
         return;

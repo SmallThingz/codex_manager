@@ -3,8 +3,6 @@ const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_ORIGINATOR = "codex_cli_rs";
 const CODEX_SCOPE = "openid profile email offline_access";
-const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
-const ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token";
 const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
 const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC = 15;
 const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
@@ -34,6 +32,11 @@ export type BrowserLoginStart = {
 
 export type LoginResult = {
   view: AccountsView;
+  output: string;
+};
+
+export type OAuthLoginResult = {
+  account: AccountSummary;
   output: string;
 };
 
@@ -80,15 +83,9 @@ type PendingBrowserLogin = {
   startedAt: number;
 };
 
-type TokenPair = {
-  idToken: string;
-  accessToken: string;
-  refreshToken: string;
-};
-
 type OAuthCallbackPollResponse = {
   status: "idle" | "running" | "ready" | "error";
-  callbackUrl?: string | null;
+  account?: AccountSummary | null;
   error?: string | null;
 };
 
@@ -124,15 +121,6 @@ const asRecord = (value: unknown): Record<string, unknown> | null => {
   }
 
   return value as Record<string, unknown>;
-};
-
-const getString = (obj: Record<string, unknown> | null, key: string): string | null => {
-  if (!obj) {
-    return null;
-  }
-
-  const value = obj[key];
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
 };
 
 const valueAsBoolean = (value: unknown): boolean | null => {
@@ -219,22 +207,7 @@ const asAccountsView = (value: unknown): AccountsView | null => {
 
   const rawAccounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
   const accounts: AccountSummary[] = rawAccounts
-    .map((entry) => {
-      const account = asRecord(entry);
-      if (!account || typeof account.id !== "string") {
-        return null;
-      }
-
-      return {
-        id: account.id,
-        accountId: normalizeOptional(typeof account.accountId === "string" ? account.accountId : null),
-        email: normalizeOptional(typeof account.email === "string" ? account.email : null),
-        state:
-          account.state === "archived" || account.state === "frozen" || account.state === "active"
-            ? account.state
-            : "active",
-      };
-    })
+    .map((entry) => asAccountSummary(entry))
     .filter((entry): entry is AccountSummary => entry !== null);
 
   return {
@@ -246,6 +219,23 @@ const asAccountsView = (value: unknown): AccountsView | null => {
     codexAuthExists: valueAsBoolean(parsed.codexAuthExists) ?? false,
     codexAuthPath: typeof parsed.codexAuthPath === "string" ? parsed.codexAuthPath : "",
     storePath: typeof parsed.storePath === "string" ? parsed.storePath : "",
+  };
+};
+
+const asAccountSummary = (value: unknown): AccountSummary | null => {
+  const account = asRecord(value);
+  if (!account || typeof account.id !== "string") {
+    return null;
+  }
+
+  return {
+    id: account.id,
+    accountId: normalizeOptional(typeof account.accountId === "string" ? account.accountId : null),
+    email: normalizeOptional(typeof account.email === "string" ? account.email : null),
+    state:
+      account.state === "archived" || account.state === "frozen" || account.state === "active"
+        ? account.state
+        : "active",
   };
 };
 
@@ -471,190 +461,39 @@ const buildAuthorizeUrl = (
   return `${issuer}/oauth/authorize?${query.toString()}`;
 };
 
-const parseTokenEndpointError = (bodyText: string): string => {
-  const trimmed = bodyText.trim();
-  if (!trimmed) {
-    return "unknown error";
-  }
-
-  try {
-    const parsed = asRecord(JSON.parse(trimmed));
-    const description = getString(parsed, "error_description");
-    if (description) {
-      return description;
-    }
-
-    const errorObj = asRecord(parsed?.error);
-    const errorMessage = getString(errorObj, "message");
-    if (errorMessage) {
-      return errorMessage;
-    }
-
-    const errorCode = getString(parsed, "error");
-    if (errorCode) {
-      return errorCode;
-    }
-  } catch {
-    // plain text fallback
-  }
-
-  return trimmed;
-};
-
-const parseCallbackInput = (callbackInput: string): { code: string; state: string | null } => {
-  const trimmed = callbackInput.trim();
-  if (!trimmed) {
-    throw new Error("Paste the callback URL from your browser.");
-  }
-
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new Error("Invalid callback URL. Paste the full URL that starts with http://localhost:1455/auth/callback?");
-  }
-
-  const code = normalizeOptional(url.searchParams.get("code"));
-  if (!code) {
-    const errorCode = normalizeOptional(url.searchParams.get("error"));
-    const errorDescription = normalizeOptional(url.searchParams.get("error_description"));
-
-    if (errorCode) {
-      throw new Error(errorDescription ? `Login failed: ${errorDescription}` : `Login failed: ${errorCode}`);
-    }
-
-    throw new Error("The callback URL does not contain an authorization code.");
-  }
-
-  return {
-    code,
-    state: normalizeOptional(url.searchParams.get("state")),
-  };
-};
-
-const exchangeAuthorizationCode = async (
+const waitForOAuthCallbackFromBrowser = async (
   pending: PendingBrowserLogin,
-  code: string,
-): Promise<TokenPair> => {
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    redirect_uri: pending.redirectUri,
-    client_id: pending.clientId,
-    code_verifier: pending.codeVerifier,
-  }).toString();
-
-  const response = await fetch(`${pending.issuer}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-
-  if (!response.ok) {
-    const details = parseTokenEndpointError(await response.text());
-    throw new Error(`Token exchange failed (${response.status}): ${details}`);
-  }
-
-  const payload = asRecord(await response.json());
-  const idToken = getString(payload, "id_token");
-  const accessToken = getString(payload, "access_token");
-  const refreshToken = getString(payload, "refresh_token");
-
-  if (!idToken || !accessToken || !refreshToken) {
-    throw new Error("Token exchange succeeded but returned an unexpected payload.");
-  }
-
-  return { idToken, accessToken, refreshToken };
-};
-
-const exchangeApiKey = async (
-  issuer: string,
-  clientId: string,
-  idToken: string,
-): Promise<string | null> => {
-  const body = new URLSearchParams({
-    grant_type: TOKEN_EXCHANGE_GRANT,
-    client_id: clientId,
-    requested_token: "openai-api-key",
-    subject_token: idToken,
-    subject_token_type: ID_TOKEN_TYPE,
-  }).toString();
-
-  const response = await fetch(`${issuer}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const payload = asRecord(await response.json());
-  return getString(payload, "access_token");
-};
-
-const decodeJwtPayload = (token: string): Record<string, unknown> | null => {
-  const payload = token.split(".")[1];
-  if (!payload) {
-    return null;
-  }
-
-  try {
-    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padding = base64.length % 4;
-    const normalized = padding === 0 ? base64 : `${base64}${"=".repeat(4 - padding)}`;
-    const binary = atob(normalized);
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    const json = new TextDecoder().decode(bytes);
-    return asRecord(JSON.parse(json));
-  } catch {
-    return null;
-  }
-};
-
-const buildChatgptAuthPayload = (tokens: TokenPair, apiKey: string | null): Record<string, unknown> => {
-  const claims = decodeJwtPayload(tokens.idToken);
-  const authClaims = asRecord(claims?.["https://api.openai.com/auth"]);
-  const accountId = getString(authClaims, "chatgpt_account_id");
-
-  const payload: Record<string, unknown> = {
-    auth_mode: "chatgpt",
-    tokens: {
-      id_token: tokens.idToken,
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      account_id: accountId,
-    },
-    last_refresh: new Date().toISOString(),
-  };
-
-  if (apiKey) {
-    payload.OPENAI_API_KEY = apiKey;
-  }
-
-  return payload;
-};
-
-const waitForOAuthCallbackFromBrowser = async (): Promise<string> => {
+  label?: string,
+): Promise<AccountSummary> => {
   const tauri = await loadBackendApis();
-  await tauri.invoke<boolean>("start_oauth_callback_listener", { timeoutSeconds: 180 });
+  await tauri.invoke<boolean>("start_oauth_callback_listener", {
+    timeoutSeconds: 180,
+    issuer: pending.issuer,
+    clientId: pending.clientId,
+    redirectUri: pending.redirectUri,
+    oauthState: pending.state,
+    codeVerifier: pending.codeVerifier,
+    label,
+  });
 
   const renderCallbackError = (errorCode: string): string => {
     if (errorCode === "CallbackListenerStopped") return "Callback listener stopped.";
     if (errorCode === "CallbackListenerTimeout") return "Callback listener timed out.";
     if (errorCode === "AddressInUse") return "Callback listener port 1455 is already in use.";
+    if (errorCode === "OAuthStateMismatch") return "State mismatch. Start a fresh login and try again.";
+    if (errorCode === "AuthorizationCodeExchangeFailed") return "Token exchange failed. Start a fresh login and try again.";
+    if (errorCode === "OAuthAuthorizationFailed") return "Login authorization failed in browser.";
     return errorCode;
   };
 
   while (true) {
     const status = await tauri.invoke<OAuthCallbackPollResponse>("poll_oauth_callback_listener");
     if (status.status === "ready") {
-      const normalized = normalizeOptional(status.callbackUrl);
-      if (!normalized) {
-        throw new Error("Callback listener returned an empty redirect URL.");
+      const account = asAccountSummary(status.account);
+      if (!account) {
+        throw new Error("Callback listener returned an invalid account payload.");
       }
-      return normalized;
+      return account;
     }
 
     if (status.status === "error") {
@@ -752,47 +591,23 @@ export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
   };
 };
 
-export const listenForCodexCallback = async (): Promise<string> => {
-  return waitForOAuthCallbackFromBrowser();
-};
-
-export const stopCodexCallbackListener = async (): Promise<void> => {
-  const tauri = await loadBackendApis();
-  await tauri.invoke<boolean>("cancel_oauth_callback_listener");
-};
-
-export const completeCodexLogin = async (callbackUrl?: string, label?: string): Promise<LoginResult> => {
+export const listenForCodexCallback = async (): Promise<OAuthLoginResult> => {
   if (!pendingBrowserLogin) {
     throw new Error("No active login session. Start ChatGPT login first.");
   }
 
   const pending = pendingBrowserLogin;
-  const capturedCallbackUrl = normalizeOptional(callbackUrl) || (await waitForOAuthCallbackFromBrowser());
-  const parsed = parseCallbackInput(capturedCallbackUrl);
-
-  if (parsed.state !== pending.state) {
-    throw new Error("State mismatch. Start a fresh login and use the newest callback URL.");
-  }
-
-  const tokens = await exchangeAuthorizationCode(pending, parsed.code);
-  const apiKey = await exchangeApiKey(pending.issuer, pending.clientId, tokens.idToken);
-  const auth = buildChatgptAuthPayload(tokens, apiKey);
-
-  const tauri = await loadBackendApis();
-  const view = parseAccountsViewResponse(
-    await tauri.invoke<unknown>("complete_codex_login", {
-      authPayload: JSON.stringify(auth),
-      label,
-    }),
-    "complete_codex_login",
-  );
-
+  const account = await waitForOAuthCallbackFromBrowser(pending);
   pendingBrowserLogin = null;
-
   return {
-    view,
+    account,
     output: "ChatGPT login completed.",
   };
+};
+
+export const stopCodexCallbackListener = async (): Promise<void> => {
+  const tauri = await loadBackendApis();
+  await tauri.invoke<boolean>("cancel_oauth_callback_listener");
 };
 
 export const codexLoginWithApiKey = async (apiKey: string, label?: string): Promise<LoginResult> => {
