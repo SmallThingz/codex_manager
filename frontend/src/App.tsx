@@ -6,16 +6,17 @@ import {
   completeCodexLogin,
   getAccounts,
   getEmbeddedBootstrapState,
+  getLatestSnapshot,
   getRemainingCreditsForAccount,
   getSavedTheme,
   importCurrentAccount,
   listenForCodexCallback,
   moveAccount,
   removeAccount,
-  saveEmbeddedBootstrapState,
   saveTheme,
   stopCodexCallbackListener,
   switchAccount,
+  updateUiPreferences,
   unarchiveAccount,
   type AccountSummary,
   type AccountBucket,
@@ -31,8 +32,6 @@ type Theme = "light" | "dark";
 type UsageRefreshDisplayMode = "date" | "remaining";
 const QUOTA_EPSILON = 0.0001;
 const DRAG_SELECT_LOCK_CLASS = "drag-select-lock";
-const AUTO_ARCHIVE_ZERO_QUOTA = true;
-const AUTO_UNARCHIVE_NON_ZERO_QUOTA = true;
 const AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN = true;
 const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC = 15;
 const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
@@ -445,7 +444,6 @@ function App() {
   let autoActiveRefreshInFlight = false;
   let lastActiveAutoRefreshAt = 0;
   let depletedAutoRefreshCooldownUntil = 0;
-  let persistStateTimer: number | undefined;
   let addMenuRef: HTMLDivElement | undefined;
   let addButtonRef: HTMLButtonElement | undefined;
   let settingsMenuRef: HTMLDivElement | undefined;
@@ -520,45 +518,6 @@ function App() {
       .map((account) => account.id);
   };
 
-  const normalizedCreditsCache = (): Record<string, CreditsInfo> => {
-    const current = creditsById();
-    const next: Record<string, CreditsInfo> = {};
-    for (const [accountId, credits] of Object.entries(current)) {
-      if (credits) {
-        next[accountId] = credits;
-      }
-    }
-    return next;
-  };
-
-  const schedulePersistEmbeddedState = () => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    if (persistStateTimer !== undefined) {
-      window.clearTimeout(persistStateTimer);
-    }
-
-    persistStateTimer = window.setTimeout(() => {
-      persistStateTimer = undefined;
-      const currentView = view();
-
-      void saveEmbeddedBootstrapState({
-        theme: theme(),
-        autoArchiveZeroQuota: AUTO_ARCHIVE_ZERO_QUOTA,
-        autoUnarchiveNonZeroQuota: AUTO_UNARCHIVE_NON_ZERO_QUOTA,
-        autoSwitchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
-        autoRefreshActiveEnabled: autoRefreshActiveEnabled(),
-        autoRefreshActiveIntervalSec: autoRefreshActiveIntervalSec(),
-        usageRefreshDisplayMode: usageRefreshDisplayMode(),
-        view: currentView,
-        usageById: normalizedCreditsCache(),
-        savedAt: nowEpoch(),
-      }).catch(() => {});
-    }, 120);
-  };
-
   const runAction = async <T,>(message: string, action: () => Promise<T>): Promise<T | undefined> => {
     batch(() => {
       setBusy(message);
@@ -584,7 +543,6 @@ function App() {
         setAddMenuOpen(true);
       }
     });
-    schedulePersistEmbeddedState();
   };
 
   const markRefreshing = (accountIds: string[], refreshing: boolean) => {
@@ -648,7 +606,6 @@ function App() {
 
         return next;
       });
-      schedulePersistEmbeddedState();
 
       if (!quiet) {
         const failures = entries.filter((entry) => entry[1].status === "error");
@@ -685,7 +642,6 @@ function App() {
         ...current,
         [id]: credits,
       }));
-      schedulePersistEmbeddedState();
 
       if (credits.status !== "error") {
         setNotice("Credits refreshed.");
@@ -916,7 +872,9 @@ function App() {
     if (next) {
       lastActiveAutoRefreshAt = 0;
     }
-    schedulePersistEmbeddedState();
+    void updateUiPreferences({
+      autoRefreshActiveEnabled: next,
+    }).catch(() => {});
   };
 
   const handleAutoRefreshIntervalInput = (event: Event) => {
@@ -928,7 +886,9 @@ function App() {
     const parsed = Number.parseInt(input.value, 10);
     const next = normalizeAutoRefreshIntervalSec(Number.isFinite(parsed) ? parsed : null);
     setAutoRefreshActiveIntervalSec(next);
-    schedulePersistEmbeddedState();
+    void updateUiPreferences({
+      autoRefreshActiveIntervalSec: next,
+    }).catch(() => {});
   };
 
   const handleUsageRefreshDisplayModeChange = (event: Event) => {
@@ -939,7 +899,9 @@ function App() {
 
     const next = normalizeUsageRefreshDisplayMode(select.value);
     setUsageRefreshDisplayMode(next);
-    schedulePersistEmbeddedState();
+    void updateUiPreferences({
+      usageRefreshDisplayMode: next,
+    }).catch(() => {});
   };
 
   const refreshAccounts = async (initialLoad = false) => {
@@ -956,6 +918,10 @@ function App() {
     try {
       const next = await getAccounts();
       setViewState(next);
+      const snapshot = getLatestSnapshot();
+      if (snapshot) {
+        setCreditsById(snapshot.usageById);
+      }
       if (!initialLoad) {
         await refreshCreditsForAccounts(quotaSyncAccountIds(next), { quiet: false });
       }
@@ -1457,7 +1423,6 @@ function App() {
       delete nextCredits[id];
       return nextCredits;
     });
-    schedulePersistEmbeddedState();
     setNotice("Account removed.");
   };
 
@@ -1465,7 +1430,6 @@ function App() {
     const nextTheme: Theme = theme() === "light" ? "dark" : "light";
     setTheme(nextTheme);
     applyTheme(nextTheme);
-    schedulePersistEmbeddedState();
     void saveTheme(nextTheme).catch(() => {});
   };
 
@@ -1482,7 +1446,6 @@ function App() {
     }
     setTheme(initialTheme);
     applyTheme(initialTheme);
-    schedulePersistEmbeddedState();
     void saveTheme(initialTheme).catch(() => {});
 
     const handlePointerDown = (event: PointerEvent) => {
@@ -1524,9 +1487,6 @@ function App() {
         window.clearInterval(nowTickInterval);
       }
       document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
-      if (persistStateTimer !== undefined) {
-        window.clearTimeout(persistStateTimer);
-      }
       removeDragPreview();
     });
 

@@ -32,14 +32,14 @@ export type AccountsView = {
   storePath: string;
 };
 
-export type LoginResult = {
-  view: AccountsView;
-  output: string;
-};
-
 export type BrowserLoginStart = {
   authUrl: string;
   redirectUri: string;
+};
+
+export type LoginResult = {
+  view: AccountsView;
+  output: string;
 };
 
 export type CreditsInfo = {
@@ -61,32 +61,6 @@ export type CreditsInfo = {
   checkedAt: number;
 };
 
-type ManagedAccount = {
-  id: string;
-  label: string | null;
-  accountId: string | null;
-  email: string | null;
-  archived: boolean;
-  frozen: boolean;
-  auth: unknown;
-  createdAt: number;
-  updatedAt: number;
-  lastUsedAt: number | null;
-};
-
-type AccountsStore = {
-  activeAccountId: string | null;
-  accounts: ManagedAccount[];
-};
-
-type Paths = {
-  codexHome: string;
-  codexAuthPath: string;
-  storeDir: string;
-  storePath: string;
-  bootstrapStatePath: string;
-};
-
 export type EmbeddedBootstrapState = {
   theme: "light" | "dark" | null;
   autoArchiveZeroQuota: boolean;
@@ -99,6 +73,8 @@ export type EmbeddedBootstrapState = {
   usageById: Record<string, CreditsInfo>;
   savedAt: number;
 };
+
+export type AppStateSnapshot = EmbeddedBootstrapState;
 
 type PendingBrowserLogin = {
   issuer: string;
@@ -115,31 +91,10 @@ type TokenPair = {
   refreshToken: string;
 };
 
-type WhamUsageResponse = {
-  status: number;
-  body: unknown;
-};
-
 type OAuthCallbackPollResponse = {
   status: "idle" | "running" | "ready" | "error";
   callbackUrl?: string | null;
   error?: string | null;
-};
-
-let pathsPromise: Promise<Paths> | null = null;
-let pendingBrowserLogin: PendingBrowserLogin | null = null;
-const inflightCreditsByAccountId = new Map<string, Promise<CreditsInfo>>();
-
-type BackendApis = {
-  invoke: <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
-  openUrl: (url: string) => Promise<void>;
-  getManagedPaths: () => Promise<Paths>;
-  readManagedStore: () => Promise<string | null>;
-  writeManagedStore: (contents: string) => Promise<void>;
-  readCodexAuth: () => Promise<string | null>;
-  writeCodexAuth: (contents: string) => Promise<void>;
-  readBootstrapState: () => Promise<string | null>;
-  writeBootstrapState: (contents: string) => Promise<void>;
 };
 
 type BridgeResult<T> = {
@@ -148,134 +103,22 @@ type BridgeResult<T> = {
   error?: string;
 };
 
-let backendApisPromise: Promise<BackendApis> | null = null;
-
 type RpcBridgeHttpResponse = {
   value?: unknown;
   error?: string;
 };
 
-const extractBridgeRawResponse = (op: string, value: unknown): string => {
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      const parsedRecord = asRecord(parsed);
-      if (parsedRecord && typeof parsedRecord.value === "string" && parsedRecord.ok === undefined) {
-        return parsedRecord.value;
-      }
-    } catch {
-      // Keep raw string when it is not a JSON envelope.
-    }
-
-    return value;
-  }
-
-  const record = asRecord(value);
-  if (record) {
-    if (record.ok !== undefined) {
-      return JSON.stringify(record);
-    }
-    if (typeof record.value === "string") {
-      return record.value;
-    }
-  }
-
-  throw new Error(`Backend bridge call failed for op "${op}".`);
+type BackendApis = {
+  invoke: <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
+  openUrl: (url: string) => Promise<void>;
 };
 
-const parseBridgeResult = <T>(op: string, rawResponse: string): T => {
-  const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
-  if (!parsed.ok) {
-    throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
-  }
-  return parsed.value as T;
-};
-
-const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
-  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
-    throw new Error(`Backend RPC requires an HTTP(S) session, got ${window.location.protocol}.`);
-  }
-
-  const request = JSON.stringify({
-    op,
-    ...payload,
-  });
-
-  const rpcPayload = JSON.stringify({
-    name: "call",
-    args: ["cm_rpc", request],
-  });
-  const response = await fetch("/webui/rpc", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: rpcPayload,
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP bridge request failed (${response.status}).`);
-  }
-
-  const rawResponse = await response.text();
-  const rpcResponse = JSON.parse(rawResponse) as RpcBridgeHttpResponse;
-
-  if (rpcResponse.value !== undefined) {
-    return parseBridgeResult<T>(op, extractBridgeRawResponse(op, rpcResponse.value));
-  }
-
-  if (typeof rpcResponse.error === "string") {
-    throw new Error(rpcResponse.error);
-  }
-
-  throw new Error(`Backend bridge call failed for op "${op}".`);
-};
-
-const loadBackendApis = async (): Promise<BackendApis> => {
-  if (!backendApisPromise) {
-    backendApisPromise = Promise.resolve({
-      invoke: async <T>(command: string, payload: Record<string, unknown> = {}) =>
-        callBridge<T>(`invoke:${command}`, payload),
-      openUrl: async (url: string) => {
-        await callBridge<null>("shell:open_url", { url });
-      },
-      getManagedPaths: async () => callBridge<Paths>("invoke:get_managed_paths"),
-      readManagedStore: async () => callBridge<string | null>("invoke:read_managed_store"),
-      writeManagedStore: async (contents: string) => {
-        await callBridge<null>("invoke:write_managed_store", { contents });
-      },
-      readCodexAuth: async () => callBridge<string | null>("invoke:read_codex_auth"),
-      writeCodexAuth: async (contents: string) => {
-        await callBridge<null>("invoke:write_codex_auth", { contents });
-      },
-      readBootstrapState: async () => callBridge<string | null>("invoke:read_bootstrap_state"),
-      writeBootstrapState: async (contents: string) => {
-        await callBridge<null>("invoke:write_bootstrap_state", { contents });
-      },
-    });
-  }
-
-  return backendApisPromise;
-};
-
-export const getSavedTheme = async (): Promise<"light" | "dark" | null> => {
-  const value = await callBridge<string | null>("settings:get_theme");
-  if (value === "light" || value === "dark") {
-    return value;
-  }
-
-  return null;
-};
-
-export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
-  await callBridge<null>("settings:set_theme", { theme });
-};
+let backendApisPromise: Promise<BackendApis> | null = null;
+let pendingBrowserLogin: PendingBrowserLogin | null = null;
+let lastSnapshot: AppStateSnapshot | null = null;
+const inflightRefreshByAccountId = new Map<string, Promise<CreditsInfo>>();
 
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
-
-const generateAccountId = (): string =>
-  `acct-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
 const normalizeOptional = (value: string | null | undefined): string | null => {
   if (!value) {
@@ -301,98 +144,6 @@ const getString = (obj: Record<string, unknown> | null, key: string): string | n
 
   const value = obj[key];
   return typeof value === "string" && value.trim().length > 0 ? value : null;
-};
-
-const decodeJwtPayload = (token: string): Record<string, unknown> | null => {
-  const payload = token.split(".")[1];
-  if (!payload) {
-    return null;
-  }
-
-  try {
-    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padding = base64.length % 4;
-    const normalized = padding === 0 ? base64 : `${base64}${"=".repeat(4 - padding)}`;
-    const binary = atob(normalized);
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    const json = new TextDecoder().decode(bytes);
-    return asRecord(JSON.parse(json));
-  } catch {
-    return null;
-  }
-};
-
-const extractTokens = (auth: unknown): Record<string, unknown> | null => {
-  const root = asRecord(auth);
-  return asRecord(root?.tokens);
-};
-
-const extractApiKey = (auth: unknown): string | null => {
-  const root = asRecord(auth);
-  return getString(root, "OPENAI_API_KEY");
-};
-
-const extractIdToken = (auth: unknown): string | null => {
-  const tokens = extractTokens(auth);
-  const direct = getString(tokens, "id_token");
-  if (direct) {
-    return direct;
-  }
-
-  const idTokenObj = asRecord(tokens?.id_token);
-  return getString(idTokenObj, "raw_jwt");
-};
-
-const extractAuthClaims = (auth: unknown): Record<string, unknown> | null => {
-  const idToken = extractIdToken(auth);
-  if (!idToken) {
-    return null;
-  }
-
-  const payload = decodeJwtPayload(idToken);
-  return asRecord(payload?.["https://api.openai.com/auth"]);
-};
-
-const extractAccountId = (auth: unknown): string | null => {
-  const fromTokens = getString(extractTokens(auth), "account_id");
-  if (fromTokens) {
-    return fromTokens;
-  }
-
-  return getString(extractAuthClaims(auth), "chatgpt_account_id");
-};
-
-const extractEmail = (auth: unknown): string | null => {
-  const idToken = extractIdToken(auth);
-  if (!idToken) {
-    return null;
-  }
-
-  const payload = decodeJwtPayload(idToken);
-  const profile = asRecord(payload?.["https://api.openai.com/profile"]);
-
-  return (
-    getString(payload, "email") ||
-    getString(profile, "email") ||
-    getString(payload, "preferred_username") ||
-    getString(payload, "upn") ||
-    getString(payload, "name") ||
-    getString(payload, "sub")
-  );
-};
-
-const validateAuth = (auth: unknown): void => {
-  const apiKey = extractApiKey(auth);
-  if (apiKey) {
-    return;
-  }
-
-  const accessToken = getString(extractTokens(auth), "access_token");
-  if (accessToken) {
-    return;
-  }
-
-  throw new Error("Auth JSON must contain OPENAI_API_KEY or tokens.access_token.");
 };
 
 const valueAsBoolean = (value: unknown): boolean | null => {
@@ -448,272 +199,255 @@ const normalizeAutoRefreshIntervalSec = (value: unknown): number => {
   );
 };
 
-const parseCreditsPayload = (
-  payload: Record<string, unknown>,
-): { available: number | null; used: number | null; total: number | null } | null => {
-  const summary = asRecord(payload.credit_summary);
+const normalizeUsageRefreshDisplayMode = (value: unknown): "date" | "remaining" => {
+  return value === "remaining" ? "remaining" : "date";
+};
 
-  const available = valueAsNumber(payload.total_available) ?? valueAsNumber(summary?.total_available);
-  const used = valueAsNumber(payload.total_used) ?? valueAsNumber(summary?.total_used);
-  const total = valueAsNumber(payload.total_granted) ?? valueAsNumber(summary?.total_granted);
+const defaultCreditsInfo = (message: string): CreditsInfo => ({
+  available: null,
+  used: null,
+  total: null,
+  currency: "USD",
+  source: "wham_usage",
+  mode: "balance",
+  unit: "USD",
+  planType: null,
+  isPaidPlan: false,
+  hourlyRemainingPercent: null,
+  weeklyRemainingPercent: null,
+  hourlyRefreshAt: null,
+  weeklyRefreshAt: null,
+  status: "unavailable",
+  message,
+  checkedAt: nowEpoch(),
+});
 
-  if (available === null && used === null && total === null) {
+const asAccountsView = (value: unknown): AccountsView | null => {
+  const parsed = asRecord(value);
+  if (!parsed) {
     return null;
   }
 
-  return { available, used, total };
-};
-
-const parseRateLimitUsedPercent = (payload: Record<string, unknown>): number | null => {
-  const rateLimit = asRecord(payload.rate_limit) ?? asRecord(payload.rateLimit);
-  const primaryWindow = asRecord(rateLimit?.primary_window) ?? asRecord(rateLimit?.primaryWindow);
-  return valueAsNumber(primaryWindow?.used_percent) ?? valueAsNumber(primaryWindow?.usedPercent);
-};
-
-type RateLimitWindowInfo = {
-  usedPercent: number;
-  windowSeconds: number;
-  refreshAt: number | null;
-};
-
-const parseEpochSeconds = (value: unknown): number | null => {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    if (value > 1_000_000_000_000) {
-      return Math.floor(value / 1000);
-    }
-    return Math.floor(value);
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    const asNumber = Number.parseFloat(trimmed);
-    if (Number.isFinite(asNumber)) {
-      if (asNumber > 1_000_000_000_000) {
-        return Math.floor(asNumber / 1000);
+  const rawAccounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
+  const accounts: AccountSummary[] = rawAccounts
+    .map((entry) => {
+      const account = asRecord(entry);
+      if (!account || typeof account.id !== "string") {
+        return null;
       }
-      return Math.floor(asNumber);
-    }
 
-    const parsedDate = Date.parse(trimmed);
-    if (Number.isFinite(parsedDate)) {
-      return Math.floor(parsedDate / 1000);
-    }
-  }
-
-  return null;
-};
-
-const clampPercent = (value: number): number => Math.max(0, Math.min(100, value));
-
-const parseRateLimitWindows = (
-  rateLimit: Record<string, unknown> | null,
-  checkedAt: number,
-): RateLimitWindowInfo[] => {
-  if (!rateLimit) {
-    return [];
-  }
-
-  const windows: RateLimitWindowInfo[] = [];
-
-  for (const key of ["primary_window", "secondary_window", "primaryWindow", "secondaryWindow"]) {
-    const window = asRecord(rateLimit[key]);
-    const usedPercent = valueAsNumber(window?.used_percent) ?? valueAsNumber(window?.usedPercent);
-    const windowSeconds = valueAsNumber(window?.limit_window_seconds) ?? valueAsNumber(window?.limitWindowSeconds);
-
-    if (usedPercent === null || windowSeconds === null) {
-      continue;
-    }
-
-    const refreshAt =
-      parseEpochSeconds(window?.next_reset_at) ??
-      parseEpochSeconds(window?.nextResetAt) ??
-      parseEpochSeconds(window?.reset_at) ??
-      parseEpochSeconds(window?.resetAt) ??
-      parseEpochSeconds(window?.resets_at) ??
-      parseEpochSeconds(window?.resetsAt) ??
-      parseEpochSeconds(window?.window_reset_at) ??
-      parseEpochSeconds(window?.windowResetAt) ??
-      parseEpochSeconds(window?.next_refresh_at) ??
-      parseEpochSeconds(window?.nextRefreshAt) ??
-      parseEpochSeconds(window?.refresh_at) ??
-      parseEpochSeconds(window?.refreshAt) ??
-      (() => {
-        const resetInSeconds =
-          valueAsNumber(window?.seconds_until_reset) ??
-          valueAsNumber(window?.secondsUntilReset) ??
-          valueAsNumber(window?.reset_in_seconds) ??
-          valueAsNumber(window?.resetInSeconds) ??
-          valueAsNumber(window?.time_until_reset_seconds) ??
-          valueAsNumber(window?.timeUntilResetSeconds) ??
-          valueAsNumber(window?.window_remaining_seconds);
-        if (resetInSeconds === null || resetInSeconds < 0) {
-          return null;
-        }
-        return checkedAt + Math.floor(resetInSeconds);
-      })();
-
-    windows.push({
-      usedPercent: clampPercent(usedPercent),
-      windowSeconds,
-      refreshAt,
-    });
-  }
-
-  return windows;
-};
-
-const collectAllRateLimitWindows = (payload: Record<string, unknown>, checkedAt: number): RateLimitWindowInfo[] => {
-  const windows: RateLimitWindowInfo[] = [];
-  windows.push(...parseRateLimitWindows(asRecord(payload.rate_limit) ?? asRecord(payload.rateLimit), checkedAt));
-
-  const additional = payload.additional_rate_limits ?? payload.additionalRateLimits;
-  if (!Array.isArray(additional)) {
-    return windows;
-  }
-
-  for (const entry of additional) {
-    const record = asRecord(entry);
-    windows.push(
-      ...parseRateLimitWindows(asRecord(record?.rate_limit) ?? asRecord(record?.rateLimit), checkedAt),
-    );
-  }
-
-  return windows;
-};
-
-const remainingFromWindow = (window: RateLimitWindowInfo | null): number | null => {
-  if (!window) {
-    return null;
-  }
-
-  return clampPercent(100 - window.usedPercent);
-};
-
-const refreshAtFromWindow = (window: RateLimitWindowInfo | null, checkedAt: number): number | null => {
-  if (!window) {
-    return null;
-  }
-
-  if (window.refreshAt !== null) {
-    return window.refreshAt;
-  }
-
-  if (window.windowSeconds > 0) {
-    return checkedAt + Math.floor(window.windowSeconds);
-  }
-
-  return null;
-};
-
-const pickWeeklyWindow = (windows: RateLimitWindowInfo[]): RateLimitWindowInfo | null => {
-  if (windows.length === 0) {
-    return null;
-  }
-
-  const weeklyCandidates = windows
-    .filter((window) => window.windowSeconds >= 86400)
-    .sort((a, b) => Math.abs(a.windowSeconds - 604800) - Math.abs(b.windowSeconds - 604800));
-
-  if (weeklyCandidates.length > 0) {
-    return weeklyCandidates[0];
-  }
-
-  const sorted = [...windows].sort((a, b) => b.windowSeconds - a.windowSeconds);
-  return sorted[0] ?? null;
-};
-
-const pickHourlyWindow = (
-  windows: RateLimitWindowInfo[],
-  weeklyWindow: RateLimitWindowInfo | null,
-): RateLimitWindowInfo | null => {
-  if (windows.length === 0) {
-    return null;
-  }
-
-  const withoutWeekly = weeklyWindow
-    ? windows.filter(
-        (window) =>
-          !(
-            window.windowSeconds === weeklyWindow.windowSeconds &&
-            window.usedPercent === weeklyWindow.usedPercent
-          ),
-      )
-    : windows;
-
-  const shortCandidates = withoutWeekly
-    .filter((window) => window.windowSeconds <= 43200)
-    .sort((a, b) => a.windowSeconds - b.windowSeconds);
-
-  if (shortCandidates.length > 0) {
-    return shortCandidates[0];
-  }
-
-  const sorted = [...withoutWeekly].sort((a, b) => a.windowSeconds - b.windowSeconds);
-  return sorted[0] ?? null;
-};
-
-const parseWhamCredits = (
-  payload: Record<string, unknown>,
-  checkedAt: number,
-): {
-  balance: number | null;
-  hasCredits: boolean | null;
-  unlimited: boolean | null;
-  usedPercent: number | null;
-  planType: string | null;
-  isPaidPlan: boolean;
-  hourlyRemainingPercent: number | null;
-  weeklyRemainingPercent: number | null;
-  hourlyRefreshAt: number | null;
-  weeklyRefreshAt: number | null;
-} => {
-  const credits = asRecord(payload.credits);
-  const balance = valueAsNumber(credits?.balance);
-  const hasCredits = valueAsBoolean(credits?.has_credits);
-  const unlimited = valueAsBoolean(credits?.unlimited);
-  const usedPercent = parseRateLimitUsedPercent(payload);
-  const planType = normalizeOptional(getString(payload, "plan_type"));
-  const isPaidPlan = Boolean(planType && planType.toLowerCase() !== "free");
-  const windows = collectAllRateLimitWindows(payload, checkedAt);
-  const weeklyWindow = pickWeeklyWindow(windows);
-  const hourlyWindow = pickHourlyWindow(windows, weeklyWindow);
-  const hourlyRemainingPercent = isPaidPlan ? remainingFromWindow(hourlyWindow) : null;
-  const weeklyRemainingPercent = isPaidPlan ? remainingFromWindow(weeklyWindow) : null;
-  const hourlyRefreshAt = refreshAtFromWindow(hourlyWindow, checkedAt);
-  const weeklyRefreshAt = refreshAtFromWindow(weeklyWindow, checkedAt);
+      return {
+        id: account.id,
+        label: normalizeOptional(typeof account.label === "string" ? account.label : null),
+        accountId: normalizeOptional(typeof account.accountId === "string" ? account.accountId : null),
+        email: normalizeOptional(typeof account.email === "string" ? account.email : null),
+        archived: Boolean(account.archived),
+        frozen: Boolean(account.frozen),
+        isActive: Boolean(account.isActive),
+        updatedAt: valueAsNumber(account.updatedAt) ?? 0,
+        lastUsedAt: valueAsNumber(account.lastUsedAt),
+      };
+    })
+    .filter((entry): entry is AccountSummary => entry !== null);
 
   return {
-    balance,
-    hasCredits,
-    unlimited,
-    usedPercent,
-    planType,
-    isPaidPlan,
-    hourlyRemainingPercent,
-    weeklyRemainingPercent,
-    hourlyRefreshAt,
-    weeklyRefreshAt,
+    accounts,
+    activeAccountId: normalizeOptional(typeof parsed.activeAccountId === "string" ? parsed.activeAccountId : null),
+    activeDiskAccountId: normalizeOptional(
+      typeof parsed.activeDiskAccountId === "string" ? parsed.activeDiskAccountId : null,
+    ),
+    codexAuthExists: valueAsBoolean(parsed.codexAuthExists) ?? false,
+    codexAuthPath: typeof parsed.codexAuthPath === "string" ? parsed.codexAuthPath : "",
+    storePath: typeof parsed.storePath === "string" ? parsed.storePath : "",
   };
 };
 
-const base64UrlEncode = (bytes: Uint8Array): string => {
-  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+const asCreditsInfo = (value: unknown): CreditsInfo | null => {
+  const parsed = asRecord(value);
+  if (!parsed) {
+    return null;
+  }
+
+  const source = parsed.source === "legacy_credit_grants" ? "legacy_credit_grants" : "wham_usage";
+  const mode = parsed.mode === "legacy" ? "legacy" : parsed.mode === "percent_fallback" ? "percent_fallback" : "balance";
+  const unit = parsed.unit === "%" ? "%" : "USD";
+  const status = parsed.status === "available" ? "available" : parsed.status === "error" ? "error" : "unavailable";
+
+  return {
+    available: valueAsNumber(parsed.available),
+    used: valueAsNumber(parsed.used),
+    total: valueAsNumber(parsed.total),
+    currency: typeof parsed.currency === "string" ? parsed.currency : unit === "%" ? "%" : "USD",
+    source,
+    mode,
+    unit,
+    planType: normalizeOptional(typeof parsed.planType === "string" ? parsed.planType : null),
+    isPaidPlan: valueAsBoolean(parsed.isPaidPlan) ?? false,
+    hourlyRemainingPercent: valueAsNumber(parsed.hourlyRemainingPercent),
+    weeklyRemainingPercent: valueAsNumber(parsed.weeklyRemainingPercent),
+    hourlyRefreshAt: valueAsNumber(parsed.hourlyRefreshAt),
+    weeklyRefreshAt: valueAsNumber(parsed.weeklyRefreshAt),
+    status,
+    message: typeof parsed.message === "string" ? parsed.message : "",
+    checkedAt: valueAsNumber(parsed.checkedAt) ?? nowEpoch(),
+  };
+};
+
+const asSnapshot = (value: unknown): AppStateSnapshot => {
+  const parsed = asRecord(value);
+  if (!parsed) {
+    return {
+      theme: null,
+      autoArchiveZeroQuota: true,
+      autoUnarchiveNonZeroQuota: true,
+      autoSwitchAwayFromArchived: true,
+      autoRefreshActiveEnabled: false,
+      autoRefreshActiveIntervalSec: AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC,
+      usageRefreshDisplayMode: "date",
+      view: null,
+      usageById: {},
+      savedAt: nowEpoch(),
+    };
+  }
+
+  const usageById: Record<string, CreditsInfo> = {};
+  const usageRaw = asRecord(parsed.usageById);
+  if (usageRaw) {
+    for (const [id, credits] of Object.entries(usageRaw)) {
+      const parsedCredits = asCreditsInfo(credits);
+      if (parsedCredits) {
+        usageById[id] = parsedCredits;
+      }
+    }
+  }
+
+  return {
+    theme: parsed.theme === "light" || parsed.theme === "dark" ? parsed.theme : null,
+    autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? true,
+    autoUnarchiveNonZeroQuota: valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? true,
+    autoSwitchAwayFromArchived: valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? true,
+    autoRefreshActiveEnabled: valueAsBoolean(parsed.autoRefreshActiveEnabled) ?? false,
+    autoRefreshActiveIntervalSec: normalizeAutoRefreshIntervalSec(parsed.autoRefreshActiveIntervalSec),
+    usageRefreshDisplayMode: normalizeUsageRefreshDisplayMode(parsed.usageRefreshDisplayMode),
+    view: asAccountsView(parsed.view),
+    usageById,
+    savedAt: valueAsNumber(parsed.savedAt) ?? nowEpoch(),
+  };
+};
+
+const parseBridgeResult = <T>(op: string, rawResponse: string): T => {
+  const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
+  if (!parsed.ok) {
+    throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
+  }
+  return parsed.value as T;
+};
+
+const extractBridgeRawResponse = (op: string, value: unknown): string => {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      const parsedRecord = asRecord(parsed);
+      if (parsedRecord && typeof parsedRecord.value === "string" && parsedRecord.ok === undefined) {
+        return parsedRecord.value;
+      }
+    } catch {
+      // keep raw
+    }
+
+    return value;
+  }
+
+  const record = asRecord(value);
+  if (record) {
+    if (record.ok !== undefined) {
+      return JSON.stringify(record);
+    }
+    if (typeof record.value === "string") {
+      return record.value;
+    }
+  }
+
+  throw new Error(`Backend bridge call failed for op "${op}".`);
+};
+
+const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
+  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
+    throw new Error(`Backend RPC requires an HTTP(S) session, got ${window.location.protocol}.`);
+  }
+
+  const request = JSON.stringify({ op, ...payload });
+  const rpcPayload = JSON.stringify({
+    name: "call",
+    args: ["cm_rpc", request],
+  });
+
+  const response = await fetch("/webui/rpc", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: rpcPayload,
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP bridge request failed (${response.status}).`);
+  }
+
+  const rawResponse = await response.text();
+  const rpcResponse = JSON.parse(rawResponse) as RpcBridgeHttpResponse;
+
+  if (rpcResponse.value !== undefined) {
+    return parseBridgeResult<T>(op, extractBridgeRawResponse(op, rpcResponse.value));
+  }
+
+  if (typeof rpcResponse.error === "string") {
+    throw new Error(rpcResponse.error);
+  }
+
+  throw new Error(`Backend bridge call failed for op "${op}".`);
+};
+
+const loadBackendApis = async (): Promise<BackendApis> => {
+  if (!backendApisPromise) {
+    backendApisPromise = Promise.resolve({
+      invoke: async <T>(command: string, payload: Record<string, unknown> = {}) =>
+        callBridge<T>(`invoke:${command}`, payload),
+      openUrl: async (url: string) => {
+        await callBridge<null>("shell:open_url", { url });
+      },
+    });
+  }
+
+  return backendApisPromise;
+};
+
+const refreshSnapshot = async (): Promise<AppStateSnapshot> => {
+  const tauri = await loadBackendApis();
+  const snapshot = asSnapshot(await tauri.invoke<unknown>("get_app_state"));
+  lastSnapshot = snapshot;
+  return snapshot;
+};
+
+const updateSnapshot = (snapshot: unknown): AppStateSnapshot => {
+  const normalized = asSnapshot(snapshot);
+  lastSnapshot = normalized;
+  return normalized;
 };
 
 const randomBase64Url = (size: number): string => {
   const bytes = new Uint8Array(size);
   crypto.getRandomValues(bytes);
-  return base64UrlEncode(bytes);
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
 
 const sha256Base64Url = async (value: string): Promise<string> => {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return base64UrlEncode(new Uint8Array(digest));
+  const bytes = new Uint8Array(digest);
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
 
 const buildAuthorizeUrl = (
@@ -763,7 +497,7 @@ const parseTokenEndpointError = (bodyText: string): string => {
       return errorCode;
     }
   } catch {
-    // plain-text responses still provide useful details
+    // plain text fallback
   }
 
   return trimmed;
@@ -779,9 +513,7 @@ const parseCallbackInput = (callbackInput: string): { code: string; state: strin
   try {
     url = new URL(trimmed);
   } catch {
-    throw new Error(
-      "Invalid callback URL. Paste the full URL that starts with http://localhost:1455/auth/callback?",
-    );
+    throw new Error("Invalid callback URL. Paste the full URL that starts with http://localhost:1455/auth/callback?");
   }
 
   const code = normalizeOptional(url.searchParams.get("code"));
@@ -800,84 +532,6 @@ const parseCallbackInput = (callbackInput: string): { code: string; state: strin
     code,
     state: normalizeOptional(url.searchParams.get("state")),
   };
-};
-
-const waitForOAuthCallbackFromBrowser = async (): Promise<string> => {
-  const tauri = await loadBackendApis();
-  await tauri.invoke<boolean>("start_oauth_callback_listener", {
-    timeoutSeconds: 180,
-  });
-
-  const renderCallbackError = (errorCode: string): string => {
-    if (errorCode === "CallbackListenerStopped") {
-      return "Callback listener stopped.";
-    }
-    if (errorCode === "CallbackListenerTimeout") {
-      return "Callback listener timed out.";
-    }
-    if (errorCode === "AddressInUse") {
-      return "Callback listener port 1455 is already in use.";
-    }
-    return errorCode;
-  };
-
-  while (true) {
-    const status = await tauri.invoke<OAuthCallbackPollResponse>("poll_oauth_callback_listener");
-
-    if (status.status === "ready") {
-      const normalized = normalizeOptional(status.callbackUrl);
-      if (!normalized) {
-        throw new Error("Callback listener returned an empty redirect URL.");
-      }
-      return normalized;
-    }
-
-    if (status.status === "error") {
-      const errorCode = normalizeOptional(status.error) || "Callback listener failed.";
-      throw new Error(renderCallbackError(errorCode));
-    }
-
-    await new Promise((resolve) => {
-      window.setTimeout(resolve, 250);
-    });
-  }
-};
-
-const fetchWhamUsageViaTauri = async (
-  accessToken: string,
-  accountId: string | null,
-): Promise<{ status: number; payload: Record<string, unknown> | null; rawBody: unknown }> => {
-  const tauri = await loadBackendApis();
-  const response = await tauri.invoke<WhamUsageResponse>("fetch_wham_usage", {
-    accessToken,
-    accountId,
-  });
-
-  const bodyCandidate =
-    typeof response.body === "string"
-      ? (() => {
-          try {
-            return JSON.parse(response.body);
-          } catch {
-            return response.body;
-          }
-        })()
-      : response.body;
-  const payload = asRecord(bodyCandidate);
-  return {
-    status: response.status,
-    payload,
-    rawBody: bodyCandidate,
-  };
-};
-
-export const listenForCodexCallback = async (): Promise<string> => {
-  return waitForOAuthCallbackFromBrowser();
-};
-
-export const stopCodexCallbackListener = async (): Promise<void> => {
-  const tauri = await loadBackendApis();
-  await tauri.invoke<boolean>("cancel_oauth_callback_listener");
 };
 
 const exchangeAuthorizationCode = async (
@@ -942,6 +596,25 @@ const exchangeApiKey = async (
   return getString(payload, "access_token");
 };
 
+const decodeJwtPayload = (token: string): Record<string, unknown> | null => {
+  const payload = token.split(".")[1];
+  if (!payload) {
+    return null;
+  }
+
+  try {
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padding = base64.length % 4;
+    const normalized = padding === 0 ? base64 : `${base64}${"=".repeat(4 - padding)}`;
+    const binary = atob(normalized);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const json = new TextDecoder().decode(bytes);
+    return asRecord(JSON.parse(json));
+  } catch {
+    return null;
+  }
+};
+
 const buildChatgptAuthPayload = (tokens: TokenPair, apiKey: string | null): Record<string, unknown> => {
   const claims = decodeJwtPayload(tokens.idToken);
   const authClaims = asRecord(claims?.["https://api.openai.com/auth"]);
@@ -965,55 +638,34 @@ const buildChatgptAuthPayload = (tokens: TokenPair, apiKey: string | null): Reco
   return payload;
 };
 
-const resolvePaths = async (): Promise<Paths> => {
-  if (!pathsPromise) {
-    pathsPromise = (async () => {
-      const tauri = await loadBackendApis();
-      return tauri.getManagedPaths();
-    })();
-  }
+const waitForOAuthCallbackFromBrowser = async (): Promise<string> => {
+  const tauri = await loadBackendApis();
+  await tauri.invoke<boolean>("start_oauth_callback_listener", { timeoutSeconds: 180 });
 
-  return pathsPromise;
-};
-
-const asBootstrapState = (value: unknown): EmbeddedBootstrapState | null => {
-  const parsed = asRecord(value);
-  if (!parsed) {
-    return null;
-  }
-
-  const themeRaw = parsed.theme;
-  const theme = themeRaw === "light" || themeRaw === "dark" ? themeRaw : null;
-  const viewRaw = parsed.view;
-  const view = asRecord(viewRaw) ? (viewRaw as AccountsView) : null;
-  const usageRaw = asRecord(parsed.usageById);
-  const usageById: Record<string, CreditsInfo> = {};
-  const legacyArchiveFolders = Array.isArray(parsed.archiveFolders) ? parsed.archiveFolders : [];
-  const legacyAutoArchiveEnabled = legacyArchiveFolders.some((entry) => {
-    const folder = asRecord(entry);
-    return valueAsBoolean(folder?.autoArchiveDepleted) === true;
-  });
-
-  if (usageRaw) {
-    for (const [id, credits] of Object.entries(usageRaw)) {
-      if (asRecord(credits)) {
-        usageById[id] = credits as CreditsInfo;
-      }
-    }
-  }
-
-  return {
-    theme,
-    autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? legacyAutoArchiveEnabled,
-    autoUnarchiveNonZeroQuota: valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? false,
-    autoSwitchAwayFromArchived: valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? true,
-    autoRefreshActiveEnabled: valueAsBoolean(parsed.autoRefreshActiveEnabled) ?? false,
-    autoRefreshActiveIntervalSec: normalizeAutoRefreshIntervalSec(parsed.autoRefreshActiveIntervalSec),
-    usageRefreshDisplayMode: getString(parsed, "usageRefreshDisplayMode") === "remaining" ? "remaining" : "date",
-    view,
-    usageById,
-    savedAt: valueAsNumber(parsed.savedAt) ?? nowEpoch(),
+  const renderCallbackError = (errorCode: string): string => {
+    if (errorCode === "CallbackListenerStopped") return "Callback listener stopped.";
+    if (errorCode === "CallbackListenerTimeout") return "Callback listener timed out.";
+    if (errorCode === "AddressInUse") return "Callback listener port 1455 is already in use.";
+    return errorCode;
   };
+
+  while (true) {
+    const status = await tauri.invoke<OAuthCallbackPollResponse>("poll_oauth_callback_listener");
+    if (status.status === "ready") {
+      const normalized = normalizeOptional(status.callbackUrl);
+      if (!normalized) {
+        throw new Error("Callback listener returned an empty redirect URL.");
+      }
+      return normalized;
+    }
+
+    if (status.status === "error") {
+      const errorCode = normalizeOptional(status.error) || "Callback listener failed.";
+      throw new Error(renderCallbackError(errorCode));
+    }
+
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
 };
 
 export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
@@ -1028,514 +680,52 @@ export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
 
   try {
     const json = atob(encoded);
-    const parsed = JSON.parse(json);
-    return asBootstrapState(parsed);
+    return asSnapshot(JSON.parse(json));
   } catch {
     return null;
   }
 };
 
-export const saveEmbeddedBootstrapState = async (state: EmbeddedBootstrapState): Promise<void> => {
+export const getSavedTheme = async (): Promise<"light" | "dark" | null> => {
+  const snapshot = await refreshSnapshot();
+  return snapshot.theme;
+};
+
+export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
   const tauri = await loadBackendApis();
-  await tauri.writeBootstrapState(JSON.stringify(state, null, 2));
+  const snapshot = await tauri.invoke<unknown>("update_ui_preferences", { theme });
+  updateSnapshot(snapshot);
 };
 
-const readAuthFile = async (): Promise<unknown> => {
-  const paths = await resolvePaths();
+export const updateUiPreferences = async (
+  payload: Partial<{
+    autoRefreshActiveEnabled: boolean;
+    autoRefreshActiveIntervalSec: number;
+    usageRefreshDisplayMode: "date" | "remaining";
+    theme: "light" | "dark";
+  }>,
+): Promise<AppStateSnapshot> => {
   const tauri = await loadBackendApis();
-  const rawAuth = await tauri.readCodexAuth();
-
-  if (rawAuth === null) {
-    throw new Error(`Codex auth not found at ${paths.codexAuthPath}`);
-  }
-
-  return JSON.parse(rawAuth);
-};
-
-const writeAuthFile = async (auth: unknown): Promise<void> => {
-  const tauri = await loadBackendApis();
-  await tauri.writeCodexAuth(JSON.stringify(auth, null, 2));
-};
-
-const sanitizeAccount = (value: unknown): ManagedAccount | null => {
-  const obj = asRecord(value);
-  if (!obj) {
-    return null;
-  }
-
-  const id = getString(obj, "id");
-  if (!id) {
-    return null;
-  }
-
-  const createdAt = valueAsNumber(obj.createdAt) ?? nowEpoch();
-  const updatedAt = valueAsNumber(obj.updatedAt) ?? createdAt;
-  const lastUsedAt = valueAsNumber(obj.lastUsedAt);
-  const frozen = Boolean(obj.frozen);
-
-  return {
-    id,
-    label: normalizeOptional(getString(obj, "label")),
-    accountId: normalizeOptional(getString(obj, "accountId")),
-    email: normalizeOptional(getString(obj, "email")),
-    archived: Boolean(obj.archived) && !frozen,
-    frozen,
-    auth: obj.auth,
-    createdAt,
-    updatedAt,
-    lastUsedAt,
-  };
-};
-
-const readStore = async (): Promise<AccountsStore> => {
-  const tauri = await loadBackendApis();
-  const rawStore = await tauri.readManagedStore();
-  if (!rawStore) {
-    return { activeAccountId: null, accounts: [] };
-  }
-  const store = JSON.parse(rawStore) as AccountsStore;
-
-  const rawAccounts = Array.isArray(store.accounts) ? store.accounts : [];
-  const accounts = rawAccounts
-    .map((entry) => sanitizeAccount(entry))
-    .filter((entry): entry is ManagedAccount => entry !== null);
-
-  const activeAccountId =
-    typeof store.activeAccountId === "string" && accounts.some((a) => a.id === store.activeAccountId)
-      ? store.activeAccountId
-      : null;
-
-  return {
-    activeAccountId,
-    accounts,
-  };
-};
-
-const writeStore = async (store: AccountsStore): Promise<void> => {
-  const tauri = await loadBackendApis();
-  await tauri.writeManagedStore(JSON.stringify(store, null, 2));
-};
-
-const upsertAccount = (
-  store: AccountsStore,
-  auth: unknown,
-  label: string | null,
-  setActive: boolean,
-): string => {
-  const now = nowEpoch();
-  const accountId = extractAccountId(auth);
-  const email = extractEmail(auth);
-  const normalizedLabel = normalizeOptional(label);
-
-  const existingIndex = store.accounts.findIndex((account) => {
-    const accountMatch = accountId && account.accountId === accountId;
-    const emailMatch = email && account.email === email;
-    return Boolean(accountMatch || emailMatch);
-  });
-
-  if (existingIndex >= 0) {
-    const existing = store.accounts[existingIndex];
-    existing.accountId = accountId;
-    existing.email = email;
-    existing.label = normalizedLabel ?? existing.label;
-    existing.auth = auth;
-    existing.archived = false;
-    existing.frozen = false;
-    existing.updatedAt = now;
-
-    if (setActive) {
-      existing.lastUsedAt = now;
-      store.activeAccountId = existing.id;
-    }
-
-    return existing.id;
-  }
-
-  const id = generateAccountId();
-  const next: ManagedAccount = {
-    id,
-    label: normalizedLabel,
-    accountId,
-    email,
-    archived: false,
-    frozen: false,
-    auth,
-    createdAt: now,
-    updatedAt: now,
-    lastUsedAt: setActive ? now : null,
-  };
-
-  store.accounts.push(next);
-
-  if (setActive) {
-    store.activeAccountId = id;
-  }
-
-  return id;
-};
-
-const moveActiveToFallback = async (store: AccountsStore, removedId?: string): Promise<void> => {
-  const active = store.activeAccountId;
-  if (!active) {
-    return;
-  }
-
-  if (removedId && active !== removedId) {
-    return;
-  }
-
-  const next = store.accounts.find((account) => !account.archived && !account.frozen && account.id !== removedId);
-  if (!next) {
-    store.activeAccountId = null;
-    return;
-  }
-
-  validateAuth(next.auth);
-  await writeAuthFile(next.auth);
-
-  const now = nowEpoch();
-  next.lastUsedAt = now;
-  next.updatedAt = now;
-  store.activeAccountId = next.id;
-};
-
-const accountBucketOf = (account: Pick<ManagedAccount, "archived" | "frozen">): AccountBucket => {
-  if (account.frozen) {
-    return "frozen";
-  }
-  if (account.archived) {
-    return "depleted";
-  }
-  return "active";
-};
-
-const applyBucket = (account: ManagedAccount, bucket: AccountBucket) => {
-  account.archived = bucket === "depleted";
-  account.frozen = bucket === "frozen";
-};
-
-const buildView = async (store: AccountsStore): Promise<AccountsView> => {
-  const paths = await resolvePaths();
-  const tauri = await loadBackendApis();
-  const activeAuthRaw = await tauri.readCodexAuth();
-  const activeAuth = activeAuthRaw ? (JSON.parse(activeAuthRaw) as unknown) : null;
-  const activeDiskAccountId = activeAuth ? extractAccountId(activeAuth) : null;
-  const activeDiskEmail = activeAuth ? extractEmail(activeAuth) : null;
-
-  const activeByAccountId = activeDiskAccountId
-    ? store.accounts.find((account) => !account.archived && !account.frozen && account.accountId === activeDiskAccountId)
-    : null;
-  const activeByEmail =
-    !activeByAccountId && activeDiskEmail
-      ? store.accounts.find((account) => !account.archived && !account.frozen && account.email === activeDiskEmail)
-      : null;
-  const activeFromStore =
-    store.activeAccountId &&
-    store.accounts.some((account) => account.id === store.activeAccountId && !account.archived && !account.frozen)
-      ? store.activeAccountId
-      : null;
-
-  const normalizedActiveId = activeByAccountId?.id || activeByEmail?.id || activeFromStore;
-  const activeChanged = store.activeAccountId !== normalizedActiveId;
-  store.activeAccountId = normalizedActiveId;
-
-  if (activeChanged) {
-    await writeStore(store);
-  }
-
-  const accounts = store.accounts.map((account) => ({
-    id: account.id,
-    label: account.label,
-    accountId: account.accountId,
-    email: account.email,
-    archived: account.archived,
-    frozen: account.frozen,
-    isActive: account.id === normalizedActiveId,
-    updatedAt: account.updatedAt,
-    lastUsedAt: account.lastUsedAt,
-  }));
-
-  return {
-    accounts,
-    activeAccountId: normalizedActiveId,
-    activeDiskAccountId,
-    codexAuthExists: activeAuth !== null,
-    codexAuthPath: paths.codexAuthPath,
-    storePath: paths.storePath,
-  };
-};
-
-const importFromCurrentAuth = async (label?: string): Promise<AccountsView> => {
-  const auth = await readAuthFile();
-  validateAuth(auth);
-
-  const store = await readStore();
-  upsertAccount(store, auth, normalizeOptional(label), true);
-  await writeStore(store);
-
-  return buildView(store);
-};
-
-const fetchLegacyCreditsFromApiKey = async (apiKey: string, checkedAt: number): Promise<CreditsInfo> => {
-  const endpoints = [
-    "https://api.openai.com/dashboard/billing/credit_grants",
-    "https://api.openai.com/v1/dashboard/billing/credit_grants",
-  ];
-
-  let lastError = "No usable billing payload returned.";
-
-  for (const endpoint of endpoints) {
-    try {
-      const response = await fetch(endpoint, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-      });
-
-      if (!response.ok) {
-        lastError = `Credit endpoint ${endpoint} returned ${response.status}.`;
-        continue;
-      }
-
-      const payload = asRecord(await response.json());
-      if (!payload) {
-        lastError = `Credit endpoint ${endpoint} returned invalid JSON.`;
-        continue;
-      }
-
-      const parsed = parseCreditsPayload(payload);
-      if (!parsed) {
-        lastError = `Credit endpoint ${endpoint} returned an unexpected payload shape.`;
-        continue;
-      }
-
-      return {
-        available: parsed.available,
-        used: parsed.used,
-        total: parsed.total,
-        currency: "USD",
-        source: "legacy_credit_grants",
-        mode: "legacy",
-        unit: "USD",
-        planType: null,
-        isPaidPlan: false,
-        hourlyRemainingPercent: null,
-        weeklyRemainingPercent: null,
-        hourlyRefreshAt: null,
-        weeklyRefreshAt: null,
-        status: "available",
-        message: "Remaining credits loaded from billing endpoint.",
-        checkedAt,
-      };
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      lastError = `Failed to fetch credits from ${endpoint}: ${detail}`;
-    }
-  }
-
-  return {
-    available: null,
-    used: null,
-    total: null,
-    currency: "USD",
-    source: "legacy_credit_grants",
-    mode: "legacy",
-    unit: "USD",
-    planType: null,
-    isPaidPlan: false,
-    hourlyRemainingPercent: null,
-    weeklyRemainingPercent: null,
-    hourlyRefreshAt: null,
-    weeklyRefreshAt: null,
-    status: "error",
-    message: lastError,
-    checkedAt,
-  };
-};
-
-const fetchCreditsFromAuth = async (auth: unknown): Promise<CreditsInfo> => {
-  const checkedAt = nowEpoch();
-  const tokens = extractTokens(auth);
-  const accessToken = getString(tokens, "access_token");
-  const accountId = extractAccountId(auth);
-
-  if (accessToken) {
-    const endpoint = "https://chatgpt.com/backend-api/wham/usage";
-
-    try {
-      const usage = await fetchWhamUsageViaTauri(accessToken, accountId);
-      if (usage.status < 200 || usage.status >= 300) {
-        const detailText =
-          typeof usage.rawBody === "string"
-            ? usage.rawBody
-            : JSON.stringify(usage.rawBody);
-        const detail = detailText.length > 0 ? ` Body: ${detailText.slice(0, 200)}` : "";
-        return {
-          available: null,
-          used: null,
-          total: null,
-          currency: "USD",
-          source: "wham_usage",
-          mode: "balance",
-          unit: "USD",
-          planType: null,
-          isPaidPlan: false,
-          hourlyRemainingPercent: null,
-          weeklyRemainingPercent: null,
-          hourlyRefreshAt: null,
-          weeklyRefreshAt: null,
-          status: "error",
-          message: `Usage endpoint ${endpoint} returned ${usage.status}.${detail}`,
-          checkedAt,
-        };
-      }
-
-      const payload = usage.payload;
-      if (!payload) {
-        return {
-          available: null,
-          used: null,
-          total: null,
-          currency: "USD",
-          source: "wham_usage",
-          mode: "balance",
-          unit: "USD",
-          planType: null,
-          isPaidPlan: false,
-          hourlyRemainingPercent: null,
-          weeklyRemainingPercent: null,
-          hourlyRefreshAt: null,
-          weeklyRefreshAt: null,
-          status: "error",
-          message: `Usage endpoint ${endpoint} returned invalid JSON.`,
-          checkedAt,
-        };
-      }
-
-      const parsed = parseWhamCredits(payload, checkedAt);
-
-      if (parsed.balance !== null) {
-        return {
-          available: parsed.balance,
-          used: null,
-          total: null,
-          currency: "USD",
-          source: "wham_usage",
-          mode: "balance",
-          unit: "USD",
-          planType: parsed.planType,
-          isPaidPlan: parsed.isPaidPlan,
-          hourlyRemainingPercent: parsed.hourlyRemainingPercent,
-          weeklyRemainingPercent: parsed.weeklyRemainingPercent,
-          hourlyRefreshAt: parsed.hourlyRefreshAt,
-          weeklyRefreshAt: parsed.weeklyRefreshAt,
-          status: "available",
-          message: "Remaining credits loaded from Codex usage endpoint.",
-          checkedAt,
-        };
-      }
-
-      if (parsed.usedPercent !== null) {
-        const usedPercent = Math.max(0, Math.min(100, parsed.usedPercent));
-        return {
-          available: Math.max(0, 100 - usedPercent),
-          used: usedPercent,
-          total: 100,
-          currency: "%",
-          source: "wham_usage",
-          mode: "percent_fallback",
-          unit: "%",
-          planType: parsed.planType,
-          isPaidPlan: parsed.isPaidPlan,
-          hourlyRemainingPercent: parsed.hourlyRemainingPercent,
-          weeklyRemainingPercent: parsed.weeklyRemainingPercent,
-          hourlyRefreshAt: parsed.hourlyRefreshAt,
-          weeklyRefreshAt: parsed.weeklyRefreshAt,
-          status: "available",
-          message: "Usage fallback loaded from rate-limit percent.",
-          checkedAt,
-        };
-      }
-
-      const flags = [
-        `has_credits=${parsed.hasCredits === null ? "unknown" : parsed.hasCredits ? "true" : "false"}`,
-        `unlimited=${parsed.unlimited === null ? "unknown" : parsed.unlimited ? "true" : "false"}`,
-      ].join(", ");
-
-      return {
-        available: null,
-        used: null,
-        total: null,
-        currency: "USD",
-        source: "wham_usage",
-        mode: "balance",
-        unit: "USD",
-        planType: parsed.planType,
-        isPaidPlan: parsed.isPaidPlan,
-        hourlyRemainingPercent: parsed.hourlyRemainingPercent,
-        weeklyRemainingPercent: parsed.weeklyRemainingPercent,
-        hourlyRefreshAt: parsed.hourlyRefreshAt,
-        weeklyRefreshAt: parsed.weeklyRefreshAt,
-        status: "error",
-        message: `Usage endpoint returned no balance or rate-limit usage data (${flags}).`,
-        checkedAt,
-      };
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      return {
-        available: null,
-        used: null,
-        total: null,
-        currency: "USD",
-        source: "wham_usage",
-        mode: "balance",
-        unit: "USD",
-        planType: null,
-        isPaidPlan: false,
-        hourlyRemainingPercent: null,
-        weeklyRemainingPercent: null,
-        hourlyRefreshAt: null,
-        weeklyRefreshAt: null,
-        status: "error",
-        message: `Failed to fetch usage from ${endpoint}: ${detail}`,
-        checkedAt,
-      };
-    }
-  }
-
-  const apiKey = extractApiKey(auth);
-  if (apiKey) {
-    return fetchLegacyCreditsFromApiKey(apiKey, checkedAt);
-  }
-
-  return {
-    available: null,
-    used: null,
-    total: null,
-    currency: "USD",
-    source: "wham_usage",
-    mode: "balance",
-    unit: "USD",
-    planType: null,
-    isPaidPlan: false,
-    hourlyRemainingPercent: null,
-    weeklyRemainingPercent: null,
-    hourlyRefreshAt: null,
-    weeklyRefreshAt: null,
-    status: "unavailable",
-    message: "No access token available for this account.",
-    checkedAt,
-  };
+  const snapshot = await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
+  return updateSnapshot(snapshot);
 };
 
 export const getAccounts = async (): Promise<AccountsView> => {
-  const store = await readStore();
-  return buildView(store);
+  const snapshot = await refreshSnapshot();
+  return snapshot.view ?? {
+    accounts: [],
+    activeAccountId: null,
+    activeDiskAccountId: null,
+    codexAuthExists: false,
+    codexAuthPath: "",
+    storePath: "",
+  };
 };
 
 export const importCurrentAccount = async (label?: string): Promise<AccountsView> => {
-  return importFromCurrentAuth(label);
+  const tauri = await loadBackendApis();
+  const snapshot = updateSnapshot(await tauri.invoke<unknown>("import_current_account", { label }));
+  return snapshot.view ?? (await getAccounts());
 };
 
 export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
@@ -1571,10 +761,16 @@ export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
   };
 };
 
-export const completeCodexLogin = async (
-  callbackUrl?: string,
-  label?: string,
-): Promise<LoginResult> => {
+export const listenForCodexCallback = async (): Promise<string> => {
+  return waitForOAuthCallbackFromBrowser();
+};
+
+export const stopCodexCallbackListener = async (): Promise<void> => {
+  const tauri = await loadBackendApis();
+  await tauri.invoke<boolean>("cancel_oauth_callback_listener");
+};
+
+export const completeCodexLogin = async (callbackUrl?: string, label?: string): Promise<LoginResult> => {
   if (!pendingBrowserLogin) {
     throw new Error("No active login session. Start ChatGPT login first.");
   }
@@ -1589,17 +785,20 @@ export const completeCodexLogin = async (
 
   const tokens = await exchangeAuthorizationCode(pending, parsed.code);
   const apiKey = await exchangeApiKey(pending.issuer, pending.clientId, tokens.idToken);
-
   const auth = buildChatgptAuthPayload(tokens, apiKey);
-  validateAuth(auth);
 
-  await writeAuthFile(auth);
+  const tauri = await loadBackendApis();
+  const snapshot = updateSnapshot(
+    await tauri.invoke<unknown>("complete_codex_login", {
+      authPayload: JSON.stringify(auth),
+      label,
+    }),
+  );
+
   pendingBrowserLogin = null;
 
-  const view = await importFromCurrentAuth(label);
-
   return {
-    view,
+    view: snapshot.view ?? (await getAccounts()),
     output: "ChatGPT login completed.",
   };
 };
@@ -1610,45 +809,24 @@ export const codexLoginWithApiKey = async (apiKey: string, label?: string): Prom
     throw new Error("API key is required.");
   }
 
-  const auth = {
-    auth_mode: "apikey",
-    OPENAI_API_KEY: normalized,
-  };
-
-  validateAuth(auth);
-  await writeAuthFile(auth);
-
-  const view = await importFromCurrentAuth(label);
+  const tauri = await loadBackendApis();
+  const snapshot = updateSnapshot(
+    await tauri.invoke<unknown>("login_with_api_key", {
+      apiKey: normalized,
+      label,
+    }),
+  );
 
   return {
-    view,
+    view: snapshot.view ?? (await getAccounts()),
     output: "API key login completed.",
   };
 };
 
 export const switchAccount = async (id: string): Promise<AccountsView> => {
-  const store = await readStore();
-  const index = store.accounts.findIndex((account) => account.id === id);
-
-  if (index < 0) {
-    throw new Error("Account not found.");
-  }
-
-  const account = store.accounts[index];
-  if (account.archived || account.frozen) {
-    throw new Error("Cannot switch to a depleted or frozen account.");
-  }
-
-  validateAuth(account.auth);
-  await writeAuthFile(account.auth);
-
-  const now = nowEpoch();
-  account.lastUsedAt = now;
-  account.updatedAt = now;
-  store.activeAccountId = account.id;
-
-  await writeStore(store);
-  return buildView(store);
+  const tauri = await loadBackendApis();
+  const snapshot = updateSnapshot(await tauri.invoke<unknown>("switch_account", { accountId: id }));
+  return snapshot.view ?? (await getAccounts());
 };
 
 export const moveAccount = async (
@@ -1657,51 +835,17 @@ export const moveAccount = async (
   targetIndex: number,
   options?: { switchAwayFromMoved?: boolean },
 ): Promise<AccountsView> => {
-  const store = await readStore();
-  const sourceIndex = store.accounts.findIndex((entry) => entry.id === id);
+  const tauri = await loadBackendApis();
+  const snapshot = updateSnapshot(
+    await tauri.invoke<unknown>("move_account", {
+      accountId: id,
+      targetBucket,
+      targetIndex,
+      switchAwayFromMoved: options?.switchAwayFromMoved,
+    }),
+  );
 
-  if (sourceIndex < 0) {
-    throw new Error("Account not found.");
-  }
-
-  const [account] = store.accounts.splice(sourceIndex, 1);
-  if (!account) {
-    throw new Error("Account not found.");
-  }
-
-  applyBucket(account, targetBucket);
-  account.updatedAt = nowEpoch();
-
-  if (store.activeAccountId === id && targetBucket !== "active") {
-    if (options?.switchAwayFromMoved ?? true) {
-      await moveActiveToFallback(store, id);
-    } else {
-      store.activeAccountId = null;
-    }
-  }
-
-  const bucketIds = store.accounts
-    .filter((entry) => accountBucketOf(entry) === targetBucket)
-    .map((entry) => entry.id);
-  const normalizedIndex = Number.isFinite(targetIndex)
-    ? Math.max(0, Math.min(Math.floor(targetIndex), bucketIds.length))
-    : bucketIds.length;
-
-  let insertIndex = store.accounts.length;
-  if (normalizedIndex < bucketIds.length) {
-    const anchorId = bucketIds[normalizedIndex];
-    const anchorIndex = store.accounts.findIndex((entry) => entry.id === anchorId);
-    insertIndex = anchorIndex >= 0 ? anchorIndex : store.accounts.length;
-  } else if (bucketIds.length > 0) {
-    const tailId = bucketIds[bucketIds.length - 1];
-    const tailIndex = store.accounts.findIndex((entry) => entry.id === tailId);
-    insertIndex = tailIndex >= 0 ? tailIndex + 1 : store.accounts.length;
-  }
-
-  store.accounts.splice(insertIndex, 0, account);
-
-  await writeStore(store);
-  return buildView(store);
+  return snapshot.view ?? (await getAccounts());
 };
 
 export const archiveAccount = async (
@@ -1717,111 +861,33 @@ export const unarchiveAccount = async (id: string): Promise<AccountsView> => {
   return moveAccount(id, "active", Number.MAX_SAFE_INTEGER);
 };
 
-export const clearAccountLabel = async (id: string): Promise<AccountsView> => {
-  const store = await readStore();
-  const account = store.accounts.find((entry) => entry.id === id);
-
-  if (!account) {
-    throw new Error("Account not found.");
-  }
-
-  account.label = null;
-  account.updatedAt = nowEpoch();
-
-  await writeStore(store);
-  return buildView(store);
-};
-
 export const removeAccount = async (id: string): Promise<AccountsView> => {
-  const store = await readStore();
-  const nextAccounts = store.accounts.filter((entry) => entry.id !== id);
-
-  if (nextAccounts.length === store.accounts.length) {
-    throw new Error("Account not found.");
-  }
-
-  store.accounts = nextAccounts;
-
-  if (store.activeAccountId === id) {
-    await moveActiveToFallback(store, id);
-  }
-
-  await writeStore(store);
-  return buildView(store);
-};
-
-export const getRemainingCredits = async (): Promise<CreditsInfo> => {
-  let auth: unknown;
-
-  try {
-    auth = await readAuthFile();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      available: null,
-      used: null,
-      total: null,
-      currency: "USD",
-      source: "wham_usage",
-      mode: "balance",
-      unit: "USD",
-      planType: null,
-      isPaidPlan: false,
-      hourlyRemainingPercent: null,
-      weeklyRemainingPercent: null,
-      hourlyRefreshAt: null,
-      weeklyRefreshAt: null,
-      status: "unavailable",
-      message,
-      checkedAt: nowEpoch(),
-    };
-  }
-
-  return fetchCreditsFromAuth(auth);
+  const tauri = await loadBackendApis();
+  const snapshot = updateSnapshot(await tauri.invoke<unknown>("remove_account", { accountId: id }));
+  return snapshot.view ?? (await getAccounts());
 };
 
 export const getRemainingCreditsForAccount = async (id: string): Promise<CreditsInfo> => {
-  const existing = inflightCreditsByAccountId.get(id);
+  const existing = inflightRefreshByAccountId.get(id);
   if (existing) {
     return existing;
   }
 
-  const pending: Promise<CreditsInfo> = (async (): Promise<CreditsInfo> => {
-    const store = await readStore();
-    const account = store.accounts.find((entry) => entry.id === id);
-
-    if (!account) {
-      const unavailable: CreditsInfo = {
-        available: null,
-        used: null,
-        total: null,
-        currency: "USD",
-        source: "wham_usage",
-        mode: "balance",
-        unit: "USD",
-        planType: null,
-        isPaidPlan: false,
-        hourlyRemainingPercent: null,
-        weeklyRemainingPercent: null,
-        hourlyRefreshAt: null,
-        weeklyRefreshAt: null,
-        status: "unavailable",
-        message: "Account not found.",
-        checkedAt: nowEpoch(),
-      };
-      return unavailable;
-    }
-
-    return fetchCreditsFromAuth(account.auth);
+  const pending = (async (): Promise<CreditsInfo> => {
+    const tauri = await loadBackendApis();
+    const snapshot = updateSnapshot(await tauri.invoke<unknown>("refresh_account_usage", { accountId: id }));
+    return snapshot.usageById[id] ?? defaultCreditsInfo("No usage data available for this account.");
   })();
 
-  inflightCreditsByAccountId.set(id, pending);
+  inflightRefreshByAccountId.set(id, pending);
   try {
     return await pending;
   } finally {
-    const current = inflightCreditsByAccountId.get(id);
+    const current = inflightRefreshByAccountId.get(id);
     if (current === pending) {
-      inflightCreditsByAccountId.delete(id);
+      inflightRefreshByAccountId.delete(id);
     }
   }
 };
+
+export const getLatestSnapshot = (): AppStateSnapshot | null => lastSnapshot;
