@@ -445,6 +445,7 @@ function App() {
   const [notice, setNotice] = createSignal<string | null>(null);
   let callbackListenRunId = 0;
   let autoQuotaSyncInFlight = false;
+  let autoQuotaSyncRequested = false;
   let autoDepletedRefreshInFlight = false;
   let autoActiveRefreshInFlight = false;
   let lastActiveAutoRefreshAt = 0;
@@ -698,6 +699,9 @@ function App() {
               ...current,
               [id]: credits,
             }));
+            if (!skipAutoSync) {
+              await syncAutoQuotaPolicies();
+            }
 
             if (!quiet && credits.status === "error") {
               failureMessages.push(`Credits check issue: ${credits.message}`);
@@ -721,10 +725,6 @@ function App() {
       if (!quiet) {
         setBusy(null);
       }
-    }
-
-    if (!skipAutoSync) {
-      await syncAutoQuotaPolicies();
     }
   };
 
@@ -752,135 +752,78 @@ function App() {
   };
 
   const syncAutoQuotaPolicies = async () => {
+    autoQuotaSyncRequested = true;
     if (autoQuotaSyncInFlight) {
-      return;
-    }
-
-    const currentView = view();
-    if (!currentView) {
       return;
     }
 
     autoQuotaSyncInFlight = true;
     try {
-      let nextView = currentView;
-      const cachedCredits = creditsById();
-      let changed = false;
+      while (autoQuotaSyncRequested) {
+        autoQuotaSyncRequested = false;
 
-      const active = nextView.activeAccountId
-        ? nextView.accounts.find((account) => account.id === nextView.activeAccountId) ?? null
-        : null;
-      if (!active || active.state !== "active") {
-        const switchTarget = nextView.accounts.find((account) => account.state === "active");
-        if (switchTarget) {
-          const switchedView = await switchAccount(switchTarget.id);
-          nextView = switchedView;
-          setViewState(switchedView);
-          changed = true;
+        const currentView = view();
+        if (!currentView) {
+          return;
         }
-      }
 
-      const activeAccountsWithQuota = nextView.accounts.filter((account) => account.state === "active");
-      const depletedActiveIds = activeAccountsWithQuota
-        .filter((account) => hasZeroQuotaRemaining(cachedCredits[account.id]))
-        .map((account) => account.id);
+        const cachedCredits = creditsById();
+        let nextView = currentView;
+        let changed = false;
 
-      const activeId = nextView.activeAccountId;
-      if (activeId && depletedActiveIds.includes(activeId)) {
-        let switchTarget = activeAccountsWithQuota.find(
-          (account) =>
-            account.id !== activeId &&
-            !depletedActiveIds.includes(account.id) &&
-            hasNonZeroQuotaRemaining(cachedCredits[account.id]),
-        );
+        const toArchive = nextView.accounts
+          .filter((account) => account.state === "active" && hasZeroQuotaRemaining(cachedCredits[account.id]))
+          .map((account) => account.id);
 
-        if (!switchTarget) {
-          const archivedRecoveryTarget = nextView.accounts.find(
-            (account) => account.state === "archived" && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+        for (const id of toArchive) {
+          const stillActive = nextView.accounts.find(
+            (account) => account.id === id && account.state === "active",
           );
-
-          if (archivedRecoveryTarget) {
-            await unarchiveAccount(archivedRecoveryTarget.id);
-            const restoredView = applyMovedAccountInView(
-              nextView,
-              archivedRecoveryTarget.id,
-              "active",
-              Number.MAX_SAFE_INTEGER,
-              true,
-            );
-            nextView = restoredView;
-            setViewState(restoredView);
-            changed = true;
-
-            const restoredActive = nextView.accounts.filter((account) => account.state === "active");
-            switchTarget = restoredActive.find(
-              (account) =>
-                account.id !== activeId &&
-                hasNonZeroQuotaRemaining(cachedCredits[account.id]),
-            );
+          if (!stillActive || !hasZeroQuotaRemaining(cachedCredits[id])) {
+            continue;
           }
-        }
 
-        if (switchTarget) {
-          const switchedView = await switchAccount(switchTarget.id);
-          nextView = switchedView;
-          setViewState(switchedView);
+          await archiveAccount(id, {
+            switchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+          });
+          nextView = applyMovedAccountInView(
+            nextView,
+            id,
+            "depleted",
+            Number.MAX_SAFE_INTEGER,
+            AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+          );
+          setViewState(nextView);
           changed = true;
         }
-      }
 
-      for (const id of depletedActiveIds) {
-        const stillActive = nextView.accounts.find(
-          (account) => account.id === id && account.state === "active",
-        );
-        if (!stillActive || !hasZeroQuotaRemaining(cachedCredits[id])) {
-          continue;
+        const toRestore = nextView.accounts
+          .filter((account) => account.state === "archived" && hasNonZeroQuotaRemaining(cachedCredits[account.id]))
+          .map((account) => account.id);
+
+        for (const id of toRestore) {
+          const stillArchived = nextView.accounts.find(
+            (account) => account.id === id && account.state === "archived",
+          );
+          if (!stillArchived || !hasNonZeroQuotaRemaining(cachedCredits[id])) {
+            continue;
+          }
+
+          await unarchiveAccount(id);
+          nextView = applyMovedAccountInView(
+            nextView,
+            id,
+            "active",
+            Number.MAX_SAFE_INTEGER,
+            true,
+          );
+          setViewState(nextView);
+          changed = true;
         }
 
-        await archiveAccount(id, {
-          switchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
-        });
-        const archivedView = applyMovedAccountInView(
-          nextView,
-          id,
-          "depleted",
-          Number.MAX_SAFE_INTEGER,
-          AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
-        );
-        nextView = archivedView;
-        setViewState(archivedView);
-        changed = true;
-      }
-
-      const recoverableArchivedIds = nextView.accounts
-        .filter(
-          (account) => account.state === "archived" && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
-        )
-        .map((account) => account.id);
-
-      for (const id of recoverableArchivedIds) {
-        const stillArchived = nextView.accounts.find(
-          (account) => account.id === id && account.state === "archived",
-        );
-        if (!stillArchived || !hasNonZeroQuotaRemaining(cachedCredits[id])) {
-          continue;
+        if (changed) {
+          setNotice("Auto quota sync updated account status.");
         }
-
-        await unarchiveAccount(id);
-        const restoredView = applyMovedAccountInView(
-          nextView,
-          id,
-          "active",
-          Number.MAX_SAFE_INTEGER,
-          true,
-        );
-        nextView = restoredView;
-        setViewState(restoredView);
-        changed = true;
-      }
-
-      if (changed) {
-        setNotice("Auto quota sync updated account status.");
       }
     } catch (syncError) {
       const rendered = syncError instanceof Error ? syncError.message : String(syncError);
