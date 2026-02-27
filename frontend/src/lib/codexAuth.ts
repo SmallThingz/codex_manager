@@ -152,22 +152,7 @@ let backendApisPromise: Promise<BackendApis> | null = null;
 type RpcBridgeHttpResponse = {
   value?: unknown;
   error?: string;
-  job_id?: number;
-  state?: string;
-  poll_min_ms?: number;
-  poll_max_ms?: number;
 };
-
-type RpcJobHttpStatus = {
-  state?: string;
-  value?: unknown;
-  error_message?: string | null;
-};
-
-const waitMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
-  });
 
 const extractBridgeRawResponse = (op: string, value: unknown): string => {
   if (typeof value === "string") {
@@ -185,8 +170,13 @@ const extractBridgeRawResponse = (op: string, value: unknown): string => {
   }
 
   const record = asRecord(value);
-  if (record && typeof record.value === "string") {
-    return record.value;
+  if (record) {
+    if (record.ok !== undefined) {
+      return JSON.stringify(record);
+    }
+    if (typeof record.value === "string") {
+      return record.value;
+    }
   }
 
   throw new Error(`Backend bridge call failed for op "${op}".`);
@@ -198,52 +188,6 @@ const parseBridgeResult = <T>(op: string, rawResponse: string): T => {
     throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
   }
   return parsed.value as T;
-};
-
-const pollQueuedRpcBridgeValue = async (
-  op: string,
-  jobId: number,
-  pollMinMs: number,
-  pollMaxMs: number,
-): Promise<string> => {
-  const startedAt = Date.now();
-  const timeoutMs = 30000;
-  const minDelay = Math.max(25, Math.floor(pollMinMs));
-  const maxDelay = Math.max(minDelay, Math.floor(pollMaxMs));
-  let delay = minDelay;
-
-  while (Date.now() - startedAt < timeoutMs) {
-    const response = await fetch(`/rpc/job?id=${encodeURIComponent(String(jobId))}`, {
-      method: "GET",
-      cache: "no-store",
-    });
-
-    if (!response.ok) {
-      throw new Error(`RPC job polling failed (${response.status}).`);
-    }
-
-    const status = JSON.parse(await response.text()) as RpcJobHttpStatus;
-    switch (status.state) {
-      case "completed":
-        return extractBridgeRawResponse(op, status.value);
-      case "queued":
-      case "running":
-        break;
-      case "failed":
-        throw new Error(status.error_message || `Backend bridge call failed for op "${op}".`);
-      case "canceled":
-        throw new Error(`Backend bridge call canceled for op "${op}".`);
-      case "timed_out":
-        throw new Error(`Backend bridge call timed out for op "${op}".`);
-      default:
-        throw new Error(`Backend bridge call returned unknown job state for op "${op}".`);
-    }
-
-    await waitMs(delay);
-    delay = Math.min(maxDelay, Math.floor(delay * 1.25));
-  }
-
-  throw new Error(`Backend bridge call timed out for op "${op}".`);
 };
 
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
@@ -260,7 +204,7 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
     name: "call",
     args: ["cm_rpc", request],
   });
-  const response = await fetch("/rpc", {
+  const response = await fetch("/webui/rpc", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -278,14 +222,6 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
 
   if (rpcResponse.value !== undefined) {
     return parseBridgeResult<T>(op, extractBridgeRawResponse(op, rpcResponse.value));
-  }
-
-  if (typeof rpcResponse.job_id === "number") {
-    const pollMinMs = typeof rpcResponse.poll_min_ms === "number" ? rpcResponse.poll_min_ms : 100;
-    const pollMaxMs =
-      typeof rpcResponse.poll_max_ms === "number" ? rpcResponse.poll_max_ms : Math.max(pollMinMs, 750);
-    const bridgedValue = await pollQueuedRpcBridgeValue(op, rpcResponse.job_id, pollMinMs, pollMaxMs);
-    return parseBridgeResult<T>(op, bridgedValue);
   }
 
   if (typeof rpcResponse.error === "string") {

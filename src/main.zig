@@ -80,19 +80,9 @@ pub fn main() !void {
             .style = window_style,
         },
         .rpc = .{
-            // Use WebUI async RPC job runner so HTTP handlers do not block on
-            // filesystem/network-heavy backend work.
-            .dispatcher_mode = .sync,
-            .execution_mode = .queued_async,
+            // Threaded dispatcher keeps RPC work off the HTTP connection thread.
+            .dispatcher_mode = .threaded,
             .threaded_poll_interval_ns = 1 * std.time.ns_per_ms,
-            .job_queue_capacity = 512,
-            .job_poll_min_ms = 60,
-            .job_poll_max_ms = 300,
-            .bridge_options = .{
-                .namespace = "webui",
-                .script_route = "/webui.js",
-                .rpc_route = "/rpc",
-            },
         },
     });
     defer service.deinit();
@@ -267,28 +257,46 @@ fn makeDynamicIndexHtml(allocator: std.mem.Allocator) ?[]u8 {
 }
 
 fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
-    const module_tag = "<script type=\"module\" src=\"/webui.js\"></script>";
-    const legacy_tag = "<script src=\"/webui.js\"></script>";
+    const script_tag = "<script src=\"/webui_bridge.js\"></script>";
+    const legacy_module_tag = "<script type=\"module\" src=\"/webui_bridge.js\"></script>";
+    const legacy_old_tag = "<script src=\"/webui.js\"></script>";
+    const legacy_old_module_tag = "<script type=\"module\" src=\"/webui.js\"></script>";
 
-    if (std.mem.indexOf(u8, html, module_tag) != null) {
+    if (std.mem.indexOf(u8, html, script_tag) != null) {
         return allocator.dupe(u8, html);
     }
 
-    if (std.mem.indexOf(u8, html, legacy_tag)) |legacy_idx| {
+    if (std.mem.indexOf(u8, html, legacy_module_tag)) |legacy_idx| {
         return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
             html[0..legacy_idx],
-            module_tag,
-            html[legacy_idx + legacy_tag.len ..],
+            script_tag,
+            html[legacy_idx + legacy_module_tag.len ..],
+        });
+    }
+
+    if (std.mem.indexOf(u8, html, legacy_old_tag)) |legacy_idx| {
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+            html[0..legacy_idx],
+            script_tag,
+            html[legacy_idx + legacy_old_tag.len ..],
+        });
+    }
+
+    if (std.mem.indexOf(u8, html, legacy_old_module_tag)) |legacy_idx| {
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+            html[0..legacy_idx],
+            script_tag,
+            html[legacy_idx + legacy_old_module_tag.len ..],
         });
     }
 
     if (std.mem.indexOf(u8, html, "</head>")) |head_idx| {
         return std.fmt.allocPrint(allocator, "{s}{s}\n{s}", .{
             html[0..head_idx],
-            module_tag,
+            script_tag,
             html[head_idx..],
         });
     }
 
-    return std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ html, module_tag });
+    return std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ html, script_tag });
 }
