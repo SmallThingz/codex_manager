@@ -22,9 +22,6 @@ pub const RpcBridgeMethods = struct {
         };
         defer std.heap.page_allocator.free(rpc_response);
 
-        bridge_response_lock.lock();
-        defer bridge_response_lock.unlock();
-
         if (rpc_response.len > bridge_response_storage.len) {
             return .{ .data = "{\"ok\":false,\"error\":\"RPC response exceeds bridge buffer\"}" };
         }
@@ -36,9 +33,8 @@ pub const RpcBridgeMethods = struct {
 };
 
 var bridge_cancel_ptr: ?*std.atomic.Value(bool) = null;
-var bridge_response_lock: std.Thread.Mutex = .{};
-var bridge_response_storage: [8 * 1024 * 1024]u8 = undefined;
-var bridge_response_len: usize = 0;
+threadlocal var bridge_response_storage: [8 * 1024 * 1024]u8 = undefined;
+threadlocal var bridge_response_len: usize = 0;
 
 pub fn setCancelPointer(cancel_ptr: *std.atomic.Value(bool)) void {
     bridge_cancel_ptr = cancel_ptr;

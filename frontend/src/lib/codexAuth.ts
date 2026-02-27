@@ -345,13 +345,34 @@ const decodeBridgeValue = <T>(op: string, value: unknown): T => {
   return value as T;
 };
 
-const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
-  const request = JSON.stringify({ op, ...payload });
+const getWebuiBridge = (): WebuiRpcBridge | null => {
   const bridge = (globalThis as { webuiRpc?: WebuiRpcBridge }).webuiRpc;
   if (!bridge || typeof bridge.cm_rpc !== "function") {
-    throw new Error("WebUI bridge is unavailable (webuiRpc.cm_rpc missing).");
+    return null;
+  }
+  return bridge;
+};
+
+const waitForWebuiBridge = async (): Promise<WebuiRpcBridge> => {
+  const immediate = getWebuiBridge();
+  if (immediate) {
+    return immediate;
   }
 
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 25));
+    const bridge = getWebuiBridge();
+    if (bridge) {
+      return bridge;
+    }
+  }
+
+  throw new Error("WebUI bridge is unavailable (webuiRpc.cm_rpc missing).");
+};
+
+const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
+  const request = JSON.stringify({ op, ...payload });
+  const bridge = await waitForWebuiBridge();
   const rawResponse = await bridge.cm_rpc(request);
   return decodeBridgeValue<T>(op, rawResponse);
 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const webui = @import("webui");
 
 const embedded_index = @import("embedded_index.zig");
@@ -31,8 +32,16 @@ var oauth_listener_cancel = std.atomic.Value(bool).init(false);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    defer {
+        if (builtin.mode == .Debug) {
+            _ = gpa.deinit();
+        }
+    }
+
+    const allocator = if (builtin.mode == .Debug)
+        gpa.allocator()
+    else
+        std.heap.smp_allocator;
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
