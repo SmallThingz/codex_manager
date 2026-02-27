@@ -115,12 +115,9 @@ type TokenPair = {
   refreshToken: string;
 };
 
-type WhamUsageAsyncResponse = {
-  state: "queued" | "running" | "completed" | "unknown";
-  requestId: number;
-  status?: number;
-  body?: unknown;
-  debounced?: boolean;
+type WhamUsageResponse = {
+  status: number;
+  body: unknown;
 };
 
 type OAuthCallbackPollResponse = {
@@ -131,6 +128,7 @@ type OAuthCallbackPollResponse = {
 
 let pathsPromise: Promise<Paths> | null = null;
 let pendingBrowserLogin: PendingBrowserLogin | null = null;
+const inflightCreditsByAccountId = new Map<string, Promise<CreditsInfo>>();
 
 type BackendApis = {
   invoke: <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
@@ -849,54 +847,11 @@ const fetchWhamUsageViaTauri = async (
   accessToken: string,
   accountId: string | null,
 ): Promise<{ status: number; payload: Record<string, unknown> | null; rawBody: unknown }> => {
-  const pollIntervalMs = 150;
-  const pollTimeoutMs = 45000;
   const tauri = await loadBackendApis();
-  const start = await tauri.invoke<WhamUsageAsyncResponse>("fetch_wham_usage_start", {
+  const response = await tauri.invoke<WhamUsageResponse>("fetch_wham_usage", {
     accessToken,
     accountId,
   });
-  if (typeof start.requestId !== "number") {
-    throw new Error("Usage fetch start did not return requestId.");
-  }
-
-  const waitForCompletion = async (
-    requestId: number,
-    initial: WhamUsageAsyncResponse,
-  ): Promise<WhamUsageAsyncResponse> => {
-    if (initial.state === "completed") {
-      return initial;
-    }
-
-    const startedAt = Date.now();
-    let latest = initial;
-    while (Date.now() - startedAt < pollTimeoutMs) {
-      await new Promise((resolve) => {
-        window.setTimeout(resolve, pollIntervalMs);
-      });
-      latest = await tauri.invoke<WhamUsageAsyncResponse>("fetch_wham_usage_poll", {
-        requestId,
-      });
-
-      if (latest.state === "completed") {
-        return latest;
-      }
-
-      if (latest.state === "unknown") {
-        throw new Error("Usage fetch request became unknown before completion.");
-      }
-    }
-
-    throw new Error("Timed out waiting for usage fetch completion.");
-  };
-
-  const response = await waitForCompletion(start.requestId, start);
-  if (response.state !== "completed") {
-    throw new Error(`Unexpected usage fetch state: ${response.state}`);
-  }
-  if (typeof response.status !== "number") {
-    throw new Error("Usage fetch completed without a status code.");
-  }
 
   const bodyCandidate =
     typeof response.body === "string"
@@ -1826,29 +1781,47 @@ export const getRemainingCredits = async (): Promise<CreditsInfo> => {
 };
 
 export const getRemainingCreditsForAccount = async (id: string): Promise<CreditsInfo> => {
-  const store = await readStore();
-  const account = store.accounts.find((entry) => entry.id === id);
-
-  if (!account) {
-    return {
-      available: null,
-      used: null,
-      total: null,
-      currency: "USD",
-      source: "wham_usage",
-      mode: "balance",
-      unit: "USD",
-      planType: null,
-      isPaidPlan: false,
-      hourlyRemainingPercent: null,
-      weeklyRemainingPercent: null,
-      hourlyRefreshAt: null,
-      weeklyRefreshAt: null,
-      status: "unavailable",
-      message: "Account not found.",
-      checkedAt: nowEpoch(),
-    };
+  const existing = inflightCreditsByAccountId.get(id);
+  if (existing) {
+    return existing;
   }
 
-  return fetchCreditsFromAuth(account.auth);
+  const pending: Promise<CreditsInfo> = (async (): Promise<CreditsInfo> => {
+    const store = await readStore();
+    const account = store.accounts.find((entry) => entry.id === id);
+
+    if (!account) {
+      const unavailable: CreditsInfo = {
+        available: null,
+        used: null,
+        total: null,
+        currency: "USD",
+        source: "wham_usage",
+        mode: "balance",
+        unit: "USD",
+        planType: null,
+        isPaidPlan: false,
+        hourlyRemainingPercent: null,
+        weeklyRemainingPercent: null,
+        hourlyRefreshAt: null,
+        weeklyRefreshAt: null,
+        status: "unavailable",
+        message: "Account not found.",
+        checkedAt: nowEpoch(),
+      };
+      return unavailable;
+    }
+
+    return fetchCreditsFromAuth(account.auth);
+  })();
+
+  inflightCreditsByAccountId.set(id, pending);
+  try {
+    return await pending;
+  } finally {
+    const current = inflightCreditsByAccountId.get(id);
+    if (current === pending) {
+      inflightCreditsByAccountId.delete(id);
+    }
+  }
 };
