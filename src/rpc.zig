@@ -86,11 +86,12 @@ pub const RpcRequest = struct {
     timeoutSeconds: ?u64 = null,
     accessToken: ?[]const u8 = null,
     accountId: ?[]const u8 = null,
+    requestId: ?u64 = null,
 };
 
 const UsageResult = struct {
     status: u16,
-    body: []const u8,
+    body: []u8,
 };
 
 const ManagedPaths = struct {
@@ -126,6 +127,60 @@ const OAuthPollResult = struct {
 };
 
 var oauth_listener_state = OAuthListenerState{};
+
+const USAGE_FETCH_DEBOUNCE_MS: i64 = 15 * 1000;
+
+const UsageFetchEntry = struct {
+    key: []u8,
+    last_request_id: u64 = 0,
+    inflight: bool = false,
+    last_started_ms: i64 = 0,
+    last_completed_ms: i64 = 0,
+    last_status: u16 = 0,
+    last_body: ?[]u8 = null,
+};
+
+const UsageFetchState = struct {
+    mutex: std.Thread.Mutex = .{},
+    entries: std.ArrayListUnmanaged(UsageFetchEntry) = .{},
+    next_request_id: u64 = 1,
+};
+
+const UsageFetchWorkerArgs = struct {
+    key: []u8,
+    access_token: []u8,
+    account_id: ?[]u8,
+    request_id: u64,
+
+    fn init(access_token: []const u8, account_id: ?[]const u8, key: []const u8, request_id: u64) !UsageFetchWorkerArgs {
+        const key_copy = try std.heap.page_allocator.dupe(u8, key);
+        errdefer std.heap.page_allocator.free(key_copy);
+
+        const token_copy = try std.heap.page_allocator.dupe(u8, access_token);
+        errdefer std.heap.page_allocator.free(token_copy);
+
+        const account_copy = if (account_id) |id| try std.heap.page_allocator.dupe(u8, id) else null;
+        errdefer if (account_copy) |id| std.heap.page_allocator.free(id);
+
+        return .{
+            .key = key_copy,
+            .access_token = token_copy,
+            .account_id = account_copy,
+            .request_id = request_id,
+        };
+    }
+
+    fn deinit(self: *UsageFetchWorkerArgs) void {
+        std.heap.page_allocator.free(self.key);
+        std.heap.page_allocator.free(self.access_token);
+        if (self.account_id) |id| {
+            std.heap.page_allocator.free(id);
+        }
+    }
+};
+
+var usage_fetch_state = UsageFetchState{};
+var managed_files_mutex: std.Thread.Mutex = .{};
 
 pub fn handleRpcText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     return rpcFromText(allocator, request_text, cancel_ptr);
@@ -378,6 +433,20 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
             return jsonOk(allocator, true);
         }
 
+        if (std.mem.eql(u8, command, "fetch_wham_usage_start")) {
+            const access_token = request.accessToken orelse return jsonError(allocator, "fetch_wham_usage_start requires accessToken");
+            return startWhamUsageFetch(allocator, access_token, request.accountId) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+        }
+
+        if (std.mem.eql(u8, command, "fetch_wham_usage_poll")) {
+            const request_id = request.requestId orelse return jsonError(allocator, "fetch_wham_usage_poll requires requestId");
+            return pollWhamUsageFetch(allocator, request_id) catch |err| {
+                return jsonError(allocator, @errorName(err));
+            };
+        }
+
         if (std.mem.eql(u8, command, "fetch_wham_usage")) {
             const access_token = request.accessToken orelse return jsonError(allocator, "fetch_wham_usage requires accessToken");
             const usage = fetchWhamUsage(allocator, access_token, request.accountId) catch |err| {
@@ -474,6 +543,9 @@ fn readManagedStore(allocator: std.mem.Allocator) !?[]u8 {
 fn writeManagedStore(contents: []const u8, allocator: std.mem.Allocator) !void {
     var paths = try getManagedPaths(allocator);
     defer paths.deinit(allocator);
+
+    managed_files_mutex.lock();
+    defer managed_files_mutex.unlock();
     try writeTextFile(paths.storePath, contents);
 }
 
@@ -486,6 +558,9 @@ fn readCodexAuth(allocator: std.mem.Allocator) !?[]u8 {
 fn writeCodexAuth(contents: []const u8, allocator: std.mem.Allocator) !void {
     var paths = try getManagedPaths(allocator);
     defer paths.deinit(allocator);
+
+    managed_files_mutex.lock();
+    defer managed_files_mutex.unlock();
     try writeTextFile(paths.codexAuthPath, contents);
 }
 
@@ -498,6 +573,9 @@ fn readBootstrapState(allocator: std.mem.Allocator) !?[]u8 {
 fn writeBootstrapState(contents: []const u8, allocator: std.mem.Allocator) !void {
     var paths = try getManagedPaths(allocator);
     defer paths.deinit(allocator);
+
+    managed_files_mutex.lock();
+    defer managed_files_mutex.unlock();
     try writeTextFile(paths.bootstrapStatePath, contents);
 }
 
@@ -517,6 +595,235 @@ fn writeTextFile(path: []const u8, contents: []const u8) !void {
     defer file.close();
 
     try file.writeAll(contents);
+}
+
+fn usageFetchKeyForRequest(allocator: std.mem.Allocator, access_token: []const u8, account_id: ?[]const u8) ![]u8 {
+    if (account_id) |id| {
+        const trimmed = std.mem.trim(u8, id, " \r\n\t");
+        if (trimmed.len > 0) {
+            return std.fmt.allocPrint(allocator, "account:{s}", .{trimmed});
+        }
+    }
+
+    const hash = std.hash.Wyhash.hash(0, access_token);
+    return std.fmt.allocPrint(allocator, "token:{x}", .{hash});
+}
+
+fn usageFetchEntryIndexByKeyLocked(key: []const u8) ?usize {
+    for (usage_fetch_state.entries.items, 0..) |entry, idx| {
+        if (std.mem.eql(u8, entry.key, key)) {
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn usageFetchEntryIndexByRequestIdLocked(request_id: u64) ?usize {
+    for (usage_fetch_state.entries.items, 0..) |entry, idx| {
+        if (entry.last_request_id == request_id) {
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn makeUsageFetchErrorBody(message: []const u8) []u8 {
+    return std.heap.page_allocator.dupe(u8, message) catch blk: {
+        const fallback = "usage fetch failed";
+        const owned = std.heap.page_allocator.alloc(u8, fallback.len) catch @panic("out of memory creating usage error");
+        @memcpy(owned, fallback);
+        break :blk owned;
+    };
+}
+
+fn usageFetchWorkerMain(args_in: UsageFetchWorkerArgs) void {
+    var args = args_in;
+    defer args.deinit();
+
+    const usage = fetchWhamUsage(std.heap.page_allocator, args.access_token, args.account_id) catch |err| blk: {
+        const message = std.fmt.allocPrint(std.heap.page_allocator, "wham fetch failed: {s}", .{@errorName(err)}) catch makeUsageFetchErrorBody("wham fetch failed");
+        break :blk UsageResult{
+            .status = 599,
+            .body = message,
+        };
+    };
+
+    const finished_at_ms = std.time.milliTimestamp();
+
+    usage_fetch_state.mutex.lock();
+    defer usage_fetch_state.mutex.unlock();
+
+    const idx = usageFetchEntryIndexByKeyLocked(args.key) orelse {
+        std.heap.page_allocator.free(usage.body);
+        return;
+    };
+    var entry = &usage_fetch_state.entries.items[idx];
+
+    if (entry.last_request_id != args.request_id) {
+        std.heap.page_allocator.free(usage.body);
+        return;
+    }
+
+    if (entry.last_body) |previous| {
+        std.heap.page_allocator.free(previous);
+    }
+
+    // Keep the critical section short: network fetch runs outside mutex; lock only
+    // while updating shared fetch/account state.
+    entry.last_body = usage.body;
+    entry.last_status = usage.status;
+    entry.last_completed_ms = finished_at_ms;
+    entry.inflight = false;
+}
+
+fn startWhamUsageFetch(
+    allocator: std.mem.Allocator,
+    access_token: []const u8,
+    account_id: ?[]const u8,
+) ![]u8 {
+    const key = try usageFetchKeyForRequest(allocator, access_token, account_id);
+    defer allocator.free(key);
+
+    const now_ms = std.time.milliTimestamp();
+
+    var request_id: u64 = 0;
+    var cached_status: ?u16 = null;
+    var cached_body_copy: ?[]u8 = null;
+    var action: enum { running, completed, spawn } = .spawn;
+
+    {
+        usage_fetch_state.mutex.lock();
+        defer usage_fetch_state.mutex.unlock();
+
+        const idx = idx: {
+            if (usageFetchEntryIndexByKeyLocked(key)) |existing| {
+                break :idx existing;
+            }
+
+            const owned_key = try std.heap.page_allocator.dupe(u8, key);
+            errdefer std.heap.page_allocator.free(owned_key);
+
+            try usage_fetch_state.entries.append(std.heap.page_allocator, .{
+                .key = owned_key,
+            });
+            break :idx usage_fetch_state.entries.items.len - 1;
+        };
+
+        var entry = &usage_fetch_state.entries.items[idx];
+
+        if (entry.inflight) {
+            request_id = entry.last_request_id;
+            action = .running;
+        } else {
+            const can_use_cached = entry.last_body != null and
+                entry.last_completed_ms > 0 and
+                (now_ms - entry.last_completed_ms) < USAGE_FETCH_DEBOUNCE_MS;
+
+            if (can_use_cached) {
+                request_id = entry.last_request_id;
+                cached_status = entry.last_status;
+                cached_body_copy = if (entry.last_body) |body| try allocator.dupe(u8, body) else null;
+                action = .completed;
+            } else {
+                request_id = usage_fetch_state.next_request_id;
+                usage_fetch_state.next_request_id += 1;
+                entry.last_request_id = request_id;
+                entry.inflight = true;
+                entry.last_started_ms = now_ms;
+                action = .spawn;
+            }
+        }
+    }
+
+    switch (action) {
+        .running => {
+            return jsonOk(allocator, .{
+                .state = "running",
+                .requestId = request_id,
+                .debounced = true,
+            });
+        },
+        .completed => {
+            defer if (cached_body_copy) |body| allocator.free(body);
+            return jsonOk(allocator, .{
+                .state = "completed",
+                .requestId = request_id,
+                .status = cached_status,
+                .body = cached_body_copy,
+                .debounced = true,
+            });
+        },
+        .spawn => {},
+    }
+
+    var worker_args = try UsageFetchWorkerArgs.init(access_token, account_id, key, request_id);
+    errdefer worker_args.deinit();
+
+    const worker = std.Thread.spawn(.{}, usageFetchWorkerMain, .{worker_args}) catch |err| {
+        usage_fetch_state.mutex.lock();
+        defer usage_fetch_state.mutex.unlock();
+
+        if (usageFetchEntryIndexByKeyLocked(key)) |idx_locked| {
+            var entry_locked = &usage_fetch_state.entries.items[idx_locked];
+            if (entry_locked.last_request_id == request_id) {
+                entry_locked.inflight = false;
+            }
+        }
+
+        return err;
+    };
+    worker.detach();
+
+    return jsonOk(allocator, .{
+        .state = "queued",
+        .requestId = request_id,
+        .debounced = false,
+    });
+}
+
+fn pollWhamUsageFetch(allocator: std.mem.Allocator, request_id: u64) ![]u8 {
+    var inflight = false;
+    var status: ?u16 = null;
+    var body_copy: ?[]u8 = null;
+    var found = false;
+
+    {
+        usage_fetch_state.mutex.lock();
+        defer usage_fetch_state.mutex.unlock();
+
+        if (usageFetchEntryIndexByRequestIdLocked(request_id)) |idx| {
+            found = true;
+            const entry = &usage_fetch_state.entries.items[idx];
+            inflight = entry.inflight;
+            status = entry.last_status;
+            body_copy = if (!entry.inflight and entry.last_body != null)
+                try allocator.dupe(u8, entry.last_body.?)
+            else
+                null;
+        }
+    }
+
+    if (!found) {
+        return jsonOk(allocator, .{
+            .state = "unknown",
+            .requestId = request_id,
+        });
+    }
+
+    if (inflight) {
+        return jsonOk(allocator, .{
+            .state = "running",
+            .requestId = request_id,
+        });
+    }
+
+    defer if (body_copy) |body| allocator.free(body);
+    return jsonOk(allocator, .{
+        .state = if (body_copy != null) "completed" else "unknown",
+        .requestId = request_id,
+        .status = status,
+        .body = body_copy,
+    });
 }
 
 fn fetchWhamUsage(

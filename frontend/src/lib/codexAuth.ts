@@ -115,9 +115,12 @@ type TokenPair = {
   refreshToken: string;
 };
 
-type WhamUsageResponse = {
-  status: number;
-  body: unknown;
+type WhamUsageAsyncResponse = {
+  state: "queued" | "running" | "completed" | "unknown";
+  requestId: number;
+  status?: number;
+  body?: unknown;
+  debounced?: boolean;
 };
 
 type OAuthCallbackPollResponse = {
@@ -846,11 +849,54 @@ const fetchWhamUsageViaTauri = async (
   accessToken: string,
   accountId: string | null,
 ): Promise<{ status: number; payload: Record<string, unknown> | null; rawBody: unknown }> => {
+  const pollIntervalMs = 150;
+  const pollTimeoutMs = 45000;
   const tauri = await loadBackendApis();
-  const response = await tauri.invoke<WhamUsageResponse>("fetch_wham_usage", {
+  const start = await tauri.invoke<WhamUsageAsyncResponse>("fetch_wham_usage_start", {
     accessToken,
     accountId,
   });
+  if (typeof start.requestId !== "number") {
+    throw new Error("Usage fetch start did not return requestId.");
+  }
+
+  const waitForCompletion = async (
+    requestId: number,
+    initial: WhamUsageAsyncResponse,
+  ): Promise<WhamUsageAsyncResponse> => {
+    if (initial.state === "completed") {
+      return initial;
+    }
+
+    const startedAt = Date.now();
+    let latest = initial;
+    while (Date.now() - startedAt < pollTimeoutMs) {
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, pollIntervalMs);
+      });
+      latest = await tauri.invoke<WhamUsageAsyncResponse>("fetch_wham_usage_poll", {
+        requestId,
+      });
+
+      if (latest.state === "completed") {
+        return latest;
+      }
+
+      if (latest.state === "unknown") {
+        throw new Error("Usage fetch request became unknown before completion.");
+      }
+    }
+
+    throw new Error("Timed out waiting for usage fetch completion.");
+  };
+
+  const response = await waitForCompletion(start.requestId, start);
+  if (response.state !== "completed") {
+    throw new Error(`Unexpected usage fetch state: ${response.state}`);
+  }
+  if (typeof response.status !== "number") {
+    throw new Error("Usage fetch completed without a status code.");
+  }
 
   const bodyCandidate =
     typeof response.body === "string"
