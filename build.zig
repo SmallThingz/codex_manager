@@ -295,40 +295,6 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    var linux_webview_host_install_step: ?*std.Build.Step = null;
-    var linux_browser_host_install_step: ?*std.Build.Step = null;
-    if (target.result.os.tag == .linux and target.query.isNative()) {
-        const linux_webview_host = b.addExecutable(.{
-            .name = "webui_linux_webview_host",
-            .root_module = b.createModule(.{
-                .root_source_file = webui_dep.path("tools/linux_webview_host.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = strip_symbols,
-                .link_libc = true,
-            }),
-        });
-        linux_webview_host.linkSystemLibrary("gtk-3");
-        linux_webview_host.linkSystemLibrary("webkit2gtk-4.1");
-        const webview_host_install = b.addInstallArtifact(linux_webview_host, .{});
-        linux_webview_host_install_step = &webview_host_install.step;
-        b.getInstallStep().dependOn(&webview_host_install.step);
-
-        const linux_browser_host = b.addExecutable(.{
-            .name = "webui_linux_browser_host",
-            .root_module = b.createModule(.{
-                .root_source_file = webui_dep.path("tools/linux_browser_host.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = strip_symbols,
-                .link_libc = false,
-            }),
-        });
-        const browser_host_install = b.addInstallArtifact(linux_browser_host, .{});
-        linux_browser_host_install_step = &browser_host_install.step;
-        b.getInstallStep().dependOn(&browser_host_install.step);
-    }
-
     const install_artifact = b.addInstallArtifact(exe, .{
         .dest_sub_path = matrix_name,
         .pdb_dir = if (matrix_name == null) .default else .disabled,
@@ -340,12 +306,6 @@ pub fn build(b: *std.Build) void {
     const installed_exe_path = b.getInstallPath(.bin, installed_exe_name);
     const run_cmd = b.addSystemCommand(&.{installed_exe_path});
     run_cmd.step.dependOn(&install_artifact.step);
-    if (linux_webview_host_install_step) |step| {
-        run_cmd.step.dependOn(step);
-    }
-    if (linux_browser_host_install_step) |step| {
-        run_cmd.step.dependOn(step);
-    }
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
