@@ -83,16 +83,14 @@ type PendingBrowserLogin = {
   startedAt: number;
 };
 
-type OAuthCallbackPollResponse = {
-  status: "idle" | "running" | "ready" | "error";
-  account?: AccountSummary | null;
-  error?: string | null;
-};
-
 type BridgeResult<T> = {
   ok: boolean;
   value?: T;
   error?: string;
+};
+
+type WebuiRpcBridge = {
+  cm_rpc: (requestJson: string) => Promise<unknown> | unknown;
 };
 
 type BackendApis = {
@@ -348,32 +346,14 @@ const decodeBridgeValue = <T>(op: string, value: unknown): T => {
 };
 
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
-  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
-    throw new Error(`Backend RPC requires an HTTP(S) session, got ${window.location.protocol}.`);
-  }
-
   const request = JSON.stringify({ op, ...payload });
-  const rpcPayload = JSON.stringify({
-    name: "call",
-    args: ["cm_rpc", request],
-  });
-
-  const response = await fetch("/webui/rpc", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: rpcPayload,
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP bridge request failed (${response.status}).`);
+  const bridge = (globalThis as { webuiRpc?: WebuiRpcBridge }).webuiRpc;
+  if (!bridge || typeof bridge.cm_rpc !== "function") {
+    throw new Error("WebUI bridge is unavailable (webuiRpc.cm_rpc missing).");
   }
 
-  const rawResponse = await response.text();
-  const parsedResponse = JSON.parse(rawResponse) as unknown;
-  return decodeBridgeValue<T>(op, parsedResponse);
+  const rawResponse = await bridge.cm_rpc(request);
+  return decodeBridgeValue<T>(op, rawResponse);
 };
 
 const loadBackendApis = async (): Promise<BackendApis> => {
@@ -466,15 +446,6 @@ const waitForOAuthCallbackFromBrowser = async (
   label?: string,
 ): Promise<AccountSummary> => {
   const tauri = await loadBackendApis();
-  await tauri.invoke<boolean>("start_oauth_callback_listener", {
-    timeoutSeconds: 180,
-    issuer: pending.issuer,
-    clientId: pending.clientId,
-    redirectUri: pending.redirectUri,
-    oauthState: pending.state,
-    codeVerifier: pending.codeVerifier,
-    label,
-  });
 
   const renderCallbackError = (errorCode: string): string => {
     if (errorCode === "CallbackListenerStopped") return "Callback listener stopped.";
@@ -486,22 +457,24 @@ const waitForOAuthCallbackFromBrowser = async (
     return errorCode;
   };
 
-  while (true) {
-    const status = await tauri.invoke<OAuthCallbackPollResponse>("poll_oauth_callback_listener");
-    if (status.status === "ready") {
-      const account = asAccountSummary(status.account);
-      if (!account) {
-        throw new Error("Callback listener returned an invalid account payload.");
-      }
-      return account;
+  try {
+    const payload = await tauri.invoke<unknown>("wait_for_oauth_callback", {
+      timeoutSeconds: 180,
+      issuer: pending.issuer,
+      clientId: pending.clientId,
+      redirectUri: pending.redirectUri,
+      oauthState: pending.state,
+      codeVerifier: pending.codeVerifier,
+      label,
+    });
+    const account = asAccountSummary(payload);
+    if (!account) {
+      throw new Error("Callback listener returned an invalid account payload.");
     }
-
-    if (status.status === "error") {
-      const errorCode = normalizeOptional(status.error) || "Callback listener failed.";
-      throw new Error(renderCallbackError(errorCode));
-    }
-
-    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    return account;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(renderCallbackError(message));
   }
 };
 

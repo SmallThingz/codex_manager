@@ -636,11 +636,11 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
                 }
             };
 
-            const callback_url = waitForOAuthCallbackResult(allocator) catch |err| {
+            var ready_account = waitForOAuthReadyAccountResult(allocator) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
-            defer allocator.free(callback_url);
-            return jsonOk(allocator, callback_url);
+            defer ready_account.deinit(allocator);
+            return jsonOk(allocator, ready_account);
         }
 
         if (std.mem.eql(u8, command, "cancel_oauth_callback_listener")) {
@@ -3421,6 +3421,40 @@ fn waitForOAuthCallbackResult(allocator: std.mem.Allocator) ![]u8 {
 
     if (oauth_listener_state.callback_url) |url| {
         return allocator.dupe(u8, url);
+    }
+
+    if (oauth_listener_state.error_name) |err_name| {
+        if (std.mem.eql(u8, err_name, "CallbackListenerStopped")) {
+            return error.CallbackListenerStopped;
+        }
+        if (std.mem.eql(u8, err_name, "CallbackListenerTimeout")) {
+            return error.CallbackListenerTimeout;
+        }
+        if (std.mem.eql(u8, err_name, "CallbackListenerSocketError")) {
+            return error.CallbackListenerSocketError;
+        }
+        return error.CallbackListenerFailed;
+    }
+
+    return error.CallbackListenerUnavailable;
+}
+
+fn waitForOAuthReadyAccountResult(allocator: std.mem.Allocator) !OAuthReadyAccount {
+    oauth_listener_state.mutex.lock();
+    defer oauth_listener_state.mutex.unlock();
+
+    while (oauth_listener_state.running) {
+        oauth_listener_state.cond.wait(&oauth_listener_state.mutex);
+    }
+    joinOAuthListenerThreadLocked();
+
+    if (oauth_listener_state.ready_account) |account| {
+        return .{
+            .id = try allocator.dupe(u8, account.id),
+            .accountId = if (account.accountId) |value| try allocator.dupe(u8, value) else null,
+            .email = if (account.email) |value| try allocator.dupe(u8, value) else null,
+            .state = account.state,
+        };
     }
 
     if (oauth_listener_state.error_name) |err_name| {

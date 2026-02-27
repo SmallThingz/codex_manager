@@ -688,32 +688,33 @@ function App() {
     markRefreshing(accountIds, true);
 
     try {
-      const entries = await Promise.all(
-        accountIds.map(async (id) => [id, await getRemainingCreditsForAccount(id)] as const),
+      const failureMessages: string[] = [];
+
+      await Promise.all(
+        accountIds.map(async (id) => {
+          try {
+            const credits = await getRemainingCreditsForAccount(id);
+            setCreditsById((current) => ({
+              ...current,
+              [id]: credits,
+            }));
+
+            if (!quiet && credits.status === "error") {
+              failureMessages.push(`Credits check issue: ${credits.message}`);
+            }
+          } catch (creditsError) {
+            const rendered = creditsError instanceof Error ? creditsError.message : String(creditsError);
+            failureMessages.push(rendered);
+          } finally {
+            markRefreshing([id], false);
+          }
+        }),
       );
 
-      setCreditsById((previous) => {
-        const next = { ...previous };
-
-        for (const [id, credits] of entries) {
-          next[id] = credits;
-        }
-
-        return next;
-      });
-
-      if (!quiet) {
-        const failures = entries.filter((entry) => entry[1].status === "error");
-        if (failures.length > 0) {
-          const first = failures[0][1];
-          setError(`Credits check issue: ${first.message}`);
-        }
+      if (!quiet && failureMessages.length > 0) {
+        setError(failureMessages[0]);
       }
-    } catch (creditsError) {
-      const rendered = creditsError instanceof Error ? creditsError.message : String(creditsError);
-      setError(rendered);
     } finally {
-      markRefreshing(accountIds, false);
       if (trackAll) {
         setRefreshingAll(false);
       }

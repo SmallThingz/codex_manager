@@ -12,11 +12,7 @@ const RawJson = struct {
 };
 
 pub const RpcBridgeMethods = struct {
-    pub fn call(target_fn: []const u8, request_text: []const u8) RawJson {
-        if (!std.mem.eql(u8, target_fn, "cm_rpc")) {
-            return .{ .data = "{\"ok\":false,\"error\":\"unknown bridge function\"}" };
-        }
-
+    pub fn cm_rpc(request_text: []const u8) RawJson {
         const cancel_ptr = bridge_cancel_ptr orelse {
             return .{ .data = "{\"ok\":false,\"error\":\"RPC bridge not initialized\"}" };
         };
