@@ -10,6 +10,7 @@ const DEFAULT_HEIGHT: u32 = 760;
 const APP_ID = "com.codex.manager";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
+const BROWSER_IDLE_SHUTDOWN_DELAY_MS: i64 = 3000;
 const DEFAULT_BOOTSTRAP_STATE_JSON =
     \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
 ;
@@ -170,9 +171,29 @@ fn runModeService(
         std.debug.print("Codex Manager URL: {s}\n", .{url});
     }
 
-    while (!service.shouldExit()) {
+    var browser_shutdown_deadline_ms: ?i64 = null;
+    while (true) {
         try service.run();
-        std.Thread.sleep(16 * std.time.ns_per_ms);
+        if (!service.shouldExit()) {
+            browser_shutdown_deadline_ms = null;
+            std.Thread.sleep(16 * std.time.ns_per_ms);
+            continue;
+        }
+
+        const active_surface = service.runtimeRenderState().active_surface;
+        const browser_surface = active_surface == .browser_window or active_surface == .web_url;
+        if (browser_surface) {
+            const now_ms = std.time.milliTimestamp();
+            if (browser_shutdown_deadline_ms == null) {
+                browser_shutdown_deadline_ms = now_ms + BROWSER_IDLE_SHUTDOWN_DELAY_MS;
+            }
+            if (now_ms < browser_shutdown_deadline_ms.?) {
+                std.Thread.sleep(16 * std.time.ns_per_ms);
+                continue;
+            }
+        }
+
+        break;
     }
 }
 

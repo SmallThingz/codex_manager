@@ -408,8 +408,7 @@ const IconClose = () => (
 
 function App() {
   const embeddedState = getEmbeddedBootstrapState();
-  const hasEmbeddedState =
-    Boolean(embeddedState?.view) || Boolean(embeddedState && Object.keys(embeddedState.usageById).length > 0);
+  const hasEmbeddedView = Boolean(embeddedState?.view);
 
   const [view, setView] = createSignal<AccountsView | null>(embeddedState?.view ?? null);
   const [creditsById, setCreditsById] = createSignal<CreditsByAccount>(embeddedState?.usageById ?? {});
@@ -436,7 +435,7 @@ function App() {
   const [refreshingById, setRefreshingById] = createSignal<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = createSignal(false);
   const [nowTick, setNowTick] = createSignal(nowEpoch());
-  const [initializing, setInitializing] = createSignal(!hasEmbeddedState);
+  const [initializing, setInitializing] = createSignal(!hasEmbeddedView);
   const [busy, setBusy] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
@@ -1508,6 +1507,9 @@ function App() {
     window.addEventListener("pointerdown", handlePointerDown);
     window.addEventListener("pointerup", releaseDragSelectionLock);
     window.addEventListener("pointercancel", releaseDragSelectionLock);
+    const startupEpoch = nowEpoch();
+    lastActiveAutoRefreshAt = startupEpoch;
+    depletedAutoRefreshCooldownUntil = startupEpoch + AUTO_REFRESH_DEPLETED_COOLDOWN_SEC;
     nowTickInterval = window.setInterval(() => {
       const currentEpoch = nowEpoch();
       setNowTick(currentEpoch);
@@ -1529,7 +1531,9 @@ function App() {
     });
 
     try {
-      await refreshAccounts(true);
+      if (!hasEmbeddedView) {
+        await refreshAccounts(true);
+      }
     } finally {
       setInitializing(false);
     }
