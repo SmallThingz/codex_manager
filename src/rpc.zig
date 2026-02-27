@@ -502,12 +502,6 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
             };
         }
 
-        if (std.mem.eql(u8, command, "get_accounts_view")) {
-            return handleGetAccountsViewCommand(allocator) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        }
-
         if (std.mem.eql(u8, command, "get_usage_cache")) {
             return handleGetUsageCacheCommand(allocator) catch |err| {
                 return jsonError(allocator, @errorName(err));
@@ -2170,19 +2164,7 @@ fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, remove
 }
 
 fn handleGetAppStateCommand(allocator: std.mem.Allocator) ![]u8 {
-    return jsonError(allocator, "get_app_state is deprecated; use get_accounts_view, get_usage_cache, and get_ui_preferences");
-}
-
-fn handleGetAccountsViewCommand(allocator: std.mem.Allocator) ![]u8 {
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
-
-    var state = try loadAppState(allocator);
-    defer state.deinit(allocator);
-
-    const view_json = try buildAccountsViewJson(allocator, &state);
-    defer allocator.free(view_json);
-    return jsonOkRaw(allocator, view_json);
+    return jsonError(allocator, "get_app_state is deprecated");
 }
 
 fn handleGetUsageCacheCommand(allocator: std.mem.Allocator) ![]u8 {
@@ -2292,9 +2274,7 @@ fn handleMoveAccountCommand(
     try state.store.accounts.insert(allocator, insert_index, moved);
 
     try persistStateFilesOnly(allocator, &state);
-    const view_json = try buildAccountsViewJson(allocator, &state);
-    defer allocator.free(view_json);
-    return jsonOkRaw(allocator, view_json);
+    return jsonOk(allocator, @as(?u8, null));
 }
 
 fn handleRemoveAccountCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {

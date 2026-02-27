@@ -707,12 +707,6 @@ export const updateUiPreferences = async (
   await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
 };
 
-export const getAccounts = async (): Promise<AccountsView> => {
-  const tauri = await loadBackendApis();
-  const view = await tauri.invoke<unknown>("get_accounts_view");
-  return parseAccountsViewResponse(view, "get_accounts_view");
-};
-
 export const getUsageCache = async (): Promise<Record<string, CreditsInfo>> => {
   const tauri = await loadBackendApis();
   const usage = await tauri.invoke<unknown>("get_usage_cache");
@@ -833,27 +827,26 @@ export const moveAccount = async (
   targetBucket: AccountBucket,
   targetIndex: number,
   options?: { switchAwayFromMoved?: boolean },
-): Promise<AccountsView> => {
+): Promise<void> => {
   const tauri = await loadBackendApis();
-  const view = await tauri.invoke<unknown>("move_account", {
+  await tauri.invoke<unknown>("move_account", {
       accountId: id,
       targetBucket,
       targetIndex,
       switchAwayFromMoved: options?.switchAwayFromMoved,
     });
-  return parseAccountsViewResponse(view, "move_account");
 };
 
 export const archiveAccount = async (
   id: string,
   options?: { switchAwayFromArchived?: boolean },
-): Promise<AccountsView> => {
+): Promise<void> => {
   return moveAccount(id, "depleted", Number.MAX_SAFE_INTEGER, {
     switchAwayFromMoved: options?.switchAwayFromArchived,
   });
 };
 
-export const unarchiveAccount = async (id: string): Promise<AccountsView> => {
+export const unarchiveAccount = async (id: string): Promise<void> => {
   return moveAccount(id, "active", Number.MAX_SAFE_INTEGER);
 };
 

@@ -4,11 +4,8 @@ import {
   beginCodexLogin,
   codexLoginWithApiKey,
   completeCodexLogin,
-  getAccounts,
   getEmbeddedBootstrapState,
   getRemainingCreditsForAccount,
-  getSavedTheme,
-  getUsageCache,
   importCurrentAccount,
   listenForCodexCallback,
   moveAccount,
@@ -104,6 +101,15 @@ const normalizeUsageRefreshDisplayMode = (value: string | null | undefined): Usa
 
   return "date";
 };
+
+const emptyAccountsView = (): AccountsView => ({
+  accounts: [],
+  activeAccountId: null,
+  activeDiskAccountId: null,
+  codexAuthExists: false,
+  codexAuthPath: "",
+  storePath: "",
+});
 
 const numberOrDash = (value: number | null): string => {
   if (value === null) {
@@ -499,18 +505,6 @@ function App() {
   const activeAccountIds = (nextView: AccountsView): string[] =>
     nextView.accounts.filter((account) => account.state === "active").map((account) => account.id);
 
-  const quotaSyncAccountIds = (nextView: AccountsView): string[] => {
-    const ids = new Set(activeAccountIds(nextView));
-
-    for (const account of nextView.accounts) {
-      if (account.state === "archived") {
-        ids.add(account.id);
-      }
-    }
-
-    return [...ids];
-  };
-
   const newlyAddedAccountIds = (previousView: AccountsView | null, nextView: AccountsView): string[] => {
     const previousIds = new Set((previousView?.accounts ?? []).map((account) => account.id));
     return nextView.accounts
@@ -543,6 +537,93 @@ function App() {
         setAddMenuOpen(true);
       }
     });
+  };
+
+  const accountStateForBucket = (bucket: AccountBucket): AccountSummary["state"] => {
+    if (bucket === "depleted") {
+      return "archived";
+    }
+    if (bucket === "frozen") {
+      return "frozen";
+    }
+    return "active";
+  };
+
+  const accountBucketFromState = (state: AccountSummary["state"]): AccountBucket => {
+    if (state === "archived") {
+      return "depleted";
+    }
+    if (state === "frozen") {
+      return "frozen";
+    }
+    return "active";
+  };
+
+  const applyMovedAccountInView = (
+    currentView: AccountsView,
+    accountId: string,
+    targetBucket: AccountBucket,
+    targetIndex: number,
+    switchAwayFromMoved: boolean,
+  ): AccountsView => {
+    const sourceIndex = currentView.accounts.findIndex((account) => account.id === accountId);
+    if (sourceIndex < 0) {
+      return currentView;
+    }
+
+    const source = currentView.accounts[sourceIndex];
+    const remaining = currentView.accounts.filter((_, index) => index !== sourceIndex);
+    const moved: AccountSummary = {
+      ...source,
+      state: accountStateForBucket(targetBucket),
+    };
+
+    let nextActiveAccountId = currentView.activeAccountId;
+    if (nextActiveAccountId === moved.id && targetBucket !== "active") {
+      if (switchAwayFromMoved) {
+        const fallback = remaining.find((account) => account.state === "active");
+        nextActiveAccountId = fallback?.id ?? null;
+      } else {
+        nextActiveAccountId = null;
+      }
+    }
+
+    const targetBucketIndices = remaining
+      .map((account, index) => ({ account, index }))
+      .filter((entry) => accountBucketFromState(entry.account.state) === targetBucket)
+      .map((entry) => entry.index);
+
+    const normalizedTargetIndex =
+      targetIndex <= 0 ? 0 : Math.min(targetIndex, targetBucketIndices.length);
+
+    let insertIndex = remaining.length;
+    if (normalizedTargetIndex < targetBucketIndices.length) {
+      insertIndex = targetBucketIndices[normalizedTargetIndex];
+    } else if (targetBucketIndices.length > 0) {
+      insertIndex = targetBucketIndices[targetBucketIndices.length - 1] + 1;
+    }
+
+    const nextAccounts = [...remaining];
+    nextAccounts.splice(insertIndex, 0, moved);
+
+    if (nextActiveAccountId) {
+      const activeEntry = nextAccounts.find((account) => account.id === nextActiveAccountId);
+      if (!activeEntry || activeEntry.state !== "active") {
+        nextActiveAccountId = nextAccounts.find((account) => account.state === "active")?.id ?? null;
+      }
+    }
+
+    const nextActiveDiskAccountId =
+      nextActiveAccountId === null
+        ? null
+        : nextAccounts.find((account) => account.id === nextActiveAccountId)?.accountId ?? null;
+
+    return {
+      ...currentView,
+      accounts: nextAccounts,
+      activeAccountId: nextActiveAccountId,
+      activeDiskAccountId: nextActiveDiskAccountId,
+    };
   };
 
   const markRefreshing = (accountIds: string[], refreshing: boolean) => {
@@ -704,7 +785,14 @@ function App() {
           );
 
           if (archivedRecoveryTarget) {
-            const restoredView = await unarchiveAccount(archivedRecoveryTarget.id);
+            await unarchiveAccount(archivedRecoveryTarget.id);
+            const restoredView = applyMovedAccountInView(
+              nextView,
+              archivedRecoveryTarget.id,
+              "active",
+              Number.MAX_SAFE_INTEGER,
+              true,
+            );
             nextView = restoredView;
             setViewState(restoredView);
             changed = true;
@@ -734,9 +822,16 @@ function App() {
           continue;
         }
 
-        const archivedView = await archiveAccount(id, {
+        await archiveAccount(id, {
           switchAwayFromArchived: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
         });
+        const archivedView = applyMovedAccountInView(
+          nextView,
+          id,
+          "depleted",
+          Number.MAX_SAFE_INTEGER,
+          AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+        );
         nextView = archivedView;
         setViewState(archivedView);
         changed = true;
@@ -756,7 +851,14 @@ function App() {
           continue;
         }
 
-        const restoredView = await unarchiveAccount(id);
+        await unarchiveAccount(id);
+        const restoredView = applyMovedAccountInView(
+          nextView,
+          id,
+          "active",
+          Number.MAX_SAFE_INTEGER,
+          true,
+        );
         nextView = restoredView;
         setViewState(restoredView);
         changed = true;
@@ -902,35 +1004,6 @@ function App() {
     void updateUiPreferences({
       usageRefreshDisplayMode: next,
     }).catch(() => {});
-  };
-
-  const refreshAccounts = async (initialLoad = false) => {
-    if (!initialLoad) {
-      batch(() => {
-        setBusy("Loading accounts");
-        setError(null);
-        setNotice(null);
-      });
-    } else {
-      setError(null);
-    }
-
-    try {
-      const next = await getAccounts();
-      setViewState(next);
-      const usageById = await getUsageCache();
-      setCreditsById(usageById);
-      if (!initialLoad) {
-        await refreshCreditsForAccounts(quotaSyncAccountIds(next), { quiet: false });
-      }
-    } catch (actionError) {
-      const rendered = actionError instanceof Error ? actionError.message : String(actionError);
-      setError(rendered);
-    } finally {
-      if (!initialLoad) {
-        setBusy(null);
-      }
-    }
   };
 
   const handleAddChatgptStart = async () => {
@@ -1110,11 +1183,23 @@ function App() {
   };
 
   const moveAccountToBucket = async (id: string, bucket: AccountBucket, targetIndex: number) => {
-    const next = await runAction("Moving account", () =>
-      moveAccount(id, bucket, targetIndex, {
+    const currentView = view();
+    if (!currentView) {
+      return;
+    }
+
+    const next = await runAction("Moving account", async () => {
+      await moveAccount(id, bucket, targetIndex, {
         switchAwayFromMoved: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
-      }),
-    );
+      });
+      return applyMovedAccountInView(
+        currentView,
+        id,
+        bucket,
+        targetIndex,
+        AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+      );
+    });
 
     if (!next) {
       return;
@@ -1433,18 +1518,9 @@ function App() {
 
   onMount(async () => {
     const fallbackTheme = localStorage.getItem("codex-manager-theme");
-    let initialTheme: Theme = embeddedState?.theme === "dark" ? "dark" : fallbackTheme === "dark" ? "dark" : "light";
-    try {
-      const bridgedTheme = await getSavedTheme();
-      if (bridgedTheme) {
-        initialTheme = bridgedTheme;
-      }
-    } catch {
-      // Keep localStorage fallback for pure browser sessions.
-    }
+    const initialTheme: Theme = embeddedState?.theme === "dark" ? "dark" : fallbackTheme === "dark" ? "dark" : "light";
     setTheme(initialTheme);
     applyTheme(initialTheme);
-    void saveTheme(initialTheme).catch(() => {});
 
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
@@ -1490,7 +1566,8 @@ function App() {
 
     try {
       if (!hasEmbeddedView) {
-        await refreshAccounts(true);
+        setViewState(emptyAccountsView());
+        setCreditsById({});
       }
     } finally {
       setInitializing(false);
