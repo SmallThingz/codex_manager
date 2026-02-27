@@ -280,7 +280,7 @@ const usageRefreshRows = (
 };
 
 const accountTitle = (account: AccountSummary): string => {
-  return account.label || account.email || account.accountId || account.id;
+  return account.email || account.accountId || account.id;
 };
 
 const accountMainIdentity = (account: AccountSummary): string => {
@@ -453,13 +453,13 @@ function App() {
   let nowTickInterval: number | undefined;
 
   const activeAccounts = createMemo(
-    () => view()?.accounts.filter((account) => !account.archived && !account.frozen) || [],
+    () => view()?.accounts.filter((account) => account.state === "active") || [],
   );
   const depletedAccounts = createMemo(
-    () => view()?.accounts.filter((account) => account.archived && !account.frozen) || [],
+    () => view()?.accounts.filter((account) => account.state === "archived") || [],
   );
   const frozenAccounts = createMemo(
-    () => view()?.accounts.filter((account) => account.frozen) || [],
+    () => view()?.accounts.filter((account) => account.state === "frozen") || [],
   );
   const addMenuVisible = createMemo(
     () => !initializing() && addMenuOpen(),
@@ -497,13 +497,13 @@ function App() {
   };
 
   const activeAccountIds = (nextView: AccountsView): string[] =>
-    nextView.accounts.filter((account) => !account.archived && !account.frozen).map((account) => account.id);
+    nextView.accounts.filter((account) => account.state === "active").map((account) => account.id);
 
   const quotaSyncAccountIds = (nextView: AccountsView): string[] => {
     const ids = new Set(activeAccountIds(nextView));
 
     for (const account of nextView.accounts) {
-      if (account.archived && !account.frozen) {
+      if (account.state === "archived") {
         ids.add(account.id);
       }
     }
@@ -674,8 +674,8 @@ function App() {
       const active = nextView.activeAccountId
         ? nextView.accounts.find((account) => account.id === nextView.activeAccountId) ?? null
         : null;
-      if (!active || active.archived || active.frozen) {
-        const switchTarget = nextView.accounts.find((account) => !account.archived && !account.frozen);
+      if (!active || active.state !== "active") {
+        const switchTarget = nextView.accounts.find((account) => account.state === "active");
         if (switchTarget) {
           const switchedView = await switchAccount(switchTarget.id);
           nextView = switchedView;
@@ -684,7 +684,7 @@ function App() {
         }
       }
 
-      const activeAccountsWithQuota = nextView.accounts.filter((account) => !account.archived && !account.frozen);
+      const activeAccountsWithQuota = nextView.accounts.filter((account) => account.state === "active");
       const depletedActiveIds = activeAccountsWithQuota
         .filter((account) => hasZeroQuotaRemaining(cachedCredits[account.id]))
         .map((account) => account.id);
@@ -700,7 +700,7 @@ function App() {
 
         if (!switchTarget) {
           const archivedRecoveryTarget = nextView.accounts.find(
-            (account) => account.archived && !account.frozen && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+            (account) => account.state === "archived" && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
           );
 
           if (archivedRecoveryTarget) {
@@ -709,7 +709,7 @@ function App() {
             setViewState(restoredView);
             changed = true;
 
-            const restoredActive = nextView.accounts.filter((account) => !account.archived && !account.frozen);
+            const restoredActive = nextView.accounts.filter((account) => account.state === "active");
             switchTarget = restoredActive.find(
               (account) =>
                 account.id !== activeId &&
@@ -728,7 +728,7 @@ function App() {
 
       for (const id of depletedActiveIds) {
         const stillActive = nextView.accounts.find(
-          (account) => account.id === id && !account.archived && !account.frozen,
+          (account) => account.id === id && account.state === "active",
         );
         if (!stillActive || !hasZeroQuotaRemaining(cachedCredits[id])) {
           continue;
@@ -744,13 +744,13 @@ function App() {
 
       const recoverableArchivedIds = nextView.accounts
         .filter(
-          (account) => account.archived && !account.frozen && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
+          (account) => account.state === "archived" && hasNonZeroQuotaRemaining(cachedCredits[account.id]),
         )
         .map((account) => account.id);
 
       for (const id of recoverableArchivedIds) {
         const stillArchived = nextView.accounts.find(
-          (account) => account.id === id && account.archived && !account.frozen,
+          (account) => account.id === id && account.state === "archived",
         );
         if (!stillArchived || !hasNonZeroQuotaRemaining(cachedCredits[id])) {
           continue;
@@ -1156,10 +1156,10 @@ function App() {
     if (!account) {
       return null;
     }
-    if (account.frozen) {
+    if (account.state === "frozen") {
       return "frozen";
     }
-    if (account.archived) {
+    if (account.state === "archived") {
       return "depleted";
     }
     return "active";
@@ -1729,10 +1729,11 @@ function App() {
                     {(account) => {
                       const credits = () => creditsById()[account.id];
                       const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
+                      const isCurrent = () => view()?.activeAccountId === account.id;
 
                       return (
                         <article
-                          class={`account ${account.isActive ? "active" : ""} ${
+                          class={`account ${isCurrent() ? "active" : ""} ${
                             draggingAccountId() === account.id ? "dragging" : ""
                           } ${isDropBefore("active", account.id) ? "drop-before" : ""}${
                             draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""
@@ -1750,7 +1751,7 @@ function App() {
                             <div class="account-main">
                               <p class="account-title account-main-value">{accountTitle(account)}</p>
                             </div>
-                            <Show when={account.isActive}>
+                            <Show when={isCurrent()}>
                               <p class="pill pill-active">ACTIVE</p>
                             </Show>
                           </header>
@@ -1834,10 +1835,10 @@ function App() {
                             <button
                               type="button"
                               class="switch-btn"
-                              disabled={account.isActive}
+                              disabled={isCurrent()}
                               onClick={() => handleSwitch(account.id)}
                             >
-                              {account.isActive ? "Current Account" : "Switch Account"}
+                              {isCurrent() ? "Current Account" : "Switch Account"}
                             </button>
 
                             <div class="icon-actions">

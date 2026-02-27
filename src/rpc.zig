@@ -835,12 +835,15 @@ fn jsonGetBool(value: std.json.Value) ?bool {
 }
 
 fn jsonGetF64(value: std.json.Value) ?f64 {
-    return switch (value) {
+    const parsed: ?f64 = switch (value) {
         .float => |n| n,
         .integer => |n| @floatFromInt(n),
         .string => |s| std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \r\n\t")) catch null,
         else => null,
     };
+    if (parsed == null) return null;
+    if (!std.math.isFinite(parsed.?)) return null;
+    return parsed;
 }
 
 fn jsonGetI64(value: std.json.Value) ?i64 {
@@ -916,7 +919,11 @@ fn writeJsonOptionalI64(writer: anytype, value: ?i64) !void {
 
 fn writeJsonOptionalF64(writer: anytype, value: ?f64) !void {
     if (value) |n| {
-        try writer.print("{d}", .{n});
+        if (std.math.isFinite(n)) {
+            try writer.print("{d}", .{n});
+        } else {
+            try writer.writeAll("null");
+        }
     } else {
         try writer.writeAll("null");
     }
@@ -1222,6 +1229,12 @@ fn applyBucket(account: *ManagedAccount, bucket: AccountBucket) void {
     account.frozen = bucket == .frozen;
 }
 
+fn accountStateString(account: *const ManagedAccount) []const u8 {
+    if (account.frozen) return "frozen";
+    if (account.archived) return "archived";
+    return "active";
+}
+
 fn sanitizeStoreActiveAccount(allocator: std.mem.Allocator, store: *StoreState) !void {
     if (store.active_account_id) |active_id| {
         const idx = accountIndex(store, active_id);
@@ -1291,6 +1304,35 @@ fn extractAccountIdFromAuthJson(allocator: std.mem.Allocator, auth_json: []const
     return allocator.dupe(u8, account_id) catch null;
 }
 
+fn extractEmailFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
+    const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
+    const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
+    if (second_dot <= first_dot + 1) return null;
+
+    const payload_b64 = id_token[first_dot + 1 .. second_dot];
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeUpperBound(payload_b64.len) catch return null;
+    const decoded = allocator.alloc(u8, decoded_len) catch return null;
+    defer allocator.free(decoded);
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_b64) catch return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return null;
+    defer parsed.deinit();
+
+    const payload = jsonGetObject(parsed.value) orelse return null;
+    if (payload.get("email")) |email_value| {
+        if (jsonGetString(email_value)) |email| return allocator.dupe(u8, email) catch null;
+    }
+
+    if (payload.get("https://api.openai.com/profile")) |profile_value| {
+        const profile = jsonGetObject(profile_value) orelse return null;
+        if (profile.get("email")) |email_value| {
+            if (jsonGetString(email_value)) |email| return allocator.dupe(u8, email) catch null;
+        }
+    }
+
+    return null;
+}
+
 fn extractEmailFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
     defer parsed.deinit();
@@ -1301,6 +1343,32 @@ fn extractEmailFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8)
             return allocator.dupe(u8, email) catch null;
         }
     }
+
+    if (root.get("tokens")) |tokens_value| {
+        const tokens = jsonGetObject(tokens_value) orelse return null;
+        if (tokens.get("email")) |email_value| {
+            if (jsonGetString(email_value)) |email| {
+                return allocator.dupe(u8, email) catch null;
+            }
+        }
+
+        if (tokens.get("id_token")) |id_token_value| {
+            switch (id_token_value) {
+                .string => |id_token| {
+                    if (extractEmailFromIdToken(allocator, id_token)) |email| return email;
+                },
+                .object => |id_token_object| {
+                    if (id_token_object.get("raw_jwt")) |raw_jwt_value| {
+                        if (jsonGetString(raw_jwt_value)) |raw_jwt| {
+                            if (extractEmailFromIdToken(allocator, raw_jwt)) |email| return email;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     return null;
 }
 
@@ -1381,14 +1449,8 @@ fn writeCreditsInfoJson(writer: anytype, credits: *const CreditsInfo) !void {
 
 fn buildSnapshotJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try sanitizeStoreActiveAccount(allocator, &state.store);
-
-    const current_auth = try loadCodexAuthJson(allocator, state.paths.codexAuthPath);
-    defer if (current_auth) |auth| allocator.free(auth);
-
-    const active_disk_account_id = if (current_auth) |auth| extractAccountIdFromAuthJson(allocator, auth) else null;
-    defer if (active_disk_account_id) |account_id| allocator.free(account_id);
-
-    const codex_auth_exists = current_auth != null;
+    const view_json = try buildAccountsViewJson(allocator, state);
+    defer allocator.free(view_json);
 
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
@@ -1409,45 +1471,8 @@ fn buildSnapshotJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try writer.print("{}", .{state.preferences.auto_refresh_active_interval_sec});
     try writer.writeAll(",\"usageRefreshDisplayMode\":");
     try writeJsonString(writer, state.preferences.usage_refresh_display_mode);
-    try writer.writeAll(",\"view\":{");
-    try writer.writeAll("\"accounts\":[");
-
-    for (state.store.accounts.items, 0..) |account, idx| {
-        if (idx != 0) try writer.writeByte(',');
-        try writer.writeByte('{');
-        try writer.writeAll("\"id\":");
-        try writeJsonString(writer, account.id);
-        try writer.writeAll(",\"label\":");
-        try writeJsonOptionalString(writer, account.label);
-        try writer.writeAll(",\"accountId\":");
-        try writeJsonOptionalString(writer, account.account_id);
-        try writer.writeAll(",\"email\":");
-        try writeJsonOptionalString(writer, account.email);
-        try writer.writeAll(",\"archived\":");
-        try writeJsonBool(writer, account.archived);
-        try writer.writeAll(",\"frozen\":");
-        try writeJsonBool(writer, account.frozen);
-        try writer.writeAll(",\"isActive\":");
-        const is_active = state.store.active_account_id != null and std.mem.eql(u8, state.store.active_account_id.?, account.id);
-        try writeJsonBool(writer, is_active);
-        try writer.writeAll(",\"updatedAt\":");
-        try writer.print("{}", .{account.updated_at});
-        try writer.writeAll(",\"lastUsedAt\":");
-        try writeJsonOptionalI64(writer, account.last_used_at);
-        try writer.writeByte('}');
-    }
-
-    try writer.writeAll("],\"activeAccountId\":");
-    try writeJsonOptionalString(writer, state.store.active_account_id);
-    try writer.writeAll(",\"activeDiskAccountId\":");
-    try writeJsonOptionalString(writer, active_disk_account_id);
-    try writer.writeAll(",\"codexAuthExists\":");
-    try writeJsonBool(writer, codex_auth_exists);
-    try writer.writeAll(",\"codexAuthPath\":");
-    try writeJsonString(writer, state.paths.codexAuthPath);
-    try writer.writeAll(",\"storePath\":");
-    try writeJsonString(writer, state.paths.storePath);
-    try writer.writeByte('}');
+    try writer.writeAll(",\"view\":");
+    try writer.writeAll(view_json);
 
     try writer.writeAll(",\"usageById\":{");
     for (state.usage_by_id.items, 0..) |entry, idx| {
@@ -1463,16 +1488,108 @@ fn buildSnapshotJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     return buffer.toOwnedSlice(allocator);
 }
 
-fn persistStateAndBuildSnapshot(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
+fn buildAccountsViewJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
+    try sanitizeStoreActiveAccount(allocator, &state.store);
+
+    const current_auth = try loadCodexAuthJson(allocator, state.paths.codexAuthPath);
+    defer if (current_auth) |auth| allocator.free(auth);
+
+    const active_disk_account_id = if (current_auth) |auth| extractAccountIdFromAuthJson(allocator, auth) else null;
+    defer if (active_disk_account_id) |account_id| allocator.free(account_id);
+
+    const codex_auth_exists = current_auth != null;
+
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+    const writer = buffer.writer(allocator);
+
+    try writer.writeAll("{\"accounts\":[");
+
+    for (state.store.accounts.items, 0..) |account, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writer.writeAll("\"id\":");
+        try writeJsonString(writer, account.id);
+        try writer.writeAll(",\"accountId\":");
+        try writeJsonOptionalString(writer, account.account_id);
+        try writer.writeAll(",\"email\":");
+        try writeJsonOptionalString(writer, account.email);
+        try writer.writeAll(",\"state\":");
+        try writeJsonString(writer, accountStateString(&account));
+        try writer.writeByte('}');
+    }
+
+    try writer.writeAll("],\"activeAccountId\":");
+    try writeJsonOptionalString(writer, state.store.active_account_id);
+    try writer.writeAll(",\"activeDiskAccountId\":");
+    try writeJsonOptionalString(writer, active_disk_account_id);
+    try writer.writeAll(",\"codexAuthExists\":");
+    try writeJsonBool(writer, codex_auth_exists);
+    try writer.writeAll(",\"codexAuthPath\":");
+    try writeJsonString(writer, state.paths.codexAuthPath);
+    try writer.writeAll(",\"storePath\":");
+    try writeJsonString(writer, state.paths.storePath);
+    try writer.writeByte('}');
+
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn buildUiPreferencesResponseJson(allocator: std.mem.Allocator, preferences: *const UiPreferences) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+    const writer = buffer.writer(allocator);
+
+    try writer.writeByte('{');
+    try writer.writeAll("\"theme\":");
+    try writeJsonOptionalString(writer, preferences.theme);
+    try writer.writeAll(",\"autoArchiveZeroQuota\":");
+    try writeJsonBool(writer, preferences.auto_archive_zero_quota);
+    try writer.writeAll(",\"autoUnarchiveNonZeroQuota\":");
+    try writeJsonBool(writer, preferences.auto_unarchive_non_zero_quota);
+    try writer.writeAll(",\"autoSwitchAwayFromArchived\":");
+    try writeJsonBool(writer, preferences.auto_switch_away_from_archived);
+    try writer.writeAll(",\"autoRefreshActiveEnabled\":");
+    try writeJsonBool(writer, preferences.auto_refresh_active_enabled);
+    try writer.writeAll(",\"autoRefreshActiveIntervalSec\":");
+    try writer.print("{}", .{preferences.auto_refresh_active_interval_sec});
+    try writer.writeAll(",\"usageRefreshDisplayMode\":");
+    try writeJsonString(writer, preferences.usage_refresh_display_mode);
+    try writer.writeByte('}');
+
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn persistStateFilesOnly(allocator: std.mem.Allocator, state: *AppState) !void {
     state.saved_at = nowEpochSeconds();
+
     const serialized_store = try serializeStoreState(allocator, &state.store);
     defer allocator.free(serialized_store);
     try writeTextFileAtomic(allocator, state.paths.storePath, serialized_store);
 
     const snapshot_json = try buildSnapshotJson(allocator, state);
-    errdefer allocator.free(snapshot_json);
+    defer allocator.free(snapshot_json);
     try writeTextFileAtomic(allocator, state.paths.bootstrapStatePath, snapshot_json);
-    return snapshot_json;
+}
+
+fn buildRefreshUsageResponseJson(
+    allocator: std.mem.Allocator,
+    account_id: []const u8,
+    credits: *const CreditsInfo,
+    email: ?[]const u8,
+) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+    const writer = buffer.writer(allocator);
+
+    try writer.writeAll("{\"accountId\":");
+    try writeJsonString(writer, account_id);
+    try writer.writeAll(",\"credits\":");
+    try writeCreditsInfoJson(writer, credits);
+    try writer.writeAll(",\"email\":");
+    try writeJsonOptionalString(writer, email);
+    try writer.writeByte('}');
+
+    return buffer.toOwnedSlice(allocator);
 }
 
 fn makeCreditsInfo(
@@ -1852,6 +1969,57 @@ fn fetchCreditsFromAuthJson(
     return makeCreditsInfo(allocator, checked_at, .unavailable, "No access token available for this account.");
 }
 
+fn fetchEmailFromOpenAiApi(allocator: std.mem.Allocator, access_token: []const u8) !?[]u8 {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{access_token});
+    defer allocator.free(auth_header);
+
+    try argv.appendSlice(allocator, &.{
+        "curl",
+        "-sS",
+        "--location",
+        "--write-out",
+        "\n%{http_code}",
+        "-H",
+        auth_header,
+        "-H",
+        "User-Agent: codex-cli",
+        "https://api.openai.com/v1/me",
+    });
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+        .max_output_bytes = 1024 * 1024,
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code != 0) return null;
+        },
+        else => return null,
+    }
+
+    const newline_index = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return null;
+    const body_slice = result.stdout[0..newline_index];
+    const status_slice = std.mem.trim(u8, result.stdout[newline_index + 1 ..], " \r\n\t");
+    const status_code = std.fmt.parseInt(u16, status_slice, 10) catch 599;
+    if (status_code < 200 or status_code >= 300) {
+        return null;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_slice, .{}) catch return null;
+    defer parsed.deinit();
+    const root = jsonGetObject(parsed.value) orelse return null;
+    const email_value = root.get("email") orelse return null;
+    const email = jsonGetString(email_value) orelse return null;
+    return try allocator.dupe(u8, email);
+}
+
 fn accountMatchesIdentity(account: *const ManagedAccount, account_id: ?[]const u8, email: ?[]const u8) bool {
     if (account_id != null and account.account_id != null and std.mem.eql(u8, account_id.?, account.account_id.?)) return true;
     if (email != null and account.email != null and std.mem.eql(u8, email.?, account.email.?)) return true;
@@ -1996,9 +2164,10 @@ fn handleSwitchAccountCommand(allocator: std.mem.Allocator, account_id_raw: []co
     try setStoreActiveAccountId(allocator, &state.store, account.id);
     try writeCodexAuthPath(allocator, state.paths.codexAuthPath, account.auth_json);
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
 }
 
 fn handleMoveAccountCommand(
@@ -2056,9 +2225,10 @@ fn handleMoveAccountCommand(
 
     try state.store.accounts.insert(allocator, insert_index, moved);
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
 }
 
 fn handleRemoveAccountCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
@@ -2083,9 +2253,10 @@ fn handleRemoveAccountCommand(allocator: std.mem.Allocator, account_id_raw: []co
         usage_entry.deinit(allocator);
     }
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
 }
 
 fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[]const u8) ![]u8 {
@@ -2103,9 +2274,10 @@ fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[
     defer allocator.free(auth_json);
 
     _ = try upsertAccountFromAuth(allocator, &state.store, auth_json, normalized_label, true);
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
 }
 
 fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []const u8, label_raw: ?[]const u8) ![]u8 {
@@ -2126,9 +2298,10 @@ fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []con
     try writeCodexAuthPath(allocator, state.paths.codexAuthPath, auth_json);
     _ = try upsertAccountFromAuth(allocator, &state.store, auth_json, label, true);
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
 }
 
 fn handleCompleteCodexLoginCommand(allocator: std.mem.Allocator, auth_payload_raw: []const u8, label_raw: ?[]const u8) ![]u8 {
@@ -2151,9 +2324,10 @@ fn handleCompleteCodexLoginCommand(allocator: std.mem.Allocator, auth_payload_ra
     try writeCodexAuthPath(allocator, state.paths.codexAuthPath, auth_payload);
     _ = try upsertAccountFromAuth(allocator, &state.store, auth_payload, label, true);
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const view_json = try buildAccountsViewJson(allocator, &state);
+    defer allocator.free(view_json);
+    return jsonOkRaw(allocator, view_json);
 }
 
 fn handleUpdateUiPreferencesCommand(allocator: std.mem.Allocator, request: RpcRequest) ![]u8 {
@@ -2191,9 +2365,10 @@ fn handleUpdateUiPreferencesCommand(allocator: std.mem.Allocator, request: RpcRe
         state.preferences.usage_refresh_display_mode = try allocator.dupe(u8, trimmed);
     }
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+    const preferences_json = try buildUiPreferencesResponseJson(allocator, &state.preferences);
+    defer allocator.free(preferences_json);
+    return jsonOkRaw(allocator, preferences_json);
 }
 
 fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
@@ -2204,9 +2379,31 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         defer managed_files_mutex.unlock();
         var debounced_state = try loadAppState(allocator);
         defer debounced_state.deinit(allocator);
-        const debounced_snapshot = try buildSnapshotJson(allocator, &debounced_state);
-        defer allocator.free(debounced_snapshot);
-        return jsonOkRaw(allocator, debounced_snapshot);
+
+        const usage_idx = usageEntryIndex(debounced_state.usage_by_id.items, account_id) orelse {
+            var unavailable = try makeCreditsInfo(allocator, nowEpochSeconds(), .unavailable, "No usage data available for this account.");
+            defer unavailable.deinit(allocator);
+            const email = blk: {
+                const idx = accountIndex(&debounced_state.store, account_id) orelse break :blk null;
+                break :blk debounced_state.store.accounts.items[idx].email;
+            };
+            const debounced_response = try buildRefreshUsageResponseJson(allocator, account_id, &unavailable, email);
+            defer allocator.free(debounced_response);
+            return jsonOkRaw(allocator, debounced_response);
+        };
+
+        const account_email = blk: {
+            const idx = accountIndex(&debounced_state.store, account_id) orelse break :blk null;
+            break :blk debounced_state.store.accounts.items[idx].email;
+        };
+        const debounced_response = try buildRefreshUsageResponseJson(
+            allocator,
+            account_id,
+            &debounced_state.usage_by_id.items[usage_idx].credits,
+            account_email,
+        );
+        defer allocator.free(debounced_response);
+        return jsonOkRaw(allocator, debounced_response);
     }
 
     try setRefreshInflight(account_id, true);
@@ -2216,6 +2413,9 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     defer if (auth_json_copy) |auth| allocator.free(auth);
     var account_id_hint: ?[]u8 = null;
     defer if (account_id_hint) |value| allocator.free(value);
+    var needs_email_backfill = false;
+    var fetched_email: ?[]u8 = null;
+    defer if (fetched_email) |email| allocator.free(email);
 
     managed_files_mutex.lock();
     {
@@ -2230,8 +2430,17 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         if (account.account_id) |value| {
             account_id_hint = try allocator.dupe(u8, value);
         }
+        needs_email_backfill = account.email == null;
     }
     managed_files_mutex.unlock();
+
+    if (needs_email_backfill) {
+        const access_token = extractAccessTokenFromAuthJson(allocator, auth_json_copy.?);
+        defer if (access_token) |token| allocator.free(token);
+        if (access_token) |token| {
+            fetched_email = fetchEmailFromOpenAiApi(allocator, token) catch null;
+        }
+    }
 
     var refreshed_credits = try fetchCreditsFromAuthJson(allocator, auth_json_copy.?, account_id_hint);
     errdefer refreshed_credits.deinit(allocator);
@@ -2241,7 +2450,14 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
-    _ = accountIndex(&state.store, account_id) orelse return jsonError(allocator, "Account not found.");
+    const account_idx = accountIndex(&state.store, account_id) orelse return jsonError(allocator, "Account not found.");
+
+    if (fetched_email) |email| {
+        const account = &state.store.accounts.items[account_idx];
+        if (account.email == null) {
+            account.email = try allocator.dupe(u8, email);
+        }
+    }
 
     if (usageEntryIndex(state.usage_by_id.items, account_id)) |idx| {
         var old = state.usage_by_id.items[idx];
@@ -2261,9 +2477,19 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     // Ownership moved into state.usage_by_id.
     refreshed_credits = undefined;
 
-    const snapshot = try persistStateAndBuildSnapshot(allocator, &state);
-    defer allocator.free(snapshot);
-    return jsonOkRaw(allocator, snapshot);
+    try persistStateFilesOnly(allocator, &state);
+
+    const updated_usage_idx = usageEntryIndex(state.usage_by_id.items, account_id) orelse {
+        return jsonError(allocator, "Internal usage update error.");
+    };
+    const response_json = try buildRefreshUsageResponseJson(
+        allocator,
+        account_id,
+        &state.usage_by_id.items[updated_usage_idx].credits,
+        state.store.accounts.items[account_idx].email,
+    );
+    defer allocator.free(response_json);
+    return jsonOkRaw(allocator, response_json);
 }
 
 fn usageFetchKeyForRequest(allocator: std.mem.Allocator, access_token: []const u8, account_id: ?[]const u8) ![]u8 {

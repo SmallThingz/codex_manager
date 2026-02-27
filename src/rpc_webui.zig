@@ -1,18 +1,28 @@
 const std = @import("std");
 const rpc = @import("rpc.zig");
 
+const RawJson = struct {
+    data: []const u8,
+
+    pub fn jsonStringify(self: @This(), jws: anytype) !void {
+        try jws.beginWriteRaw();
+        try jws.writer.writeAll(self.data);
+        jws.endWriteRaw();
+    }
+};
+
 pub const RpcBridgeMethods = struct {
-    pub fn call(target_fn: []const u8, request_text: []const u8) []const u8 {
+    pub fn call(target_fn: []const u8, request_text: []const u8) RawJson {
         if (!std.mem.eql(u8, target_fn, "cm_rpc")) {
-            return "{\"ok\":false,\"error\":\"unknown bridge function\"}";
+            return .{ .data = "{\"ok\":false,\"error\":\"unknown bridge function\"}" };
         }
 
         const cancel_ptr = bridge_cancel_ptr orelse {
-            return "{\"ok\":false,\"error\":\"RPC bridge not initialized\"}";
+            return .{ .data = "{\"ok\":false,\"error\":\"RPC bridge not initialized\"}" };
         };
 
         const rpc_response = rpc.handleRpcText(std.heap.page_allocator, request_text, cancel_ptr) catch {
-            return "{\"ok\":false,\"error\":\"internal RPC failure\"}";
+            return .{ .data = "{\"ok\":false,\"error\":\"internal RPC failure\"}" };
         };
         defer std.heap.page_allocator.free(rpc_response);
 
@@ -20,12 +30,12 @@ pub const RpcBridgeMethods = struct {
         defer bridge_response_lock.unlock();
 
         if (rpc_response.len > bridge_response_storage.len) {
-            return "{\"ok\":false,\"error\":\"RPC response exceeds bridge buffer\"}";
+            return .{ .data = "{\"ok\":false,\"error\":\"RPC response exceeds bridge buffer\"}" };
         }
 
         @memcpy(bridge_response_storage[0..rpc_response.len], rpc_response);
         bridge_response_len = rpc_response.len;
-        return bridge_response_storage[0..bridge_response_len];
+        return .{ .data = bridge_response_storage[0..bridge_response_len] };
     }
 };
 

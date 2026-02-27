@@ -11,14 +11,9 @@ const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
 
 export type AccountSummary = {
   id: string;
-  label: string | null;
   accountId: string | null;
   email: string | null;
-  archived: boolean;
-  frozen: boolean;
-  isActive: boolean;
-  updatedAt: number;
-  lastUsedAt: number | null;
+  state: "active" | "archived" | "frozen";
 };
 
 export type AccountBucket = "active" | "depleted" | "frozen";
@@ -100,11 +95,6 @@ type OAuthCallbackPollResponse = {
 type BridgeResult<T> = {
   ok: boolean;
   value?: T;
-  error?: string;
-};
-
-type RpcBridgeHttpResponse = {
-  value?: unknown;
   error?: string;
 };
 
@@ -238,14 +228,12 @@ const asAccountsView = (value: unknown): AccountsView | null => {
 
       return {
         id: account.id,
-        label: normalizeOptional(typeof account.label === "string" ? account.label : null),
         accountId: normalizeOptional(typeof account.accountId === "string" ? account.accountId : null),
         email: normalizeOptional(typeof account.email === "string" ? account.email : null),
-        archived: Boolean(account.archived),
-        frozen: Boolean(account.frozen),
-        isActive: Boolean(account.isActive),
-        updatedAt: valueAsNumber(account.updatedAt) ?? 0,
-        lastUsedAt: valueAsNumber(account.lastUsedAt),
+        state:
+          account.state === "archived" || account.state === "frozen" || account.state === "active"
+            ? account.state
+            : "active",
       };
     })
     .filter((entry): entry is AccountSummary => entry !== null);
@@ -335,40 +323,39 @@ const asSnapshot = (value: unknown): AppStateSnapshot => {
   };
 };
 
-const parseBridgeResult = <T>(op: string, rawResponse: string): T => {
-  const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
-  if (!parsed.ok) {
-    throw new Error(parsed.error || `Backend bridge call failed for op "${op}".`);
-  }
-  return parsed.value as T;
-};
-
-const extractBridgeRawResponse = (op: string, value: unknown): string => {
+const decodeBridgeValue = <T>(op: string, value: unknown): T => {
   if (typeof value === "string") {
     try {
-      const parsed = JSON.parse(value) as unknown;
-      const parsedRecord = asRecord(parsed);
-      if (parsedRecord && typeof parsedRecord.value === "string" && parsedRecord.ok === undefined) {
-        return parsedRecord.value;
-      }
+      return decodeBridgeValue<T>(op, JSON.parse(value) as unknown);
     } catch {
-      // keep raw
+      return value as T;
     }
-
-    return value;
   }
 
   const record = asRecord(value);
-  if (record) {
-    if (record.ok !== undefined) {
-      return JSON.stringify(record);
-    }
-    if (typeof record.value === "string") {
-      return record.value;
-    }
+  if (!record) {
+    return value as T;
   }
 
-  throw new Error(`Backend bridge call failed for op "${op}".`);
+  if (typeof record.ok === "boolean") {
+    const bridged = record as BridgeResult<T>;
+    if (!bridged.ok) {
+      throw new Error(bridged.error || `Backend bridge call failed for op "${op}".`);
+    }
+    return bridged.value as T;
+  }
+
+  if (record.value !== undefined || record.error !== undefined) {
+    if (typeof record.error === "string") {
+      throw new Error(record.error);
+    }
+    if (record.value === undefined) {
+      throw new Error(`Backend bridge call failed for op "${op}".`);
+    }
+    return decodeBridgeValue<T>(op, record.value);
+  }
+
+  return value as T;
 };
 
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
@@ -396,17 +383,8 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
   }
 
   const rawResponse = await response.text();
-  const rpcResponse = JSON.parse(rawResponse) as RpcBridgeHttpResponse;
-
-  if (rpcResponse.value !== undefined) {
-    return parseBridgeResult<T>(op, extractBridgeRawResponse(op, rpcResponse.value));
-  }
-
-  if (typeof rpcResponse.error === "string") {
-    throw new Error(rpcResponse.error);
-  }
-
-  throw new Error(`Backend bridge call failed for op "${op}".`);
+  const parsedResponse = JSON.parse(rawResponse) as unknown;
+  return decodeBridgeValue<T>(op, parsedResponse);
 };
 
 const loadBackendApis = async (): Promise<BackendApis> => {
@@ -430,10 +408,64 @@ const refreshSnapshot = async (): Promise<AppStateSnapshot> => {
   return snapshot;
 };
 
-const updateSnapshot = (snapshot: unknown): AppStateSnapshot => {
-  const normalized = asSnapshot(snapshot);
-  lastSnapshot = normalized;
-  return normalized;
+const emptyView = (): AccountsView => ({
+  accounts: [],
+  activeAccountId: null,
+  activeDiskAccountId: null,
+  codexAuthExists: false,
+  codexAuthPath: "",
+  storePath: "",
+});
+
+const updateLastSnapshotView = (view: AccountsView): void => {
+  if (!lastSnapshot) {
+    return;
+  }
+
+  lastSnapshot = {
+    ...lastSnapshot,
+    view,
+    savedAt: nowEpoch(),
+  };
+};
+
+const updateLastSnapshotPreferences = (value: unknown): void => {
+  if (!lastSnapshot) {
+    return;
+  }
+
+  const parsed = asRecord(value);
+  if (!parsed) {
+    return;
+  }
+
+  lastSnapshot = {
+    ...lastSnapshot,
+    theme: parsed.theme === "light" || parsed.theme === "dark" ? parsed.theme : lastSnapshot.theme,
+    autoArchiveZeroQuota: valueAsBoolean(parsed.autoArchiveZeroQuota) ?? lastSnapshot.autoArchiveZeroQuota,
+    autoUnarchiveNonZeroQuota:
+      valueAsBoolean(parsed.autoUnarchiveNonZeroQuota) ?? lastSnapshot.autoUnarchiveNonZeroQuota,
+    autoSwitchAwayFromArchived:
+      valueAsBoolean(parsed.autoSwitchAwayFromArchived) ?? lastSnapshot.autoSwitchAwayFromArchived,
+    autoRefreshActiveEnabled: valueAsBoolean(parsed.autoRefreshActiveEnabled) ?? lastSnapshot.autoRefreshActiveEnabled,
+    autoRefreshActiveIntervalSec: normalizeAutoRefreshIntervalSec(
+      parsed.autoRefreshActiveIntervalSec ?? lastSnapshot.autoRefreshActiveIntervalSec,
+    ),
+    usageRefreshDisplayMode: normalizeUsageRefreshDisplayMode(
+      parsed.usageRefreshDisplayMode ?? lastSnapshot.usageRefreshDisplayMode,
+    ),
+    savedAt: nowEpoch(),
+  };
+};
+
+const parseAccountsViewResponse = (payload: unknown, opName: string): AccountsView => {
+  const view = asAccountsView(payload);
+  if (view) {
+    updateLastSnapshotView(view);
+    return view;
+  }
+
+  throw new Error(`Unexpected ${opName} response from backend.`);
 };
 
 const randomBase64Url = (size: number): string => {
@@ -693,8 +725,8 @@ export const getSavedTheme = async (): Promise<"light" | "dark" | null> => {
 
 export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
   const tauri = await loadBackendApis();
-  const snapshot = await tauri.invoke<unknown>("update_ui_preferences", { theme });
-  updateSnapshot(snapshot);
+  const response = await tauri.invoke<unknown>("update_ui_preferences", { theme });
+  updateLastSnapshotPreferences(response);
 };
 
 export const updateUiPreferences = async (
@@ -704,28 +736,21 @@ export const updateUiPreferences = async (
     usageRefreshDisplayMode: "date" | "remaining";
     theme: "light" | "dark";
   }>,
-): Promise<AppStateSnapshot> => {
+): Promise<void> => {
   const tauri = await loadBackendApis();
-  const snapshot = await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
-  return updateSnapshot(snapshot);
+  const response = await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
+  updateLastSnapshotPreferences(response);
 };
 
 export const getAccounts = async (): Promise<AccountsView> => {
   const snapshot = await refreshSnapshot();
-  return snapshot.view ?? {
-    accounts: [],
-    activeAccountId: null,
-    activeDiskAccountId: null,
-    codexAuthExists: false,
-    codexAuthPath: "",
-    storePath: "",
-  };
+  return snapshot.view ?? emptyView();
 };
 
 export const importCurrentAccount = async (label?: string): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
-  const snapshot = updateSnapshot(await tauri.invoke<unknown>("import_current_account", { label }));
-  return snapshot.view ?? (await getAccounts());
+  const view = await tauri.invoke<unknown>("import_current_account", { label });
+  return parseAccountsViewResponse(view, "import_current_account");
 };
 
 export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
@@ -788,17 +813,18 @@ export const completeCodexLogin = async (callbackUrl?: string, label?: string): 
   const auth = buildChatgptAuthPayload(tokens, apiKey);
 
   const tauri = await loadBackendApis();
-  const snapshot = updateSnapshot(
+  const view = parseAccountsViewResponse(
     await tauri.invoke<unknown>("complete_codex_login", {
       authPayload: JSON.stringify(auth),
       label,
     }),
+    "complete_codex_login",
   );
 
   pendingBrowserLogin = null;
 
   return {
-    view: snapshot.view ?? (await getAccounts()),
+    view,
     output: "ChatGPT login completed.",
   };
 };
@@ -810,23 +836,24 @@ export const codexLoginWithApiKey = async (apiKey: string, label?: string): Prom
   }
 
   const tauri = await loadBackendApis();
-  const snapshot = updateSnapshot(
+  const view = parseAccountsViewResponse(
     await tauri.invoke<unknown>("login_with_api_key", {
       apiKey: normalized,
       label,
     }),
+    "login_with_api_key",
   );
 
   return {
-    view: snapshot.view ?? (await getAccounts()),
+    view,
     output: "API key login completed.",
   };
 };
 
 export const switchAccount = async (id: string): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
-  const snapshot = updateSnapshot(await tauri.invoke<unknown>("switch_account", { accountId: id }));
-  return snapshot.view ?? (await getAccounts());
+  const view = await tauri.invoke<unknown>("switch_account", { accountId: id });
+  return parseAccountsViewResponse(view, "switch_account");
 };
 
 export const moveAccount = async (
@@ -836,16 +863,13 @@ export const moveAccount = async (
   options?: { switchAwayFromMoved?: boolean },
 ): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
-  const snapshot = updateSnapshot(
-    await tauri.invoke<unknown>("move_account", {
+  const view = await tauri.invoke<unknown>("move_account", {
       accountId: id,
       targetBucket,
       targetIndex,
       switchAwayFromMoved: options?.switchAwayFromMoved,
-    }),
-  );
-
-  return snapshot.view ?? (await getAccounts());
+    });
+  return parseAccountsViewResponse(view, "move_account");
 };
 
 export const archiveAccount = async (
@@ -863,8 +887,8 @@ export const unarchiveAccount = async (id: string): Promise<AccountsView> => {
 
 export const removeAccount = async (id: string): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
-  const snapshot = updateSnapshot(await tauri.invoke<unknown>("remove_account", { accountId: id }));
-  return snapshot.view ?? (await getAccounts());
+  const view = await tauri.invoke<unknown>("remove_account", { accountId: id });
+  return parseAccountsViewResponse(view, "remove_account");
 };
 
 export const getRemainingCreditsForAccount = async (id: string): Promise<CreditsInfo> => {
@@ -875,8 +899,35 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
 
   const pending = (async (): Promise<CreditsInfo> => {
     const tauri = await loadBackendApis();
-    const snapshot = updateSnapshot(await tauri.invoke<unknown>("refresh_account_usage", { accountId: id }));
-    return snapshot.usageById[id] ?? defaultCreditsInfo("No usage data available for this account.");
+    const payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
+    const record = asRecord(payload);
+    if (record) {
+      const credits = asCreditsInfo(record.credits);
+      if (credits) {
+        if (lastSnapshot) {
+          const email = normalizeOptional(typeof record.email === "string" ? record.email : null);
+          const nextView = lastSnapshot.view
+            ? {
+                ...lastSnapshot.view,
+                accounts: lastSnapshot.view.accounts.map((account) =>
+                  account.id === id && email && !account.email ? { ...account, email } : account,
+                ),
+              }
+            : lastSnapshot.view;
+          lastSnapshot = {
+            ...lastSnapshot,
+            view: nextView,
+            usageById: {
+              ...lastSnapshot.usageById,
+              [id]: credits,
+            },
+            savedAt: nowEpoch(),
+          };
+        }
+        return credits;
+      }
+    }
+    return defaultCreditsInfo("No usage data available for this account.");
   })();
 
   inflightRefreshByAccountId.set(id, pending);
