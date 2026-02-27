@@ -149,12 +149,8 @@ type BridgeResult<T> = {
 
 let backendApisPromise: Promise<BackendApis> | null = null;
 
-type WebUiBridge = {
-  call?: (fn: string, ...args: unknown[]) => Promise<string> | string;
-};
-
 type RpcBridgeHttpResponse = {
-  value?: string;
+  value?: unknown;
   error?: string;
   job_id?: number;
   state?: string;
@@ -164,7 +160,7 @@ type RpcBridgeHttpResponse = {
 
 type RpcJobHttpStatus = {
   state?: string;
-  value?: string;
+  value?: unknown;
   error_message?: string | null;
 };
 
@@ -172,6 +168,29 @@ const waitMs = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+
+const extractBridgeRawResponse = (op: string, value: unknown): string => {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      const parsedRecord = asRecord(parsed);
+      if (parsedRecord && typeof parsedRecord.value === "string" && parsedRecord.ok === undefined) {
+        return parsedRecord.value;
+      }
+    } catch {
+      // Keep raw string when it is not a JSON envelope.
+    }
+
+    return value;
+  }
+
+  const record = asRecord(value);
+  if (record && typeof record.value === "string") {
+    return record.value;
+  }
+
+  throw new Error(`Backend bridge call failed for op "${op}".`);
+};
 
 const parseBridgeResult = <T>(op: string, rawResponse: string): T => {
   const parsed = JSON.parse(rawResponse) as BridgeResult<T>;
@@ -206,10 +225,7 @@ const pollQueuedRpcBridgeValue = async (
     const status = JSON.parse(await response.text()) as RpcJobHttpStatus;
     switch (status.state) {
       case "completed":
-        if (typeof status.value !== "string") {
-          throw new Error(`Backend bridge call failed for op "${op}".`);
-        }
-        return status.value;
+        return extractBridgeRawResponse(op, status.value);
       case "queued":
       case "running":
         break;
@@ -231,94 +247,52 @@ const pollQueuedRpcBridgeValue = async (
 };
 
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
+  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") {
+    throw new Error(`Backend RPC requires an HTTP(S) session, got ${window.location.protocol}.`);
+  }
+
   const request = JSON.stringify({
     op,
     ...payload,
   });
 
-  let lastBridgeError: string | null = null;
+  const rpcPayload = JSON.stringify({
+    name: "call",
+    args: ["cm_rpc", request],
+  });
+  const response = await fetch("/rpc", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: rpcPayload,
+    cache: "no-store",
+  });
 
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 15000) {
-    if (typeof window.cm_rpc === "function") {
-      try {
-        const rawResponse = await window.cm_rpc(request);
-        return parseBridgeResult<T>(op, rawResponse);
-      } catch (error) {
-        lastBridgeError = error instanceof Error ? error.message : String(error);
-      }
-    }
-
-    const webuiCall = (window as Window & { webui?: WebUiBridge }).webui?.call;
-    if (typeof webuiCall === "function") {
-      try {
-        const rawResponse = await webuiCall("cm_rpc", request);
-        return parseBridgeResult<T>(op, rawResponse);
-      } catch (error) {
-        lastBridgeError = error instanceof Error ? error.message : String(error);
-      }
-    }
-
-    if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-      try {
-        const rpcPayload = JSON.stringify({
-          name: "call",
-          args: ["cm_rpc", request],
-        });
-        const response = await fetch("/rpc", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: rpcPayload,
-          cache: "no-store",
-        });
-        if (!response.ok) {
-          lastBridgeError = `HTTP bridge request failed (${response.status}).`;
-        } else {
-          const rawResponse = await response.text();
-          const rpcResponse = JSON.parse(rawResponse) as RpcBridgeHttpResponse;
-
-          if (typeof rpcResponse.value === "string") {
-            return parseBridgeResult<T>(op, rpcResponse.value);
-          }
-
-          if (typeof rpcResponse.job_id === "number") {
-            const pollMinMs = typeof rpcResponse.poll_min_ms === "number" ? rpcResponse.poll_min_ms : 100;
-            const pollMaxMs =
-              typeof rpcResponse.poll_max_ms === "number" ? rpcResponse.poll_max_ms : Math.max(pollMinMs, 750);
-            const bridgedValue = await pollQueuedRpcBridgeValue(op, rpcResponse.job_id, pollMinMs, pollMaxMs);
-            return parseBridgeResult<T>(op, bridgedValue);
-          }
-
-          if (typeof rpcResponse.error === "string") {
-            throw new Error(rpcResponse.error);
-          }
-
-          throw new Error(`Backend bridge call failed for op "${op}".`);
-        }
-      } catch (error) {
-        lastBridgeError = error instanceof Error ? error.message : String(error);
-      }
-    }
-
-    await waitMs(75);
+  if (!response.ok) {
+    throw new Error(`HTTP bridge request failed (${response.status}).`);
   }
 
-  const hasCmRpc = typeof window.cm_rpc === "function";
-  const hasWebUiObject = typeof (window as Window & { webui?: WebUiBridge }).webui !== "undefined";
-  const hasWebUiCall = typeof (window as Window & { webui?: WebUiBridge }).webui?.call === "function";
+  const rawResponse = await response.text();
+  const rpcResponse = JSON.parse(rawResponse) as RpcBridgeHttpResponse;
 
-  throw new Error(
-    [
-      `Backend RPC unavailable in this session at ${window.location.origin}.`,
-      `has_cm_rpc=${String(hasCmRpc)}`,
-      `has_webui=${String(hasWebUiObject)}`,
-      `has_webui_call=${String(hasWebUiCall)}`,
-      `document_ready_state=${document.readyState}`,
-      lastBridgeError ? `last_bridge_error=${lastBridgeError}` : "last_bridge_error=none",
-    ].join(" "),
-  );
+  if (rpcResponse.value !== undefined) {
+    return parseBridgeResult<T>(op, extractBridgeRawResponse(op, rpcResponse.value));
+  }
+
+  if (typeof rpcResponse.job_id === "number") {
+    const pollMinMs = typeof rpcResponse.poll_min_ms === "number" ? rpcResponse.poll_min_ms : 100;
+    const pollMaxMs =
+      typeof rpcResponse.poll_max_ms === "number" ? rpcResponse.poll_max_ms : Math.max(pollMinMs, 750);
+    const bridgedValue = await pollQueuedRpcBridgeValue(op, rpcResponse.job_id, pollMinMs, pollMaxMs);
+    return parseBridgeResult<T>(op, bridgedValue);
+  }
+
+  if (typeof rpcResponse.error === "string") {
+    throw new Error(rpcResponse.error);
+  }
+
+  throw new Error(`Backend bridge call failed for op "${op}".`);
 };
 
 const loadBackendApis = async (): Promise<BackendApis> => {
