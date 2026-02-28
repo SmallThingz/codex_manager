@@ -8,6 +8,7 @@ import {
   importCurrentAccount,
   listenForCodexCallback,
   moveAccount,
+  prepareCodexLoginSession,
   removeAccount,
   saveTheme,
   stopCodexCallbackListener,
@@ -1011,7 +1012,7 @@ function App() {
       if (rendered.includes("Callback listener stopped.")) {
         setNotice("Stopped listening for callback.");
       } else if (rendered.includes("No active login session")) {
-        setNotice("Listener is running. Start ChatGPT Login when you're ready.");
+        setNotice("No active login session. Start ChatGPT Login first.");
       } else {
         setError(rendered);
       }
@@ -1043,6 +1044,14 @@ function App() {
     if (isListeningForCallback()) {
       await stopCallbackListener();
       return;
+    }
+
+    if (!browserStart()) {
+      const prepared = await runAction("Preparing callback listener", () => prepareCodexLoginSession());
+      if (!prepared) {
+        return;
+      }
+      setBrowserStart(prepared);
     }
 
     await startCallbackListener();

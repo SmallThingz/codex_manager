@@ -462,6 +462,37 @@ const buildAuthorizeUrl = (
   return `${issuer}/oauth/authorize?${query.toString()}`;
 };
 
+const createPendingBrowserLogin = (): PendingBrowserLogin => ({
+  issuer: CODEX_OAUTH_ISSUER,
+  clientId: CODEX_CLIENT_ID,
+  redirectUri: CODEX_REDIRECT_URI,
+  state: randomBase64Url(32),
+  codeVerifier: randomBase64Url(64),
+  startedAt: nowEpoch(),
+});
+
+const ensurePendingBrowserLogin = (): PendingBrowserLogin => {
+  if (!pendingBrowserLogin) {
+    pendingBrowserLogin = createPendingBrowserLogin();
+  }
+  return pendingBrowserLogin;
+};
+
+const buildBrowserLoginStart = async (pending: PendingBrowserLogin): Promise<BrowserLoginStart> => {
+  const codeChallenge = await sha256Base64Url(pending.codeVerifier);
+  const authUrl = buildAuthorizeUrl(
+    pending.issuer,
+    pending.clientId,
+    pending.redirectUri,
+    codeChallenge,
+    pending.state,
+  );
+  return {
+    authUrl,
+    redirectUri: pending.redirectUri,
+  };
+};
+
 const waitForOAuthCallbackFromBrowser = async (
   pending: PendingBrowserLogin,
   label?: string,
@@ -552,37 +583,18 @@ export const importCurrentAccount = async (label?: string): Promise<AccountsView
   return parseAccountsViewResponse(view, "import_current_account");
 };
 
+export const prepareCodexLoginSession = async (): Promise<BrowserLoginStart> => {
+  const pending = ensurePendingBrowserLogin();
+  return buildBrowserLoginStart(pending);
+};
+
 export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
-  const codeVerifier = randomBase64Url(64);
-  const codeChallenge = await sha256Base64Url(codeVerifier);
-  const state = randomBase64Url(32);
-
-  const pending: PendingBrowserLogin = {
-    issuer: CODEX_OAUTH_ISSUER,
-    clientId: CODEX_CLIENT_ID,
-    redirectUri: CODEX_REDIRECT_URI,
-    state,
-    codeVerifier,
-    startedAt: nowEpoch(),
-  };
-
-  pendingBrowserLogin = pending;
-
-  const authUrl = buildAuthorizeUrl(
-    pending.issuer,
-    pending.clientId,
-    pending.redirectUri,
-    codeChallenge,
-    pending.state,
-  );
+  const pending = ensurePendingBrowserLogin();
+  const start = await buildBrowserLoginStart(pending);
 
   const tauri = await loadBackendApis();
-  await tauri.openUrl(authUrl);
-
-  return {
-    authUrl,
-    redirectUri: pending.redirectUri,
-  };
+  await tauri.openUrl(start.authUrl);
+  return start;
 };
 
 export const listenForCodexCallback = async (): Promise<OAuthLoginResult> => {
