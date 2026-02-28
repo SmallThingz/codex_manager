@@ -6,11 +6,12 @@ import {
   getEmbeddedBootstrapState,
   getRemainingCreditsForAccount,
   importCurrentAccount,
-  listenForCodexCallback,
   moveAccount,
+  pollCodexCallbackListener,
   prepareCodexLoginSession,
   removeAccount,
   saveTheme,
+  startCodexCallbackListener,
   stopCodexCallbackListener,
   switchAccount,
   updateUiPreferences,
@@ -458,6 +459,7 @@ function App() {
   let dragPreviewElement: HTMLDivElement | undefined;
   let contentScrollRef: HTMLElement | undefined;
   let nowTickInterval: number | undefined;
+  let callbackPollTimer: number | undefined;
 
   const activeAccounts = createMemo(
     () => view()?.accounts.filter((account) => account.state === "active") || [],
@@ -979,8 +981,85 @@ function App() {
     }
   };
 
+  const renderCallbackError = (errorCode: string): string => {
+    if (errorCode === "CallbackListenerStopped") return "Callback listener stopped.";
+    if (errorCode === "CallbackListenerTimeout") return "Callback listener timed out.";
+    if (errorCode === "AddressInUse") return "Callback listener port 1455 is already in use.";
+    if (errorCode === "OAuthStateMismatch") return "State mismatch. Start a fresh login and try again.";
+    if (errorCode === "AuthorizationCodeExchangeFailed") return "Token exchange failed. Start a fresh login and try again.";
+    if (errorCode === "OAuthAuthorizationFailed") return "Login authorization failed in browser.";
+    return errorCode;
+  };
+
+  const clearCallbackPollTimer = () => {
+    if (callbackPollTimer !== undefined) {
+      window.clearTimeout(callbackPollTimer);
+      callbackPollTimer = undefined;
+    }
+  };
+
+  const pollCallbackListener = async (runId: number) => {
+    try {
+      const polled = await pollCodexCallbackListener();
+      if (runId !== callbackListenRunId) {
+        return;
+      }
+
+      if (polled.status === "running" || polled.status === "idle") {
+        callbackPollTimer = window.setTimeout(() => {
+          void pollCallbackListener(runId);
+        }, 300);
+        return;
+      }
+
+      if (polled.status === "ready") {
+        const login = {
+          account: polled.account,
+          output: "ChatGPT login completed.",
+        };
+
+        const currentView = view() ?? emptyAccountsView();
+        const nextView = applyOAuthLoginAccountInView(currentView, login.account);
+        setViewState(nextView);
+        setBrowserStart(null);
+        setApiKeyDraft("");
+        if (activeAccountIds(nextView).length > 0) {
+          setAddMenuOpen(false);
+        }
+        setNotice(login.output);
+        await refreshCreditsForAccounts([login.account.id], { quiet: true });
+        setIsListeningForCallback(false);
+        setBusy(null);
+        return;
+      }
+
+      if (polled.status === "error") {
+        const rendered = renderCallbackError(polled.error);
+        if (rendered.includes("Callback listener stopped.")) {
+          setNotice("Stopped listening for callback.");
+        } else if (rendered.includes("No active login session")) {
+          setNotice("No active login session. Start ChatGPT Login first.");
+        } else {
+          setError(rendered);
+        }
+        setIsListeningForCallback(false);
+        setBusy(null);
+        return;
+      }
+    } catch (listenerError) {
+      if (runId !== callbackListenRunId) {
+        return;
+      }
+      const rendered = listenerError instanceof Error ? listenerError.message : String(listenerError);
+      setError(rendered);
+      setIsListeningForCallback(false);
+      setBusy(null);
+    }
+  };
+
   const startCallbackListener = async () => {
     const runId = ++callbackListenRunId;
+    clearCallbackPollTimer();
     setIsListeningForCallback(true);
     setBusy("Listening for browser callback");
     setError(null);
@@ -988,44 +1067,30 @@ function App() {
     setNotice(`Listening for callback at ${callbackUrl}. Click again to stop.`);
 
     try {
-      const login = await listenForCodexCallback();
+      await startCodexCallbackListener();
       if (runId !== callbackListenRunId) {
         return;
       }
-
-      const currentView = view() ?? emptyAccountsView();
-      const nextView = applyOAuthLoginAccountInView(currentView, login.account);
-      setViewState(nextView);
-      setBrowserStart(null);
-      setApiKeyDraft("");
-      if (activeAccountIds(nextView).length > 0) {
-        setAddMenuOpen(false);
-      }
-      setNotice(login.output.length > 0 ? login.output : "ChatGPT login completed.");
-      await refreshCreditsForAccounts([login.account.id], { quiet: true });
+      callbackPollTimer = window.setTimeout(() => {
+        void pollCallbackListener(runId);
+      }, 100);
     } catch (listenerError) {
       if (runId !== callbackListenRunId) {
         return;
       }
 
       const rendered = listenerError instanceof Error ? listenerError.message : String(listenerError);
-      if (rendered.includes("Callback listener stopped.")) {
-        setNotice("Stopped listening for callback.");
-      } else if (rendered.includes("No active login session")) {
-        setNotice("No active login session. Start ChatGPT Login first.");
-      } else {
-        setError(rendered);
-      }
+      setError(rendered);
+      setIsListeningForCallback(false);
+      setBusy(null);
     } finally {
-      if (runId === callbackListenRunId) {
-        setIsListeningForCallback(false);
-        setBusy(null);
-      }
+      // Poll loop owns final lifecycle cleanup.
     }
   };
 
   const stopCallbackListener = async () => {
     callbackListenRunId += 1;
+    clearCallbackPollTimer();
     setBusy("Stopping callback listener");
 
     try {
@@ -1514,6 +1579,7 @@ function App() {
       void maybeAutoRefreshActive(currentEpoch);
     }, 1000);
     onCleanup(() => {
+      clearCallbackPollTimer();
       window.removeEventListener("pointerdown", handlePointerDown);
       window.removeEventListener("pointerup", releaseDragSelectionLock);
       window.removeEventListener("pointercancel", releaseDragSelectionLock);

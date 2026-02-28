@@ -40,6 +40,11 @@ export type OAuthLoginResult = {
   output: string;
 };
 
+export type OAuthCallbackListenerPollResult =
+  | { status: "running" | "idle" }
+  | { status: "ready"; account: AccountSummary }
+  | { status: "error"; error: string };
+
 export type CreditsInfo = {
   available: number | null;
   used: number | null;
@@ -235,6 +240,35 @@ const asAccountSummary = (value: unknown): AccountSummary | null => {
         ? account.state
         : "active",
   };
+};
+
+const asOAuthCallbackListenerPollResult = (value: unknown): OAuthCallbackListenerPollResult => {
+  const parsed = asRecord(value);
+  if (!parsed) {
+    return { status: "error", error: "Invalid callback listener response." };
+  }
+
+  const status = typeof parsed.status === "string" ? parsed.status : null;
+  if (status === "running" || status === "idle") {
+    return { status };
+  }
+
+  if (status === "ready") {
+    const account = asAccountSummary(parsed.account);
+    if (account) {
+      return { status: "ready", account };
+    }
+    return { status: "error", error: "Callback listener returned an invalid account payload." };
+  }
+
+  if (status === "error") {
+    const error = typeof parsed.error === "string" && parsed.error.length > 0
+      ? parsed.error
+      : "Callback listener failed.";
+    return { status: "error", error };
+  }
+
+  return { status: "error", error: "Unknown callback listener status." };
 };
 
 const asCreditsInfo = (value: unknown): CreditsInfo | null => {
@@ -586,6 +620,26 @@ export const importCurrentAccount = async (label?: string): Promise<AccountsView
 export const prepareCodexLoginSession = async (): Promise<BrowserLoginStart> => {
   const pending = ensurePendingBrowserLogin();
   return buildBrowserLoginStart(pending);
+};
+
+export const startCodexCallbackListener = async (label?: string): Promise<void> => {
+  const pending = ensurePendingBrowserLogin();
+  const tauri = await loadBackendApis();
+  await tauri.invoke<unknown>("start_oauth_callback_listener", {
+    timeoutSeconds: 180,
+    issuer: pending.issuer,
+    clientId: pending.clientId,
+    redirectUri: pending.redirectUri,
+    oauthState: pending.state,
+    codeVerifier: pending.codeVerifier,
+    label,
+  });
+};
+
+export const pollCodexCallbackListener = async (): Promise<OAuthCallbackListenerPollResult> => {
+  const tauri = await loadBackendApis();
+  const payload = await tauri.invoke<unknown>("poll_oauth_callback_listener");
+  return asOAuthCallbackListenerPollResult(payload);
 };
 
 export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
