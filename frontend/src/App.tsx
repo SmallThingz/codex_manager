@@ -972,7 +972,7 @@ function App() {
     }
 
     setBrowserStart(started);
-    setNotice("Browser opened. Listening for callback.");
+    setNotice(`Browser opened. Listening for callback at ${started.redirectUri}.`);
     if (!isListeningForCallback()) {
       void startCallbackListener();
     }
@@ -983,7 +983,8 @@ function App() {
     setIsListeningForCallback(true);
     setBusy("Listening for browser callback");
     setError(null);
-    setNotice("Listening for callback. Click again to stop.");
+    const callbackUrl = browserStart()?.redirectUri ?? "http://localhost:1455/auth/callback";
+    setNotice(`Listening for callback at ${callbackUrl}. Click again to stop.`);
 
     try {
       const login = await listenForCodexCallback();

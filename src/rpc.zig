@@ -3569,6 +3569,7 @@ fn startOAuthCallbackListener(
     oauth_listener_state.cancel.store(false, .seq_cst);
     external_cancel.store(false, .seq_cst);
     oauth_listener_state.running = true;
+    std.debug.print("OAuth callback listener URL: {s}\n", .{redirect_uri});
 
     var args = try OAuthThreadArgs.init(
         issuer,
@@ -3637,6 +3638,15 @@ fn waitForOAuthCallbackResult(allocator: std.mem.Allocator) ![]u8 {
         if (std.mem.eql(u8, err_name, "CallbackListenerSocketError")) {
             return error.CallbackListenerSocketError;
         }
+        if (std.mem.eql(u8, err_name, "OAuthAuthorizationFailed")) {
+            return error.OAuthAuthorizationFailed;
+        }
+        if (std.mem.eql(u8, err_name, "OAuthStateMismatch")) {
+            return error.OAuthStateMismatch;
+        }
+        if (std.mem.eql(u8, err_name, "AuthorizationCodeExchangeFailed")) {
+            return error.AuthorizationCodeExchangeFailed;
+        }
         return error.CallbackListenerFailed;
     }
 
@@ -3670,6 +3680,15 @@ fn waitForOAuthReadyAccountResult(allocator: std.mem.Allocator) !OAuthReadyAccou
         }
         if (std.mem.eql(u8, err_name, "CallbackListenerSocketError")) {
             return error.CallbackListenerSocketError;
+        }
+        if (std.mem.eql(u8, err_name, "OAuthAuthorizationFailed")) {
+            return error.OAuthAuthorizationFailed;
+        }
+        if (std.mem.eql(u8, err_name, "OAuthStateMismatch")) {
+            return error.OAuthStateMismatch;
+        }
+        if (std.mem.eql(u8, err_name, "AuthorizationCodeExchangeFailed")) {
+            return error.AuthorizationCodeExchangeFailed;
         }
         return error.CallbackListenerFailed;
     }
