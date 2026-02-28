@@ -35,11 +35,6 @@ export type LoginResult = {
   output: string;
 };
 
-export type OAuthLoginResult = {
-  account: AccountSummary;
-  output: string;
-};
-
 export type OAuthCallbackListenerPollResult =
   | { status: "running" | "idle" }
   | { status: "ready"; account: AccountSummary }
@@ -420,31 +415,6 @@ const parseAccountsViewResponse = (payload: unknown, opName: string): AccountsVi
   throw new Error(`Unexpected ${opName} response from backend.`);
 };
 
-const parseThemeFromPreferencesResponse = (payload: unknown): "light" | "dark" | null => {
-  const parsed = asRecord(payload);
-  if (!parsed) {
-    throw new Error("Unexpected get_ui_preferences response from backend.");
-  }
-
-  return parsed.theme === "light" || parsed.theme === "dark" ? parsed.theme : null;
-};
-
-const parseUsageCacheResponse = (payload: unknown): Record<string, CreditsInfo> => {
-  const parsed = asRecord(payload);
-  if (!parsed) {
-    throw new Error("Unexpected get_usage_cache response from backend.");
-  }
-
-  const usageById: Record<string, CreditsInfo> = {};
-  for (const [id, creditsRaw] of Object.entries(parsed)) {
-    const credits = asCreditsInfo(creditsRaw);
-    if (credits) {
-      usageById[id] = credits;
-    }
-  }
-  return usageById;
-};
-
 const randomBase64Url = (size: number): string => {
   const bytes = new Uint8Array(size);
   crypto.getRandomValues(bytes);
@@ -513,43 +483,6 @@ const buildBrowserLoginStart = async (pending: PendingBrowserLogin): Promise<Bro
   };
 };
 
-const waitForOAuthCallbackFromBrowser = async (
-  pending: PendingBrowserLogin,
-  label?: string,
-): Promise<AccountSummary> => {
-  const tauri = await loadBackendApis();
-
-  const renderCallbackError = (errorCode: string): string => {
-    if (errorCode === "CallbackListenerStopped") return "Callback listener stopped.";
-    if (errorCode === "CallbackListenerTimeout") return "Callback listener timed out.";
-    if (errorCode === "AddressInUse") return "Callback listener port 1455 is already in use.";
-    if (errorCode === "OAuthStateMismatch") return "State mismatch. Start a fresh login and try again.";
-    if (errorCode === "AuthorizationCodeExchangeFailed") return "Token exchange failed. Start a fresh login and try again.";
-    if (errorCode === "OAuthAuthorizationFailed") return "Login authorization failed in browser.";
-    return errorCode;
-  };
-
-  try {
-    const payload = await tauri.invoke<unknown>("wait_for_oauth_callback", {
-      timeoutSeconds: 180,
-      issuer: pending.issuer,
-      clientId: pending.clientId,
-      redirectUri: pending.redirectUri,
-      oauthState: pending.state,
-      codeVerifier: pending.codeVerifier,
-      label,
-    });
-    const account = asAccountSummary(payload);
-    if (!account) {
-      throw new Error("Callback listener returned an invalid account payload.");
-    }
-    return account;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(renderCallbackError(message));
-  }
-};
-
 export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
   if (typeof window === "undefined") {
     return null;
@@ -568,15 +501,8 @@ export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
   }
 };
 
-export const getSavedTheme = async (): Promise<"light" | "dark" | null> => {
-  const tauri = await loadBackendApis();
-  const response = await tauri.invoke<unknown>("get_ui_preferences");
-  return parseThemeFromPreferencesResponse(response);
-};
-
 export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
-  const tauri = await loadBackendApis();
-  await tauri.invoke<unknown>("update_ui_preferences", { theme });
+  await updateUiPreferences({ theme });
 };
 
 export const updateUiPreferences = async (
@@ -589,12 +515,6 @@ export const updateUiPreferences = async (
 ): Promise<void> => {
   const tauri = await loadBackendApis();
   await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
-};
-
-export const getUsageCache = async (): Promise<Record<string, CreditsInfo>> => {
-  const tauri = await loadBackendApis();
-  const usage = await tauri.invoke<unknown>("get_usage_cache");
-  return parseUsageCacheResponse(usage);
 };
 
 export const importCurrentAccount = async (label?: string): Promise<AccountsView> => {
@@ -639,20 +559,6 @@ export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
   const tauri = await loadBackendApis();
   await tauri.openUrl(start.authUrl);
   return start;
-};
-
-export const listenForCodexCallback = async (): Promise<OAuthLoginResult> => {
-  if (!pendingBrowserLogin) {
-    throw new Error("No active login session. Start ChatGPT login first.");
-  }
-
-  const pending = pendingBrowserLogin;
-  const account = await waitForOAuthCallbackFromBrowser(pending);
-  pendingBrowserLogin = null;
-  return {
-    account,
-    output: "ChatGPT login completed.",
-  };
 };
 
 export const stopCodexCallbackListener = async (): Promise<void> => {

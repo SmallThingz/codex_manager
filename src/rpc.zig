@@ -80,9 +80,6 @@ const OAUTH_CALLBACK_SUCCESS_HTML =
 
 pub const RpcRequest = struct {
     op: []const u8,
-    path: ?[]const u8 = null,
-    paths: ?[]const []const u8 = null,
-    contents: ?[]const u8 = null,
     theme: ?[]const u8 = null,
     label: ?[]const u8 = null,
     apiKey: ?[]const u8 = null,
@@ -92,9 +89,7 @@ pub const RpcRequest = struct {
     oauthState: ?[]const u8 = null,
     codeVerifier: ?[]const u8 = null,
     url: ?[]const u8 = null,
-    recursive: ?bool = null,
     timeoutSeconds: ?u64 = null,
-    accessToken: ?[]const u8 = null,
     accountId: ?[]const u8 = null,
     targetBucket: ?[]const u8 = null,
     targetIndex: ?i64 = null,
@@ -105,7 +100,6 @@ pub const RpcRequest = struct {
     autoRefreshActiveEnabled: ?bool = null,
     autoRefreshActiveIntervalSec: ?u64 = null,
     usageRefreshDisplayMode: ?[]const u8 = null,
-    requestId: ?u64 = null,
 };
 
 const UsageResult = struct {
@@ -174,56 +168,6 @@ var oauth_listener_state = OAuthListenerState{};
 
 const USAGE_FETCH_DEBOUNCE_MS: i64 = 15 * 1000;
 
-const UsageFetchEntry = struct {
-    key: []u8,
-    last_request_id: u64 = 0,
-    inflight: bool = false,
-    last_started_ms: i64 = 0,
-    last_completed_ms: i64 = 0,
-    last_status: u16 = 0,
-    last_body: ?[]u8 = null,
-};
-
-const UsageFetchState = struct {
-    mutex: std.Thread.Mutex = .{},
-    entries: std.ArrayListUnmanaged(UsageFetchEntry) = .{},
-    next_request_id: u64 = 1,
-};
-
-const UsageFetchWorkerArgs = struct {
-    key: []u8,
-    access_token: []u8,
-    account_id: ?[]u8,
-    request_id: u64,
-
-    fn init(access_token: []const u8, account_id: ?[]const u8, key: []const u8, request_id: u64) !UsageFetchWorkerArgs {
-        const key_copy = try std.heap.page_allocator.dupe(u8, key);
-        errdefer std.heap.page_allocator.free(key_copy);
-
-        const token_copy = try std.heap.page_allocator.dupe(u8, access_token);
-        errdefer std.heap.page_allocator.free(token_copy);
-
-        const account_copy = if (account_id) |id| try std.heap.page_allocator.dupe(u8, id) else null;
-        errdefer if (account_copy) |id| std.heap.page_allocator.free(id);
-
-        return .{
-            .key = key_copy,
-            .access_token = token_copy,
-            .account_id = account_copy,
-            .request_id = request_id,
-        };
-    }
-
-    fn deinit(self: *UsageFetchWorkerArgs) void {
-        std.heap.page_allocator.free(self.key);
-        std.heap.page_allocator.free(self.access_token);
-        if (self.account_id) |id| {
-            std.heap.page_allocator.free(id);
-        }
-    }
-};
-
-var usage_fetch_state = UsageFetchState{};
 var managed_files_mutex: std.Thread.Mutex = .{};
 var refresh_debounce_state: std.Thread.Mutex = .{};
 var refresh_debounce_entries: std.ArrayListUnmanaged(struct {
@@ -311,9 +255,6 @@ const ManagedAccount = struct {
     archived: bool = false,
     frozen: bool = false,
     auth_json: []u8,
-    created_at: i64,
-    updated_at: i64,
-    last_used_at: ?i64 = null,
 
     fn deinit(self: *ManagedAccount, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -370,10 +311,6 @@ const AppState = struct {
     }
 };
 
-pub fn handleRpcText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
-    return rpcFromText(allocator, request_text, cancel_ptr);
-}
-
 pub fn handleRpcRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     return rpcHandleRequest(allocator, request, cancel_ptr);
 }
@@ -390,135 +327,7 @@ fn jsonOkRaw(allocator: std.mem.Allocator, raw_value: []const u8) ![]u8 {
     return allocator.dupe(u8, raw_value);
 }
 
-fn rpcFromText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const request = std.json.parseFromSliceLeaky(RpcRequest, arena.allocator(), request_text, .{
-        .ignore_unknown_fields = true,
-    }) catch {
-        return jsonError(allocator, "invalid RPC payload");
-    };
-
-    return rpcHandleRequest(allocator, request, cancel_ptr);
-}
-
 fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
-    if (std.mem.eql(u8, request.op, "path:home_dir")) {
-        const home = getHomeDir(allocator) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(home);
-        return jsonOk(allocator, home);
-    }
-
-    if (std.mem.eql(u8, request.op, "path:app_local_data_dir")) {
-        const dir = getAppLocalDataDir(allocator) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(dir);
-        return jsonOk(allocator, dir);
-    }
-
-    if (std.mem.eql(u8, request.op, "path:join")) {
-        const paths = request.paths orelse return jsonError(allocator, "path join requires paths");
-        if (paths.len == 0) {
-            return jsonError(allocator, "path join requires at least one segment");
-        }
-
-        const joined = std.fs.path.join(allocator, paths) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(joined);
-        return jsonOk(allocator, joined);
-    }
-
-    if (std.mem.eql(u8, request.op, "settings:get_theme")) {
-        const settings_path = getThemeSettingsPath(allocator) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(settings_path);
-
-        if (!pathExists(settings_path)) {
-            return jsonOk(allocator, @as(?[]const u8, null));
-        }
-
-        const contents = readTextFile(allocator, settings_path) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(contents);
-
-        const trimmed = std.mem.trim(u8, contents, " \r\n\t");
-        if (trimmed.len == 0) {
-            return jsonOk(allocator, @as(?[]const u8, null));
-        }
-
-        return jsonOk(allocator, trimmed);
-    }
-
-    if (std.mem.eql(u8, request.op, "settings:set_theme")) {
-        const theme = request.theme orelse return jsonError(allocator, "set_theme requires theme");
-        const trimmed = std.mem.trim(u8, theme, " \r\n\t");
-        if (trimmed.len == 0) {
-            return jsonError(allocator, "set_theme requires non-empty theme");
-        }
-
-        const settings_path = getThemeSettingsPath(allocator) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(settings_path);
-
-        writeTextFile(settings_path, trimmed) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-
-        return jsonOk(allocator, @as(?u8, null));
-    }
-
-    if (std.mem.eql(u8, request.op, "fs:exists")) {
-        const path = request.path orelse return jsonError(allocator, "exists requires path");
-        return jsonOk(allocator, pathExists(path));
-    }
-
-    if (std.mem.eql(u8, request.op, "fs:mkdir")) {
-        const path = request.path orelse return jsonError(allocator, "mkdir requires path");
-        const recursive = request.recursive orelse false;
-
-        if (recursive) {
-            std.fs.cwd().makePath(path) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        } else {
-            std.fs.makeDirAbsolute(path) catch |err| {
-                if (err != error.PathAlreadyExists) {
-                    return jsonError(allocator, @errorName(err));
-                }
-            };
-        }
-
-        return jsonOk(allocator, @as(?u8, null));
-    }
-
-    if (std.mem.eql(u8, request.op, "fs:read_text")) {
-        const path = request.path orelse return jsonError(allocator, "read_text requires path");
-        const text = readTextFile(allocator, path) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-        defer allocator.free(text);
-        return jsonOk(allocator, text);
-    }
-
-    if (std.mem.eql(u8, request.op, "fs:write_text")) {
-        const path = request.path orelse return jsonError(allocator, "write_text requires path");
-        const contents = request.contents orelse return jsonError(allocator, "write_text requires contents");
-
-        writeTextFile(path, contents) catch |err| {
-            return jsonError(allocator, @errorName(err));
-        };
-
-        return jsonOk(allocator, @as(?u8, null));
-    }
-
     if (std.mem.eql(u8, request.op, "shell:open_url")) {
         const url = request.url orelse return jsonError(allocator, "open_url requires url");
         openUrl(url, allocator) catch |err| {
@@ -529,24 +338,6 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
 
     if (std.mem.startsWith(u8, request.op, "invoke:")) {
         const command = request.op["invoke:".len..];
-
-        if (std.mem.eql(u8, command, "get_app_state")) {
-            return handleGetAppStateCommand(allocator) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        }
-
-        if (std.mem.eql(u8, command, "get_usage_cache")) {
-            return handleGetUsageCacheCommand(allocator) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        }
-
-        if (std.mem.eql(u8, command, "get_ui_preferences")) {
-            return handleGetUiPreferencesCommand(allocator) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        }
 
         if (std.mem.eql(u8, command, "refresh_account_usage")) {
             const account_id = request.accountId orelse return jsonError(allocator, "refresh_account_usage requires accountId");
@@ -629,63 +420,10 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
             return jsonOk(allocator, polled);
         }
 
-        if (std.mem.eql(u8, command, "wait_for_oauth_callback")) {
-            const timeout_seconds = request.timeoutSeconds orelse 180;
-            const issuer = trimOptionalString(request.issuer) orelse return jsonError(allocator, "wait_for_oauth_callback requires issuer");
-            const client_id = trimOptionalString(request.clientId) orelse return jsonError(allocator, "wait_for_oauth_callback requires clientId");
-            const redirect_uri = trimOptionalString(request.redirectUri) orelse return jsonError(allocator, "wait_for_oauth_callback requires redirectUri");
-            const oauth_state = trimOptionalString(request.oauthState) orelse return jsonError(allocator, "wait_for_oauth_callback requires oauthState");
-            const code_verifier = trimOptionalString(request.codeVerifier);
-
-            startOAuthCallbackListener(
-                timeout_seconds,
-                cancel_ptr,
-                issuer,
-                client_id,
-                redirect_uri,
-                oauth_state,
-                code_verifier,
-                trimOptionalString(request.label),
-            ) catch |err| {
-                if (err != error.CallbackListenerAlreadyRunning) {
-                    return jsonError(allocator, @errorName(err));
-                }
-            };
-
-            var ready_account = waitForOAuthReadyAccountResult(allocator) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-            defer ready_account.deinit(allocator);
-            return jsonOk(allocator, ready_account);
-        }
-
         if (std.mem.eql(u8, command, "cancel_oauth_callback_listener")) {
             cancelOAuthCallbackListener(cancel_ptr);
             cancel_ptr.store(true, .seq_cst);
             return jsonOk(allocator, true);
-        }
-
-        if (std.mem.eql(u8, command, "fetch_wham_usage_start")) {
-            const access_token = request.accessToken orelse return jsonError(allocator, "fetch_wham_usage_start requires accessToken");
-            return startWhamUsageFetch(allocator, access_token, request.accountId) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        }
-
-        if (std.mem.eql(u8, command, "fetch_wham_usage_poll")) {
-            const request_id = request.requestId orelse return jsonError(allocator, "fetch_wham_usage_poll requires requestId");
-            return pollWhamUsageFetch(allocator, request_id) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-        }
-
-        if (std.mem.eql(u8, command, "fetch_wham_usage")) {
-            const access_token = request.accessToken orelse return jsonError(allocator, "fetch_wham_usage requires accessToken");
-            const usage = fetchWhamUsage(allocator, access_token, request.accountId) catch |err| {
-                return jsonError(allocator, @errorName(err));
-            };
-            defer allocator.free(usage.body);
-            return jsonOk(allocator, .{ .status = usage.status, .body = usage.body });
         }
 
         return jsonError(allocator, "unknown invoke command");
@@ -724,12 +462,6 @@ fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".local", "share", APP_ID });
 }
 
-fn getThemeSettingsPath(allocator: std.mem.Allocator) ![]u8 {
-    const app_dir = try getAppLocalDataDir(allocator);
-    defer allocator.free(app_dir);
-    return std.fs.path.join(allocator, &.{ app_dir, "ui-theme.txt" });
-}
-
 fn getManagedPaths(allocator: std.mem.Allocator) !ManagedPaths {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -766,67 +498,11 @@ fn readOptionalTextFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     return text;
 }
 
-fn readManagedStore(allocator: std.mem.Allocator) !?[]u8 {
-    var paths = try getManagedPaths(allocator);
-    defer paths.deinit(allocator);
-    return readOptionalTextFile(allocator, paths.storePath);
-}
-
-fn writeManagedStore(contents: []const u8, allocator: std.mem.Allocator) !void {
-    var paths = try getManagedPaths(allocator);
-    defer paths.deinit(allocator);
-
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
-    try writeTextFile(paths.storePath, contents);
-}
-
-fn readCodexAuth(allocator: std.mem.Allocator) !?[]u8 {
-    var paths = try getManagedPaths(allocator);
-    defer paths.deinit(allocator);
-    return readOptionalTextFile(allocator, paths.codexAuthPath);
-}
-
-fn writeCodexAuth(contents: []const u8, allocator: std.mem.Allocator) !void {
-    var paths = try getManagedPaths(allocator);
-    defer paths.deinit(allocator);
-
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
-    try writeTextFile(paths.codexAuthPath, contents);
-}
-
-fn readBootstrapState(allocator: std.mem.Allocator) !?[]u8 {
-    var paths = try getManagedPaths(allocator);
-    defer paths.deinit(allocator);
-    return readOptionalTextFile(allocator, paths.bootstrapStatePath);
-}
-
-fn writeBootstrapState(contents: []const u8, allocator: std.mem.Allocator) !void {
-    var paths = try getManagedPaths(allocator);
-    defer paths.deinit(allocator);
-
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
-    try writeTextFile(paths.bootstrapStatePath, contents);
-}
-
 fn readTextFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
 
     return file.readToEndAlloc(allocator, 16 * 1024 * 1024);
-}
-
-fn writeTextFile(path: []const u8, contents: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        try std.fs.cwd().makePath(parent);
-    }
-
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
-
-    try file.writeAll(contents);
 }
 
 fn writeTextFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
@@ -1083,14 +759,25 @@ fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreSt
             .label = null,
             .account_id = null,
             .email = null,
-            .archived = if (account_obj.get("archived")) |v| jsonGetBool(v) orelse false else false,
-            .frozen = if (account_obj.get("frozen")) |v| jsonGetBool(v) orelse false else false,
+            .archived = false,
+            .frozen = false,
             .auth_json = auth_json,
-            .created_at = if (account_obj.get("createdAt")) |v| jsonGetI64(v) orelse nowEpochSeconds() else nowEpochSeconds(),
-            .updated_at = if (account_obj.get("updatedAt")) |v| jsonGetI64(v) orelse nowEpochSeconds() else nowEpochSeconds(),
-            .last_used_at = if (account_obj.get("lastUsedAt")) |v| jsonGetI64(v) else null,
         };
         errdefer account.deinit(allocator);
+
+        if (account_obj.get("state")) |state_value| {
+            if (jsonGetString(state_value)) |state| {
+                if (std.mem.eql(u8, state, "archived")) {
+                    account.archived = true;
+                } else if (std.mem.eql(u8, state, "frozen")) {
+                    account.frozen = true;
+                }
+            }
+        } else {
+            // One-way migration path from older persisted format.
+            account.archived = if (account_obj.get("archived")) |v| jsonGetBool(v) orelse false else false;
+            account.frozen = if (account_obj.get("frozen")) |v| jsonGetBool(v) orelse false else false;
+        }
 
         if (account_obj.get("label")) |label| {
             if (jsonGetString(label)) |value| account.label = try allocator.dupe(u8, value);
@@ -1520,18 +1207,10 @@ fn serializeStoreState(allocator: std.mem.Allocator, store: *const StoreState) !
         try writeJsonOptionalString(writer, account.account_id);
         try writer.writeAll(",\"email\":");
         try writeJsonOptionalString(writer, account.email);
-        try writer.writeAll(",\"archived\":");
-        try writeJsonBool(writer, account.archived);
-        try writer.writeAll(",\"frozen\":");
-        try writeJsonBool(writer, account.frozen);
+        try writer.writeAll(",\"state\":");
+        try writeJsonString(writer, accountStateString(&account));
         try writer.writeAll(",\"auth\":");
         try writer.writeAll(account.auth_json);
-        try writer.writeAll(",\"createdAt\":");
-        try writer.print("{}", .{account.created_at});
-        try writer.writeAll(",\"updatedAt\":");
-        try writer.print("{}", .{account.updated_at});
-        try writer.writeAll(",\"lastUsedAt\":");
-        try writeJsonOptionalI64(writer, account.last_used_at);
         try writer.writeByte('}');
     }
 
@@ -1658,48 +1337,6 @@ fn buildAccountsViewJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try writeJsonString(writer, state.paths.codexAuthPath);
     try writer.writeAll(",\"storePath\":");
     try writeJsonString(writer, state.paths.storePath);
-    try writer.writeByte('}');
-
-    return buffer.toOwnedSlice(allocator);
-}
-
-fn buildUiPreferencesResponseJson(allocator: std.mem.Allocator, preferences: *const UiPreferences) ![]u8 {
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
-
-    try writer.writeByte('{');
-    try writer.writeAll("\"theme\":");
-    try writeJsonOptionalString(writer, preferences.theme);
-    try writer.writeAll(",\"autoArchiveZeroQuota\":");
-    try writeJsonBool(writer, preferences.auto_archive_zero_quota);
-    try writer.writeAll(",\"autoUnarchiveNonZeroQuota\":");
-    try writeJsonBool(writer, preferences.auto_unarchive_non_zero_quota);
-    try writer.writeAll(",\"autoSwitchAwayFromArchived\":");
-    try writeJsonBool(writer, preferences.auto_switch_away_from_archived);
-    try writer.writeAll(",\"autoRefreshActiveEnabled\":");
-    try writeJsonBool(writer, preferences.auto_refresh_active_enabled);
-    try writer.writeAll(",\"autoRefreshActiveIntervalSec\":");
-    try writer.print("{}", .{preferences.auto_refresh_active_interval_sec});
-    try writer.writeAll(",\"usageRefreshDisplayMode\":");
-    try writeJsonString(writer, preferences.usage_refresh_display_mode);
-    try writer.writeByte('}');
-
-    return buffer.toOwnedSlice(allocator);
-}
-
-fn buildUsageCacheJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
-
-    try writer.writeByte('{');
-    for (state.usage_by_id.items, 0..) |entry, idx| {
-        if (idx != 0) try writer.writeByte(',');
-        try writeJsonString(writer, entry.account_id);
-        try writer.writeByte(':');
-        try writeCreditsInfoJson(writer, &entry.credits);
-    }
     try writer.writeByte('}');
 
     return buffer.toOwnedSlice(allocator);
@@ -2186,7 +1823,6 @@ fn upsertAccountFromAuth(
     label: ?[]const u8,
     set_active: bool,
 ) ![]const u8 {
-    const now = nowEpochSeconds();
     const account_id = extractAccountIdFromAuthJson(allocator, auth_json);
     defer if (account_id) |value| allocator.free(value);
     const email = extractEmailFromAuthJson(allocator, auth_json);
@@ -2214,9 +1850,7 @@ fn upsertAccountFromAuth(
         account.auth_json = try allocator.dupe(u8, auth_json);
         account.archived = false;
         account.frozen = false;
-        account.updated_at = now;
         if (set_active) {
-            account.last_used_at = now;
             if (store.active_account_id) |value| allocator.free(value);
             store.active_account_id = try allocator.dupe(u8, account.id);
         }
@@ -2231,9 +1865,6 @@ fn upsertAccountFromAuth(
         .archived = false,
         .frozen = false,
         .auth_json = try allocator.dupe(u8, auth_json),
-        .created_at = now,
-        .updated_at = now,
-        .last_used_at = if (set_active) now else null,
     };
     errdefer account.deinit(allocator);
 
@@ -2270,41 +1901,11 @@ fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, remove
         if (candidate.archived or candidate.frozen) continue;
 
         try setStoreActiveAccountId(allocator, &state.store, candidate.id);
-        candidate.last_used_at = nowEpochSeconds();
-        candidate.updated_at = nowEpochSeconds();
         try writeCodexAuthPath(allocator, state.paths.codexAuthPath, candidate.auth_json);
         return;
     }
 
     try setStoreActiveAccountId(allocator, &state.store, null);
-}
-
-fn handleGetAppStateCommand(allocator: std.mem.Allocator) ![]u8 {
-    return jsonError(allocator, "get_app_state is deprecated");
-}
-
-fn handleGetUsageCacheCommand(allocator: std.mem.Allocator) ![]u8 {
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
-
-    var state = try loadAppState(allocator);
-    defer state.deinit(allocator);
-
-    const usage_json = try buildUsageCacheJson(allocator, &state);
-    defer allocator.free(usage_json);
-    return jsonOkRaw(allocator, usage_json);
-}
-
-fn handleGetUiPreferencesCommand(allocator: std.mem.Allocator) ![]u8 {
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
-
-    var state = try loadAppState(allocator);
-    defer state.deinit(allocator);
-
-    const preferences_json = try buildUiPreferencesResponseJson(allocator, &state.preferences);
-    defer allocator.free(preferences_json);
-    return jsonOkRaw(allocator, preferences_json);
 }
 
 fn handleSwitchAccountCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
@@ -2317,14 +1918,11 @@ fn handleSwitchAccountCommand(allocator: std.mem.Allocator, account_id_raw: []co
     defer state.deinit(allocator);
 
     const idx = accountIndex(&state.store, account_id) orelse return jsonError(allocator, "Account not found.");
-    var account = &state.store.accounts.items[idx];
+    const account = &state.store.accounts.items[idx];
     if (account.archived or account.frozen) {
         return jsonError(allocator, "Cannot switch to a depleted or frozen account.");
     }
 
-    const now = nowEpochSeconds();
-    account.last_used_at = now;
-    account.updated_at = now;
     try setStoreActiveAccountId(allocator, &state.store, account.id);
     try writeCodexAuthPath(allocator, state.paths.codexAuthPath, account.auth_json);
 
@@ -2356,7 +1954,6 @@ fn handleMoveAccountCommand(
     errdefer moved.deinit(allocator);
 
     applyBucket(&moved, target_bucket);
-    moved.updated_at = nowEpochSeconds();
 
     if (state.store.active_account_id != null and std.mem.eql(u8, state.store.active_account_id.?, moved.id) and target_bucket != .active) {
         if (switch_away) {
@@ -2502,9 +2099,7 @@ fn handleUpdateUiPreferencesCommand(allocator: std.mem.Allocator, request: RpcRe
     }
 
     try persistStateFilesOnly(allocator, &state);
-    const preferences_json = try buildUiPreferencesResponseJson(allocator, &state.preferences);
-    defer allocator.free(preferences_json);
-    return jsonOkRaw(allocator, preferences_json);
+    return jsonOk(allocator, @as(?u8, null));
 }
 
 fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
@@ -2625,235 +2220,6 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     );
     defer allocator.free(response_json);
     return jsonOkRaw(allocator, response_json);
-}
-
-fn usageFetchKeyForRequest(allocator: std.mem.Allocator, access_token: []const u8, account_id: ?[]const u8) ![]u8 {
-    if (account_id) |id| {
-        const trimmed = std.mem.trim(u8, id, " \r\n\t");
-        if (trimmed.len > 0) {
-            return std.fmt.allocPrint(allocator, "account:{s}", .{trimmed});
-        }
-    }
-
-    const hash = std.hash.Wyhash.hash(0, access_token);
-    return std.fmt.allocPrint(allocator, "token:{x}", .{hash});
-}
-
-fn usageFetchEntryIndexByKeyLocked(key: []const u8) ?usize {
-    for (usage_fetch_state.entries.items, 0..) |entry, idx| {
-        if (std.mem.eql(u8, entry.key, key)) {
-            return idx;
-        }
-    }
-    return null;
-}
-
-fn usageFetchEntryIndexByRequestIdLocked(request_id: u64) ?usize {
-    for (usage_fetch_state.entries.items, 0..) |entry, idx| {
-        if (entry.last_request_id == request_id) {
-            return idx;
-        }
-    }
-    return null;
-}
-
-fn makeUsageFetchErrorBody(message: []const u8) []u8 {
-    return std.heap.page_allocator.dupe(u8, message) catch blk: {
-        const fallback = "usage fetch failed";
-        const owned = std.heap.page_allocator.alloc(u8, fallback.len) catch @panic("out of memory creating usage error");
-        @memcpy(owned, fallback);
-        break :blk owned;
-    };
-}
-
-fn usageFetchWorkerMain(args_in: UsageFetchWorkerArgs) void {
-    var args = args_in;
-    defer args.deinit();
-
-    const usage = fetchWhamUsage(std.heap.page_allocator, args.access_token, args.account_id) catch |err| blk: {
-        const message = std.fmt.allocPrint(std.heap.page_allocator, "wham fetch failed: {s}", .{@errorName(err)}) catch makeUsageFetchErrorBody("wham fetch failed");
-        break :blk UsageResult{
-            .status = 599,
-            .body = message,
-        };
-    };
-
-    const finished_at_ms = std.time.milliTimestamp();
-
-    usage_fetch_state.mutex.lock();
-    defer usage_fetch_state.mutex.unlock();
-
-    const idx = usageFetchEntryIndexByKeyLocked(args.key) orelse {
-        std.heap.page_allocator.free(usage.body);
-        return;
-    };
-    var entry = &usage_fetch_state.entries.items[idx];
-
-    if (entry.last_request_id != args.request_id) {
-        std.heap.page_allocator.free(usage.body);
-        return;
-    }
-
-    if (entry.last_body) |previous| {
-        std.heap.page_allocator.free(previous);
-    }
-
-    // Keep the critical section short: network fetch runs outside mutex; lock only
-    // while updating shared fetch/account state.
-    entry.last_body = usage.body;
-    entry.last_status = usage.status;
-    entry.last_completed_ms = finished_at_ms;
-    entry.inflight = false;
-}
-
-fn startWhamUsageFetch(
-    allocator: std.mem.Allocator,
-    access_token: []const u8,
-    account_id: ?[]const u8,
-) ![]u8 {
-    const key = try usageFetchKeyForRequest(allocator, access_token, account_id);
-    defer allocator.free(key);
-
-    const now_ms = std.time.milliTimestamp();
-
-    var request_id: u64 = 0;
-    var cached_status: ?u16 = null;
-    var cached_body_copy: ?[]u8 = null;
-    var action: enum { running, completed, spawn } = .spawn;
-
-    {
-        usage_fetch_state.mutex.lock();
-        defer usage_fetch_state.mutex.unlock();
-
-        const idx = idx: {
-            if (usageFetchEntryIndexByKeyLocked(key)) |existing| {
-                break :idx existing;
-            }
-
-            const owned_key = try std.heap.page_allocator.dupe(u8, key);
-            errdefer std.heap.page_allocator.free(owned_key);
-
-            try usage_fetch_state.entries.append(std.heap.page_allocator, .{
-                .key = owned_key,
-            });
-            break :idx usage_fetch_state.entries.items.len - 1;
-        };
-
-        var entry = &usage_fetch_state.entries.items[idx];
-
-        if (entry.inflight) {
-            request_id = entry.last_request_id;
-            action = .running;
-        } else {
-            const can_use_cached = entry.last_body != null and
-                entry.last_completed_ms > 0 and
-                (now_ms - entry.last_completed_ms) < USAGE_FETCH_DEBOUNCE_MS;
-
-            if (can_use_cached) {
-                request_id = entry.last_request_id;
-                cached_status = entry.last_status;
-                cached_body_copy = if (entry.last_body) |body| try allocator.dupe(u8, body) else null;
-                action = .completed;
-            } else {
-                request_id = usage_fetch_state.next_request_id;
-                usage_fetch_state.next_request_id += 1;
-                entry.last_request_id = request_id;
-                entry.inflight = true;
-                entry.last_started_ms = now_ms;
-                action = .spawn;
-            }
-        }
-    }
-
-    switch (action) {
-        .running => {
-            return jsonOk(allocator, .{
-                .state = "running",
-                .requestId = request_id,
-                .debounced = true,
-            });
-        },
-        .completed => {
-            defer if (cached_body_copy) |body| allocator.free(body);
-            return jsonOk(allocator, .{
-                .state = "completed",
-                .requestId = request_id,
-                .status = cached_status,
-                .body = cached_body_copy,
-                .debounced = true,
-            });
-        },
-        .spawn => {},
-    }
-
-    var worker_args = try UsageFetchWorkerArgs.init(access_token, account_id, key, request_id);
-    errdefer worker_args.deinit();
-
-    const worker = std.Thread.spawn(.{}, usageFetchWorkerMain, .{worker_args}) catch |err| {
-        usage_fetch_state.mutex.lock();
-        defer usage_fetch_state.mutex.unlock();
-
-        if (usageFetchEntryIndexByKeyLocked(key)) |idx_locked| {
-            var entry_locked = &usage_fetch_state.entries.items[idx_locked];
-            if (entry_locked.last_request_id == request_id) {
-                entry_locked.inflight = false;
-            }
-        }
-
-        return err;
-    };
-    worker.detach();
-
-    return jsonOk(allocator, .{
-        .state = "queued",
-        .requestId = request_id,
-        .debounced = false,
-    });
-}
-
-fn pollWhamUsageFetch(allocator: std.mem.Allocator, request_id: u64) ![]u8 {
-    var inflight = false;
-    var status: ?u16 = null;
-    var body_copy: ?[]u8 = null;
-    var found = false;
-
-    {
-        usage_fetch_state.mutex.lock();
-        defer usage_fetch_state.mutex.unlock();
-
-        if (usageFetchEntryIndexByRequestIdLocked(request_id)) |idx| {
-            found = true;
-            const entry = &usage_fetch_state.entries.items[idx];
-            inflight = entry.inflight;
-            status = entry.last_status;
-            body_copy = if (!entry.inflight and entry.last_body != null)
-                try allocator.dupe(u8, entry.last_body.?)
-            else
-                null;
-        }
-    }
-
-    if (!found) {
-        return jsonOk(allocator, .{
-            .state = "unknown",
-            .requestId = request_id,
-        });
-    }
-
-    if (inflight) {
-        return jsonOk(allocator, .{
-            .state = "running",
-            .requestId = request_id,
-        });
-    }
-
-    defer if (body_copy) |body| allocator.free(body);
-    return jsonOk(allocator, .{
-        .state = if (body_copy != null) "completed" else "unknown",
-        .requestId = request_id,
-        .status = status,
-        .body = body_copy,
-    });
 }
 
 fn fetchWhamUsage(
@@ -3647,87 +3013,6 @@ fn pollOAuthCallbackListener(allocator: std.mem.Allocator) !OAuthPollResult {
     return .{ .status = "idle" };
 }
 
-fn waitForOAuthCallbackResult(allocator: std.mem.Allocator) ![]u8 {
-    oauth_listener_state.mutex.lock();
-    defer oauth_listener_state.mutex.unlock();
-
-    while (oauth_listener_state.running) {
-        oauth_listener_state.cond.wait(&oauth_listener_state.mutex);
-    }
-    joinOAuthListenerThreadLocked();
-
-    if (oauth_listener_state.callback_url) |url| {
-        return allocator.dupe(u8, url);
-    }
-
-    if (oauth_listener_state.error_name) |err_name| {
-        if (std.mem.eql(u8, err_name, "CallbackListenerStopped")) {
-            return error.CallbackListenerStopped;
-        }
-        if (std.mem.eql(u8, err_name, "CallbackListenerTimeout")) {
-            return error.CallbackListenerTimeout;
-        }
-        if (std.mem.eql(u8, err_name, "CallbackListenerSocketError")) {
-            return error.CallbackListenerSocketError;
-        }
-        if (std.mem.eql(u8, err_name, "OAuthAuthorizationFailed")) {
-            return error.OAuthAuthorizationFailed;
-        }
-        if (std.mem.eql(u8, err_name, "OAuthStateMismatch")) {
-            return error.OAuthStateMismatch;
-        }
-        if (std.mem.eql(u8, err_name, "AuthorizationCodeExchangeFailed")) {
-            return error.AuthorizationCodeExchangeFailed;
-        }
-        return error.CallbackListenerFailed;
-    }
-
-    return error.CallbackListenerUnavailable;
-}
-
-fn waitForOAuthReadyAccountResult(allocator: std.mem.Allocator) !OAuthReadyAccount {
-    oauth_listener_state.mutex.lock();
-    defer oauth_listener_state.mutex.unlock();
-
-    while (oauth_listener_state.running) {
-        oauth_listener_state.cond.wait(&oauth_listener_state.mutex);
-    }
-    joinOAuthListenerThreadLocked();
-
-    if (oauth_listener_state.ready_account) |account| {
-        return .{
-            .id = try allocator.dupe(u8, account.id),
-            .accountId = if (account.accountId) |value| try allocator.dupe(u8, value) else null,
-            .email = if (account.email) |value| try allocator.dupe(u8, value) else null,
-            .state = account.state,
-        };
-    }
-
-    if (oauth_listener_state.error_name) |err_name| {
-        if (std.mem.eql(u8, err_name, "CallbackListenerStopped")) {
-            return error.CallbackListenerStopped;
-        }
-        if (std.mem.eql(u8, err_name, "CallbackListenerTimeout")) {
-            return error.CallbackListenerTimeout;
-        }
-        if (std.mem.eql(u8, err_name, "CallbackListenerSocketError")) {
-            return error.CallbackListenerSocketError;
-        }
-        if (std.mem.eql(u8, err_name, "OAuthAuthorizationFailed")) {
-            return error.OAuthAuthorizationFailed;
-        }
-        if (std.mem.eql(u8, err_name, "OAuthStateMismatch")) {
-            return error.OAuthStateMismatch;
-        }
-        if (std.mem.eql(u8, err_name, "AuthorizationCodeExchangeFailed")) {
-            return error.AuthorizationCodeExchangeFailed;
-        }
-        return error.CallbackListenerFailed;
-    }
-
-    return error.CallbackListenerUnavailable;
-}
-
 fn cancelOAuthCallbackListener(external_cancel: *std.atomic.Value(bool)) void {
     oauth_listener_state.cancel.store(true, .seq_cst);
     external_cancel.store(true, .seq_cst);
@@ -3942,35 +3227,18 @@ fn expectRpcErrorContains(response: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.containsAtLeast(u8, error_value.string, 1, needle));
 }
 
-test "rpcFromText rejects invalid JSON payload" {
-    var cancel = std.atomic.Value(bool).init(false);
-    const response = try rpcFromText(std.testing.allocator, "{", &cancel);
-    defer std.testing.allocator.free(response);
-
-    try expectRpcErrorContains(response, "invalid RPC payload");
-}
-
-test "rpcFromText returns unknown op error for unsupported operation" {
-    var cancel = std.atomic.Value(bool).init(false);
-    const response = try rpcFromText(std.testing.allocator, "{\"op\":\"noop\"}", &cancel);
-    defer std.testing.allocator.free(response);
-
-    try expectRpcErrorContains(response, "unknown RPC op");
-}
-
-test "rpcHandleRequest path join requires at least one segment" {
+test "rpcHandleRequest returns unknown op error for unsupported operation" {
     var cancel = std.atomic.Value(bool).init(false);
     const response = try rpcHandleRequest(
         std.testing.allocator,
         .{
-            .op = "path:join",
-            .paths = &.{},
+            .op = "noop",
         },
         &cancel,
     );
     defer std.testing.allocator.free(response);
 
-    try expectRpcErrorContains(response, "path join requires at least one segment");
+    try expectRpcErrorContains(response, "unknown RPC op");
 }
 
 test "rpcHandleRequest cancel listener command sets cancel flag" {

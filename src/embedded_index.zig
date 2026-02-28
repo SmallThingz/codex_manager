@@ -149,36 +149,9 @@ fn canonicalizeBootstrapJson(allocator: std.mem.Allocator, bootstrap_json: []con
 
 fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     const script_tag = "<script src=\"/webui_bridge.js\"></script>";
-    const legacy_module_tag = "<script type=\"module\" src=\"/webui_bridge.js\"></script>";
-    const legacy_old_tag = "<script src=\"/webui.js\"></script>";
-    const legacy_old_module_tag = "<script type=\"module\" src=\"/webui.js\"></script>";
 
     if (std.mem.indexOf(u8, html, script_tag) != null) {
         return allocator.dupe(u8, html);
-    }
-
-    if (std.mem.indexOf(u8, html, legacy_module_tag)) |legacy_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            html[0..legacy_idx],
-            script_tag,
-            html[legacy_idx + legacy_module_tag.len ..],
-        });
-    }
-
-    if (std.mem.indexOf(u8, html, legacy_old_tag)) |legacy_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            html[0..legacy_idx],
-            script_tag,
-            html[legacy_idx + legacy_old_tag.len ..],
-        });
-    }
-
-    if (std.mem.indexOf(u8, html, legacy_old_module_tag)) |legacy_idx| {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            html[0..legacy_idx],
-            script_tag,
-            html[legacy_idx + legacy_old_module_tag.len ..],
-        });
     }
 
     if (std.mem.indexOf(u8, html, "</head>")) |head_idx| {

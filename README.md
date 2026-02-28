@@ -1,33 +1,33 @@
 # Codex Manager
 
-A Zig-first desktop/web account manager for Codex with typed RPC, deterministic launch modes, and automatic quota-state transitions.
+A Zig + SolidJS account manager for Codex with backend-authoritative state, typed WebUI RPC, and deterministic launch behavior.
 
-![Zig](https://img.shields.io/badge/Zig-0.15.2+-f7a41d?logo=zig&logoColor=111)
-![Frontend](https://img.shields.io/badge/Frontend-SolidJS-2c4f7c)
-![Runtime](https://img.shields.io/badge/Runtime-WebUI_Zig-111827)
-![Modes](https://img.shields.io/badge/Modes-webview%20%7C%20browser%20%7C%20web-0f766e)
+![zig](https://img.shields.io/badge/Zig-0.15.2+-f7a41d?logo=zig&logoColor=111)
+![solid](https://img.shields.io/badge/Frontend-SolidJS-1f3b6f)
+![webui](https://img.shields.io/badge/Runtime-webui-111827)
+![modes](https://img.shields.io/badge/Modes---webview%20--browser%20--web-0f766e)
 
-## ⚡ Features
+## Highlights
 
-- Multi-account management with clear buckets: `active`, `depleted`, `frozen`.
-- Fast account switching (updates `~/.codex/auth.json`).
-- Drag-and-drop account movement across buckets.
-- Per-account usage refresh with immediate card updates.
-- Quota-driven lifecycle rules:
-  - `0` remaining quota in active => auto-move to depleted.
-  - non-zero quota in depleted => auto-move back to active.
-- Auto-refresh support for active and depleted flows.
-- Theme + UI preference persistence.
+- Multi-account management with explicit states: `active`, `archived`, `frozen`.
+- Fast account switching (writes selected auth to `~/.codex/auth.json`).
+- Per-account refresh with immediate, per-card UI updates.
+- Automatic quota transitions:
+  - active accounts with zero quota move to archived.
+  - archived accounts with non-zero quota move back to active.
+- Depleted auto-refresh at refresh-window + grace.
+- Optional active-account auto-refresh with interval slider (`15s` to `6h`).
+- Backend-owned persistence (frontend sends intents, backend mutates + persists).
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 zig build dev
 ```
 
-This runs frontend build steps (TypeScript + Vite) and launches the app.
+This runs frontend checks/build and starts the app.
 
-### Launch Modes
+## Launch Modes
 
 ```bash
 zig build dev -- --webview
@@ -35,78 +35,81 @@ zig build dev -- --browser
 zig build dev -- --web
 ```
 
-- `--webview`: prefer native webview surface.
-- `--browser`: prefer app-window/browser-window mode.
-- `--web`: open in a normal browser tab.
+Default order when no explicit flag is provided:
 
-Default (no flag) uses ordered fallback: `webview -> browser window -> web tab`.
+`webview -> browser -> web`
 
-## 📦 Build / Install
+## Build & Install
 
-Optimized install:
+Release build:
 
 ```bash
 zig build install -Doptimize=ReleaseFast
 ```
 
-Run:
+Release build with stripped symbols:
+
+```bash
+zig build install -Doptimize=ReleaseFast -Dstrip=true
+```
+
+Run installed binary:
 
 ```bash
 ./zig-out/bin/codex-manager
-./zig-out/bin/codex-manager --web
 ```
 
-Build release matrix:
-
-```bash
-zig build build-all-targets
-```
-
-## 🧰 Requirements
+## Requirements
 
 Build-time:
 
 - Zig `0.15.2+`
 - Node.js `20+`
-- `npm`
+- npm
 
 Runtime:
 
 - `curl` in `PATH`
 - `codex` CLI in `PATH`
-- Browser installed (Chromium-family recommended for desktop-window behavior)
+- browser available for `--browser` / `--web`
 
-## 🧠 Architecture (At a Glance)
+## Project Layout
 
-- **Frontend**: SolidJS SPA (`frontend/`).
-- **Backend**: Zig app (`src/`) serving local UI + handling all account state mutations.
-- **Bridge**: typed WebUI RPC surface via `webuiRpc.cm_rpc(...)`.
-- **State ownership**: backend-authoritative persistence for account/view/usage data.
+- `src/` Zig backend, state management, RPC bridge, launch runtime
+- `frontend/` SolidJS UI
+- `docs/` architecture and RPC contract
+- `examples/` minimal integration examples
 
-## 🗂️ Storage
+## Storage
 
-Local app data directory:
-
-- `accounts.json` — managed account records
-- `bootstrap-state.json` — boot snapshot + UI cache
-- `ui-theme.txt` — theme selection
-
-Codex auth target:
-
+- `~/.local/share/com.codex.manager/accounts.json` (or platform equivalent)
+- `~/.local/share/com.codex.manager/bootstrap-state.json`
 - `~/.codex/auth.json`
 
-## ✅ Testing
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [RPC API](docs/RPC.md)
+
+## Development
+
+Typecheck frontend:
+
+```bash
+npm --prefix frontend exec -- tsc -p frontend/tsconfig.json --noEmit
+```
+
+Run Zig tests:
 
 ```bash
 zig build test
 ```
 
-## 🔎 Troubleshooting
+## Troubleshooting
 
-- App prints URL but no window appears:
-  - Open the printed `http://127.0.0.1:...` URL directly in your browser.
-- Native webview mode fails on Linux:
-  - Verify your WebKitGTK runtime/tooling for your distro.
-  - Use `--browser` or `--web` as fallback.
-- RPC bridge unavailable at startup:
-  - Ensure `webui_bridge.js` is injected and loaded by the served page.
+- Native webview unavailable on Linux:
+  - run with `--browser` or `--web`.
+- URL prints but no window appears:
+  - open the printed `http://127.0.0.1:...` URL manually.
+- OAuth callback issues:
+  - ensure port `1455` is available and retry login.
