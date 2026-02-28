@@ -88,14 +88,8 @@ type PendingBrowserLogin = {
   startedAt: number;
 };
 
-type BridgeResult<T> = {
-  ok: boolean;
-  value?: T;
-  error?: string;
-};
-
 type WebuiRpcBridge = {
-  cm_rpc: (requestJson: string) => Promise<unknown> | unknown;
+  cm_rpc: (request: Record<string, unknown>) => Promise<unknown> | unknown;
 };
 
 type BackendApis = {
@@ -358,22 +352,14 @@ const decodeBridgeValue = <T>(op: string, value: unknown): T => {
     return value as T;
   }
 
-  if (typeof record.ok === "boolean") {
-    const bridged = record as BridgeResult<T>;
-    if (!bridged.ok) {
-      throw new Error(bridged.error || `Backend bridge call failed for op "${op}".`);
-    }
-    return bridged.value as T;
-  }
-
-  if (record.value !== undefined || record.error !== undefined) {
-    if (typeof record.error === "string") {
-      throw new Error(record.error);
-    }
-    if (record.value === undefined) {
-      throw new Error(`Backend bridge call failed for op "${op}".`);
-    }
-    return decodeBridgeValue<T>(op, record.value);
+  const keys = Object.keys(record);
+  const isBridgeErrorObject =
+    typeof record.error === "string" &&
+    record.error.length > 0 &&
+    keys.length === 1 &&
+    keys[0] === "error";
+  if (isBridgeErrorObject) {
+    throw new Error(record.error as string);
   }
 
   return value as T;
@@ -405,7 +391,7 @@ const waitForWebuiBridge = async (): Promise<WebuiRpcBridge> => {
 };
 
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
-  const request = JSON.stringify({ op, ...payload });
+  const request = { op, ...payload };
   const bridge = await waitForWebuiBridge();
   const rawResponse = await bridge.cm_rpc(request);
   return decodeBridgeValue<T>(op, rawResponse);
@@ -620,6 +606,10 @@ export const importCurrentAccount = async (label?: string): Promise<AccountsView
 export const prepareCodexLoginSession = async (): Promise<BrowserLoginStart> => {
   const pending = ensurePendingBrowserLogin();
   return buildBrowserLoginStart(pending);
+};
+
+export const resetCodexLoginSession = (): void => {
+  pendingBrowserLogin = null;
 };
 
 export const startCodexCallbackListener = async (label?: string): Promise<void> => {

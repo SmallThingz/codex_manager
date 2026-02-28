@@ -9,6 +9,7 @@ import {
   moveAccount,
   pollCodexCallbackListener,
   prepareCodexLoginSession,
+  resetCodexLoginSession,
   removeAccount,
   saveTheme,
   startCodexCallbackListener,
@@ -676,7 +677,6 @@ function App() {
     const skipAutoSync = options.skipAutoSync ?? false;
 
     if (accountIds.length === 0) {
-      setCreditsById({});
       return;
     }
 
@@ -1005,10 +1005,19 @@ function App() {
         return;
       }
 
-      if (polled.status === "running" || polled.status === "idle") {
+      if (polled.status === "running") {
         callbackPollTimer = window.setTimeout(() => {
           void pollCallbackListener(runId);
         }, 300);
+        return;
+      }
+
+      if (polled.status === "idle") {
+        setNotice("Callback listener is idle. Start listening again.");
+        setIsListeningForCallback(false);
+        setBusy(null);
+        resetCodexLoginSession();
+        setBrowserStart(null);
         return;
       }
 
@@ -1030,6 +1039,8 @@ function App() {
         await refreshCreditsForAccounts([login.account.id], { quiet: true });
         setIsListeningForCallback(false);
         setBusy(null);
+        resetCodexLoginSession();
+        setBrowserStart(null);
         return;
       }
 
@@ -1044,6 +1055,8 @@ function App() {
         }
         setIsListeningForCallback(false);
         setBusy(null);
+        resetCodexLoginSession();
+        setBrowserStart(null);
         return;
       }
     } catch (listenerError) {
@@ -1054,6 +1067,8 @@ function App() {
       setError(rendered);
       setIsListeningForCallback(false);
       setBusy(null);
+      resetCodexLoginSession();
+      setBrowserStart(null);
     }
   };
 
@@ -1083,6 +1098,8 @@ function App() {
       setError(rendered);
       setIsListeningForCallback(false);
       setBusy(null);
+      resetCodexLoginSession();
+      setBrowserStart(null);
     } finally {
       // Poll loop owns final lifecycle cleanup.
     }
@@ -1102,6 +1119,8 @@ function App() {
     } finally {
       setIsListeningForCallback(false);
       setBusy(null);
+      resetCodexLoginSession();
+      setBrowserStart(null);
     }
   };
 
@@ -1208,28 +1227,33 @@ function App() {
   };
 
   const moveAccountToBucket = async (id: string, bucket: AccountBucket, targetIndex: number) => {
-    const currentView = view();
-    if (!currentView) {
+    if (!view()) {
       return;
     }
 
-    const next = await runAction("Moving account", async () => {
+    const moved = await runAction("Moving account", async () => {
       await moveAccount(id, bucket, targetIndex, {
         switchAwayFromMoved: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
       });
-      return applyMovedAccountInView(
-        currentView,
-        id,
-        bucket,
-        targetIndex,
-        AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
-      );
+      return true;
     });
 
-    if (!next) {
+    if (!moved) {
       return;
     }
 
+    const latestView = view();
+    if (!latestView) {
+      return;
+    }
+
+    const next = applyMovedAccountInView(
+      latestView,
+      id,
+      bucket,
+      targetIndex,
+      AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
+    );
     setViewState(next);
     setNotice("Account moved.");
   };

@@ -12,18 +12,18 @@ const RawJson = struct {
 };
 
 pub const RpcBridgeMethods = struct {
-    pub fn cm_rpc(request_text: []const u8) RawJson {
+    pub fn cm_rpc(request: rpc.RpcRequest) RawJson {
         const cancel_ptr = bridge_cancel_ptr orelse {
-            return .{ .data = "{\"ok\":false,\"error\":\"RPC bridge not initialized\"}" };
+            return .{ .data = "{\"error\":\"RPC bridge not initialized\"}" };
         };
 
-        const rpc_response = rpc.handleRpcText(std.heap.page_allocator, request_text, cancel_ptr) catch {
-            return .{ .data = "{\"ok\":false,\"error\":\"internal RPC failure\"}" };
+        const rpc_response = rpc.handleRpcRequest(std.heap.page_allocator, request, cancel_ptr) catch {
+            return .{ .data = "{\"error\":\"internal RPC failure\"}" };
         };
         defer std.heap.page_allocator.free(rpc_response);
 
         if (rpc_response.len > bridge_response_storage.len) {
-            return .{ .data = "{\"ok\":false,\"error\":\"RPC response exceeds bridge buffer\"}" };
+            return .{ .data = "{\"error\":\"RPC response exceeds bridge buffer\"}" };
         }
 
         @memcpy(bridge_response_storage[0..rpc_response.len], rpc_response);

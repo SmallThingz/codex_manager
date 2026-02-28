@@ -3,6 +3,6 @@
 interface Window {
   __CM_BOOTSTRAP_STATE__?: string;
   webuiRpc?: {
-    cm_rpc?: (requestJson: string) => Promise<unknown> | unknown;
+    cm_rpc?: (request: Record<string, unknown>) => Promise<unknown> | unknown;
   };
 }

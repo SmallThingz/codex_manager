@@ -157,6 +157,17 @@ const OAuthPollResult = struct {
     status: []const u8,
     account: ?OAuthReadyAccount = null,
     @"error": ?[]const u8 = null,
+
+    fn deinit(self: *OAuthPollResult, allocator: std.mem.Allocator) void {
+        if (self.account) |*account| {
+            account.deinit(allocator);
+            self.account = null;
+        }
+        if (self.@"error") |err_value| {
+            allocator.free(err_value);
+            self.@"error" = null;
+        }
+    }
 };
 
 var oauth_listener_state = OAuthListenerState{};
@@ -363,16 +374,20 @@ pub fn handleRpcText(allocator: std.mem.Allocator, request_text: []const u8, can
     return rpcFromText(allocator, request_text, cancel_ptr);
 }
 
+pub fn handleRpcRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
+    return rpcHandleRequest(allocator, request, cancel_ptr);
+}
+
 fn jsonError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .ok = false, .@"error" = message }, .{})});
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .@"error" = message }, .{})});
 }
 
 fn jsonOk(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .ok = true, .value = value }, .{})});
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
 }
 
 fn jsonOkRaw(allocator: std.mem.Allocator, raw_value: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"ok\":true,\"value\":{s}}}", .{raw_value});
+    return allocator.dupe(u8, raw_value);
 }
 
 fn rpcFromText(allocator: std.mem.Allocator, request_text: []const u8, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
@@ -607,9 +622,10 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
         }
 
         if (std.mem.eql(u8, command, "poll_oauth_callback_listener")) {
-            const polled = pollOAuthCallbackListener() catch |err| {
+            var polled = pollOAuthCallbackListener(allocator) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
+            defer polled.deinit(allocator);
             return jsonOk(allocator, polled);
         }
 
@@ -2539,10 +2555,10 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
 
     managed_files_mutex.lock();
     {
+        defer managed_files_mutex.unlock();
         var state = try loadAppState(allocator);
         defer state.deinit(allocator);
         const idx = accountIndex(&state.store, account_id) orelse {
-            managed_files_mutex.unlock();
             return jsonError(allocator, "Account not found.");
         };
         const account = state.store.accounts.items[idx];
@@ -2552,7 +2568,6 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         }
         needs_email_backfill = account.email == null;
     }
-    managed_files_mutex.unlock();
 
     if (needs_email_backfill) {
         const access_token = extractAccessTokenFromAuthJson(allocator, auth_json_copy.?);
@@ -3436,10 +3451,9 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
         return error.OAuthAuthorizationFailed;
     }
 
-    if (callback_query.state) |callback_state| {
-        if (!std.mem.eql(u8, callback_state, args.oauth_state)) {
-            return error.OAuthStateMismatch;
-        }
+    const callback_state = callback_query.state orelse return error.OAuthStateMismatch;
+    if (!std.mem.eql(u8, callback_state, args.oauth_state)) {
+        return error.OAuthStateMismatch;
     }
 
     var tokens: OAuthTokenPair = undefined;
@@ -3589,7 +3603,7 @@ fn startOAuthCallbackListener(
     };
 }
 
-fn pollOAuthCallbackListener() !OAuthPollResult {
+fn pollOAuthCallbackListener(allocator: std.mem.Allocator) !OAuthPollResult {
     oauth_listener_state.mutex.lock();
     defer oauth_listener_state.mutex.unlock();
 
@@ -3599,16 +3613,34 @@ fn pollOAuthCallbackListener() !OAuthPollResult {
     joinOAuthListenerThreadLocked();
 
     if (oauth_listener_state.ready_account) |account| {
+        const id_copy = try allocator.dupe(u8, account.id);
+        errdefer allocator.free(id_copy);
+        const account_id_copy = if (account.accountId) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (account_id_copy) |value| allocator.free(value);
+        const email_copy = if (account.email) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (email_copy) |value| allocator.free(value);
+
         return .{
             .status = "ready",
-            .account = account,
+            .account = .{
+                .id = id_copy,
+                .accountId = account_id_copy,
+                .email = email_copy,
+                .state = account.state,
+            },
         };
     }
 
     if (oauth_listener_state.error_name) |err_name| {
         return .{
             .status = "error",
-            .@"error" = err_name,
+            .@"error" = try allocator.dupe(u8, err_name),
         };
     }
 
@@ -3905,10 +3937,6 @@ fn expectRpcErrorContains(response: []const u8, needle: []const u8) !void {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), response, .{});
     const root = parsed.object;
 
-    const ok_value = root.get("ok") orelse return error.MissingOkField;
-    try std.testing.expect(ok_value == .bool);
-    try std.testing.expect(!ok_value.bool);
-
     const error_value = root.get("error") orelse return error.MissingErrorField;
     try std.testing.expect(error_value == .string);
     try std.testing.expect(std.mem.containsAtLeast(u8, error_value.string, 1, needle));
@@ -3959,10 +3987,8 @@ test "rpcHandleRequest cancel listener command sets cancel flag" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), response, .{});
-    const root = parsed.object;
-    const ok_value = root.get("ok") orelse return error.MissingOkField;
-    try std.testing.expect(ok_value == .bool);
-    try std.testing.expect(ok_value.bool);
+    try std.testing.expect(parsed == .bool);
+    try std.testing.expect(parsed.bool);
     try std.testing.expect(cancel.load(.seq_cst));
 }
 
