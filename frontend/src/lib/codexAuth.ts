@@ -2,7 +2,7 @@ const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_ORIGINATOR = "codex_cli_rs";
-const CODEX_SCOPE = "openid profile email offline_access";
+const CODEX_SCOPE = "openid profile email";
 const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
 const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC = 15;
 const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
@@ -79,7 +79,7 @@ type PendingBrowserLogin = {
   clientId: string;
   redirectUri: string;
   state: string;
-  codeVerifier: string;
+  nonce: string;
   startedAt: number;
 };
 
@@ -432,30 +432,23 @@ const randomBase64Url = (size: number): string => {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
 
-const sha256Base64Url = async (value: string): Promise<string> => {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  const bytes = new Uint8Array(digest);
-  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-};
-
 const buildAuthorizeUrl = (
   issuer: string,
   clientId: string,
   redirectUri: string,
-  codeChallenge: string,
   state: string,
+  nonce: string,
 ): string => {
   const query = new URLSearchParams({
-    response_type: "code",
+    response_type: "id_token",
+    response_mode: "query",
     client_id: clientId,
     redirect_uri: redirectUri,
     scope: CODEX_SCOPE,
-    code_challenge: codeChallenge,
-    code_challenge_method: "S256",
     id_token_add_organizations: "true",
     codex_cli_simplified_flow: "true",
     state,
+    nonce,
     originator: CODEX_ORIGINATOR,
   });
 
@@ -485,7 +478,6 @@ const waitForOAuthCallbackFromBrowser = async (
       clientId: pending.clientId,
       redirectUri: pending.redirectUri,
       oauthState: pending.state,
-      codeVerifier: pending.codeVerifier,
       label,
     });
     const account = asAccountSummary(payload);
@@ -553,16 +545,15 @@ export const importCurrentAccount = async (label?: string): Promise<AccountsView
 };
 
 export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
-  const codeVerifier = randomBase64Url(64);
-  const codeChallenge = await sha256Base64Url(codeVerifier);
   const state = randomBase64Url(32);
+  const nonce = randomBase64Url(32);
 
   const pending: PendingBrowserLogin = {
     issuer: CODEX_OAUTH_ISSUER,
     clientId: CODEX_CLIENT_ID,
     redirectUri: CODEX_REDIRECT_URI,
     state,
-    codeVerifier,
+    nonce,
     startedAt: nowEpoch(),
   };
 
@@ -572,8 +563,8 @@ export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
     pending.issuer,
     pending.clientId,
     pending.redirectUri,
-    codeChallenge,
     pending.state,
+    pending.nonce,
   );
 
   const tauri = await loadBackendApis();

@@ -589,7 +589,7 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
             const client_id = trimOptionalString(request.clientId) orelse return jsonError(allocator, "start_oauth_callback_listener requires clientId");
             const redirect_uri = trimOptionalString(request.redirectUri) orelse return jsonError(allocator, "start_oauth_callback_listener requires redirectUri");
             const oauth_state = trimOptionalString(request.oauthState) orelse return jsonError(allocator, "start_oauth_callback_listener requires oauthState");
-            const code_verifier = trimOptionalString(request.codeVerifier) orelse return jsonError(allocator, "start_oauth_callback_listener requires codeVerifier");
+            const code_verifier = trimOptionalString(request.codeVerifier);
 
             startOAuthCallbackListener(
                 timeout_seconds,
@@ -619,7 +619,7 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
             const client_id = trimOptionalString(request.clientId) orelse return jsonError(allocator, "wait_for_oauth_callback requires clientId");
             const redirect_uri = trimOptionalString(request.redirectUri) orelse return jsonError(allocator, "wait_for_oauth_callback requires redirectUri");
             const oauth_state = trimOptionalString(request.oauthState) orelse return jsonError(allocator, "wait_for_oauth_callback requires oauthState");
-            const code_verifier = trimOptionalString(request.codeVerifier) orelse return jsonError(allocator, "wait_for_oauth_callback requires codeVerifier");
+            const code_verifier = trimOptionalString(request.codeVerifier);
 
             startOAuthCallbackListener(
                 timeout_seconds,
@@ -1408,6 +1408,42 @@ fn extractAccountIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u
     const account_id_value = auth.get("chatgpt_account_id") orelse return null;
     const account_id = jsonGetString(account_id_value) orelse return null;
     return allocator.dupe(u8, account_id) catch null;
+}
+
+fn extractOrganizationIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
+    const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
+    const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
+    if (second_dot <= first_dot + 1) return null;
+
+    const payload_b64 = id_token[first_dot + 1 .. second_dot];
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeUpperBound(payload_b64.len) catch return null;
+    const decoded = allocator.alloc(u8, decoded_len) catch return null;
+    defer allocator.free(decoded);
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_b64) catch return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return null;
+    defer parsed.deinit();
+
+    const payload = jsonGetObject(parsed.value) orelse return null;
+    const auth_value = payload.get("https://api.openai.com/auth") orelse return null;
+    const auth = jsonGetObject(auth_value) orelse return null;
+
+    if (auth.get("organizations")) |organizations_value| {
+        const organizations = jsonGetArray(organizations_value) orelse return null;
+        if (organizations.items.len > 0) {
+            const first_org = jsonGetObject(organizations.items[0]) orelse return null;
+            const org_id_value = first_org.get("id") orelse return null;
+            const org_id = jsonGetString(org_id_value) orelse return null;
+            return allocator.dupe(u8, org_id) catch null;
+        }
+    }
+
+    if (auth.get("organization_id")) |org_id_value| {
+        const org_id = jsonGetString(org_id_value) orelse return null;
+        return allocator.dupe(u8, org_id) catch null;
+    }
+
+    return null;
 }
 
 fn extractEmailFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
@@ -2915,7 +2951,7 @@ const OAuthThreadArgs = struct {
     client_id: []u8,
     redirect_uri: []u8,
     oauth_state: []u8,
-    code_verifier: []u8,
+    code_verifier: ?[]u8 = null,
     label: ?[]u8 = null,
 
     fn init(
@@ -2923,7 +2959,7 @@ const OAuthThreadArgs = struct {
         client_id: []const u8,
         redirect_uri: []const u8,
         oauth_state: []const u8,
-        code_verifier: []const u8,
+        code_verifier: ?[]const u8,
         label: ?[]const u8,
         timeout_seconds: u64,
         external_cancel: *std.atomic.Value(bool),
@@ -2936,8 +2972,11 @@ const OAuthThreadArgs = struct {
         errdefer std.heap.page_allocator.free(redirect_uri_copy);
         const oauth_state_copy = try std.heap.page_allocator.dupe(u8, oauth_state);
         errdefer std.heap.page_allocator.free(oauth_state_copy);
-        const code_verifier_copy = try std.heap.page_allocator.dupe(u8, code_verifier);
-        errdefer std.heap.page_allocator.free(code_verifier_copy);
+        const code_verifier_copy = if (code_verifier) |value|
+            try std.heap.page_allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (code_verifier_copy) |value| std.heap.page_allocator.free(value);
         const label_copy = if (label) |value| try std.heap.page_allocator.dupe(u8, value) else null;
         errdefer if (label_copy) |value| std.heap.page_allocator.free(value);
 
@@ -2958,7 +2997,9 @@ const OAuthThreadArgs = struct {
         std.heap.page_allocator.free(self.client_id);
         std.heap.page_allocator.free(self.redirect_uri);
         std.heap.page_allocator.free(self.oauth_state);
-        std.heap.page_allocator.free(self.code_verifier);
+        if (self.code_verifier) |value| {
+            std.heap.page_allocator.free(value);
+        }
         if (self.label) |value| {
             std.heap.page_allocator.free(value);
         }
@@ -2978,14 +3019,18 @@ const OAuthTokenPair = struct {
 };
 
 const OAuthCallbackQuery = struct {
-    code: []u8,
+    code: ?[]u8 = null,
+    id_token: ?[]u8 = null,
     state: ?[]u8 = null,
+    org_id: ?[]u8 = null,
     auth_error: ?[]u8 = null,
     auth_error_description: ?[]u8 = null,
 
     fn deinit(self: *OAuthCallbackQuery, allocator: std.mem.Allocator) void {
-        allocator.free(self.code);
+        if (self.code) |value| allocator.free(value);
+        if (self.id_token) |value| allocator.free(value);
         if (self.state) |value| allocator.free(value);
+        if (self.org_id) |value| allocator.free(value);
         if (self.auth_error) |value| allocator.free(value);
         if (self.auth_error_description) |value| allocator.free(value);
     }
@@ -3074,26 +3119,38 @@ fn parseOAuthCallbackQuery(allocator: std.mem.Allocator, callback_url: []const u
     const query = callback_url[query_start + 1 .. query_end];
 
     const code = try getDecodedQueryParamValue(allocator, query, "code");
+    errdefer if (code) |value| allocator.free(value);
+    const id_token = try getDecodedQueryParamValue(allocator, query, "id_token");
+    errdefer if (id_token) |value| allocator.free(value);
     const oauth_state = try getDecodedQueryParamValue(allocator, query, "state");
     errdefer if (oauth_state) |value| allocator.free(value);
+    var org_id = try getDecodedQueryParamValue(allocator, query, "org_id");
+    if (org_id == null) {
+        org_id = try getDecodedQueryParamValue(allocator, query, "organization_id");
+    }
+    errdefer if (org_id) |value| allocator.free(value);
     const auth_error = try getDecodedQueryParamValue(allocator, query, "error");
     errdefer if (auth_error) |value| allocator.free(value);
     const auth_error_description = try getDecodedQueryParamValue(allocator, query, "error_description");
     errdefer if (auth_error_description) |value| allocator.free(value);
 
-    if (auth_error != null and code == null) {
+    if (auth_error != null and code == null and id_token == null) {
         return .{
-            .code = try allocator.dupe(u8, ""),
+            .code = null,
+            .id_token = null,
             .state = oauth_state,
+            .org_id = org_id,
             .auth_error = auth_error,
             .auth_error_description = auth_error_description,
         };
     }
 
-    const parsed_code = code orelse return error.CallbackMissingAuthorizationCode;
+    if (code == null and id_token == null) return error.CallbackMissingAuthorizationCode;
     return .{
-        .code = parsed_code,
+        .code = code,
+        .id_token = id_token,
         .state = oauth_state,
+        .org_id = org_id,
         .auth_error = auth_error,
         .auth_error_description = auth_error_description,
     };
@@ -3205,6 +3262,7 @@ fn exchangeApiKeyFromIdToken(
     issuer: []const u8,
     client_id: []const u8,
     id_token: []const u8,
+    organization_id: ?[]const u8,
 ) !?[]u8 {
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
     defer allocator.free(endpoint);
@@ -3231,6 +3289,70 @@ fn exchangeApiKeyFromIdToken(
     try appendCurlFormField(allocator, &argv, &owned_fields, "requested_token", "openai-api-key");
     try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token", id_token);
     try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token_type", ID_TOKEN_TYPE);
+    if (organization_id) |org| {
+        const trimmed = std.mem.trim(u8, org, " \r\n\t");
+        if (trimmed.len > 0) {
+            try appendCurlFormField(allocator, &argv, &owned_fields, "organization_id", trimmed);
+        }
+    }
+    try argv.append(allocator, endpoint);
+
+    const response = runCurlWithStatus(allocator, argv.items, 2 * 1024 * 1024) catch return null;
+    defer allocator.free(response.body);
+    if (response.status < 200 or response.status >= 300) return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch return null;
+    defer parsed.deinit();
+    const payload = jsonGetObject(parsed.value) orelse return null;
+    const access_token = if (payload.get("access_token")) |value| jsonGetString(value) else null;
+    if (access_token == null) return null;
+    return try allocator.dupe(u8, access_token.?);
+}
+
+fn exchangeAccessTokenFromIdToken(
+    allocator: std.mem.Allocator,
+    issuer: []const u8,
+    client_id: []const u8,
+    id_token: []const u8,
+    organization_id: ?[]const u8,
+) !?[]u8 {
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
+    defer allocator.free(endpoint);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    var owned_fields = std.ArrayList([]u8).empty;
+    defer {
+        for (owned_fields.items) |field| allocator.free(field);
+        owned_fields.deinit(allocator);
+    }
+
+    try argv.appendSlice(allocator, &.{
+        "curl",
+        "-sS",
+        "--location",
+        "--write-out",
+        "\n%{http_code}",
+        "-H",
+        "Content-Type: application/x-www-form-urlencoded",
+    });
+    try appendCurlFormField(allocator, &argv, &owned_fields, "grant_type", TOKEN_EXCHANGE_GRANT);
+    try appendCurlFormField(allocator, &argv, &owned_fields, "client_id", client_id);
+    try appendCurlFormField(
+        allocator,
+        &argv,
+        &owned_fields,
+        "requested_token",
+        "urn:ietf:params:oauth:token-type:access_token",
+    );
+    try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token", id_token);
+    try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token_type", ID_TOKEN_TYPE);
+    if (organization_id) |org| {
+        const trimmed = std.mem.trim(u8, org, " \r\n\t");
+        if (trimmed.len > 0) {
+            try appendCurlFormField(allocator, &argv, &owned_fields, "organization_id", trimmed);
+        }
+    }
     try argv.append(allocator, endpoint);
 
     const response = runCurlWithStatus(allocator, argv.items, 2 * 1024 * 1024) catch return null;
@@ -3267,7 +3389,7 @@ fn buildChatgptAuthPayloadJson(
     try writeJsonOptionalString(writer, account_id);
     try writer.writeAll("},\"last_refresh\":");
 
-    const last_refresh = try std.fmt.allocPrint(allocator, "{}", .{std.time.timestamp()});
+    const last_refresh = try formatIso8601UtcMillis(allocator, std.time.milliTimestamp());
     defer allocator.free(last_refresh);
     try writeJsonString(writer, last_refresh);
 
@@ -3280,6 +3402,32 @@ fn buildChatgptAuthPayloadJson(
     return buffer.toOwnedSlice(allocator);
 }
 
+fn formatIso8601UtcMillis(allocator: std.mem.Allocator, timestamp_ms: i64) ![]u8 {
+    const clamped_ms: i64 = if (timestamp_ms < 0) 0 else timestamp_ms;
+    const seconds_since_epoch: u64 = @intCast(@divTrunc(clamped_ms, 1000));
+    const millis: u16 = @intCast(@mod(clamped_ms, 1000));
+
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds_since_epoch };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+            millis,
+        },
+    );
+}
+
 fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAuthThreadArgs, callback_url: []const u8) !OAuthReadyAccount {
     var callback_query = try parseOAuthCallbackQuery(allocator, callback_url);
     defer callback_query.deinit(allocator);
@@ -3288,22 +3436,78 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
         return error.OAuthAuthorizationFailed;
     }
 
-    const callback_state = callback_query.state orelse return error.OAuthStateMissing;
-    if (!std.mem.eql(u8, callback_state, args.oauth_state)) {
-        return error.OAuthStateMismatch;
+    if (callback_query.state) |callback_state| {
+        if (!std.mem.eql(u8, callback_state, args.oauth_state)) {
+            return error.OAuthStateMismatch;
+        }
     }
 
-    var tokens = try exchangeAuthorizationCodeForTokens(
+    var tokens: OAuthTokenPair = undefined;
+    if (callback_query.code) |authorization_code| {
+        const code_verifier = args.code_verifier orelse return error.AuthorizationCodeExchangeFailed;
+        tokens = try exchangeAuthorizationCodeForTokens(
+            allocator,
+            args.issuer,
+            args.client_id,
+            args.redirect_uri,
+            authorization_code,
+            code_verifier,
+        );
+    } else if (callback_query.id_token) |id_token| {
+        var org_id_owned: ?[]u8 = null;
+        defer if (org_id_owned) |value| allocator.free(value);
+
+        if (callback_query.org_id) |org_id| {
+            const trimmed = std.mem.trim(u8, org_id, " \r\n\t");
+            if (trimmed.len > 0) {
+                org_id_owned = try allocator.dupe(u8, trimmed);
+            }
+        }
+        if (org_id_owned == null) {
+            org_id_owned = extractOrganizationIdFromIdToken(allocator, id_token);
+        }
+
+        const exchanged_access_token = exchangeAccessTokenFromIdToken(
+            allocator,
+            args.issuer,
+            args.client_id,
+            id_token,
+            org_id_owned,
+        ) catch null;
+        if (exchanged_access_token == null) {
+            return error.AuthorizationCodeExchangeFailed;
+        }
+
+        tokens = .{
+            .id_token = try allocator.dupe(u8, id_token),
+            .access_token = exchanged_access_token.?,
+            // Token exchange callback flow does not provide refresh token.
+            .refresh_token = try allocator.dupe(u8, ""),
+        };
+    } else {
+        return error.CallbackMissingAuthorizationCode;
+    }
+    defer tokens.deinit(allocator);
+
+    var organization_id_owned: ?[]u8 = null;
+    defer if (organization_id_owned) |value| allocator.free(value);
+    if (callback_query.org_id) |org_id| {
+        const trimmed = std.mem.trim(u8, org_id, " \r\n\t");
+        if (trimmed.len > 0) {
+            organization_id_owned = try allocator.dupe(u8, trimmed);
+        }
+    }
+    if (organization_id_owned == null) {
+        organization_id_owned = extractOrganizationIdFromIdToken(allocator, tokens.id_token);
+    }
+
+    const api_key = try exchangeApiKeyFromIdToken(
         allocator,
         args.issuer,
         args.client_id,
-        args.redirect_uri,
-        callback_query.code,
-        args.code_verifier,
+        tokens.id_token,
+        organization_id_owned,
     );
-    defer tokens.deinit(allocator);
-
-    const api_key = try exchangeApiKeyFromIdToken(allocator, args.issuer, args.client_id, tokens.id_token);
     defer if (api_key) |value| allocator.free(value);
 
     const auth_json = try buildChatgptAuthPayloadJson(allocator, &tokens, api_key);
@@ -3349,7 +3553,7 @@ fn startOAuthCallbackListener(
     client_id: []const u8,
     redirect_uri: []const u8,
     oauth_state: []const u8,
-    code_verifier: []const u8,
+    code_verifier: ?[]const u8,
     label: ?[]const u8,
 ) !void {
     oauth_listener_state.mutex.lock();
@@ -3573,7 +3777,9 @@ fn waitForOAuthCallback(
         var conn = connection;
         defer conn.stream.close();
 
-        var buffer: [8192]u8 = undefined;
+        var request_buffer = std.ArrayList(u8).empty;
+        defer request_buffer.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
         while (true) {
             if (cancel_ptr.load(.seq_cst)) {
                 return error.CallbackListenerStopped;
@@ -3601,7 +3807,7 @@ fn waitForOAuthCallback(
                 continue :accept_loop;
             }
 
-            const read_size = conn.stream.read(&buffer) catch |err| switch (err) {
+            const read_size = conn.stream.read(&chunk) catch |err| switch (err) {
                 error.WouldBlock => continue,
                 else => continue :accept_loop,
             };
@@ -3609,8 +3815,17 @@ fn waitForOAuthCallback(
                 continue :accept_loop;
             }
 
-            const request = buffer[0..read_size];
-            const maybe_target = extractRequestTarget(request);
+            try request_buffer.appendSlice(allocator, chunk[0..read_size]);
+            if (request_buffer.items.len > 64 * 1024) {
+                writeHttpResponse(conn.stream, "413 Payload Too Large", "<html><body>Callback request too large.</body></html>");
+                continue :accept_loop;
+            }
+
+            if (std.mem.indexOfScalar(u8, request_buffer.items, '\n') == null) {
+                continue;
+            }
+
+            const maybe_target = extractRequestTarget(request_buffer.items);
 
             if (maybe_target) |target| {
                 if (std.mem.startsWith(u8, target, "/auth/callback")) {
@@ -3745,4 +3960,39 @@ test "extractRequestTarget rejects non-GET methods" {
         "POST /auth/callback HTTP/1.1\r\n" ++
         "Host: localhost:1455\r\n\r\n";
     try std.testing.expectEqual(@as(?[]const u8, null), extractRequestTarget(request));
+}
+
+test "parseOAuthCallbackQuery accepts id_token callback without state" {
+    var parsed = try parseOAuthCallbackQuery(
+        std.testing.allocator,
+        "http://localhost:1455/auth/callback?id_token=a.b.c&org_id=org_test&needs_setup=false",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.code == null);
+    try std.testing.expect(parsed.id_token != null);
+    try std.testing.expectEqualStrings("a.b.c", parsed.id_token.?);
+    try std.testing.expect(parsed.state == null);
+    try std.testing.expect(parsed.org_id != null);
+    try std.testing.expectEqualStrings("org_test", parsed.org_id.?);
+}
+
+test "parseOAuthCallbackQuery accepts authorization code callback" {
+    var parsed = try parseOAuthCallbackQuery(
+        std.testing.allocator,
+        "http://localhost:1455/auth/callback?code=abc123&state=xyz",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.code != null);
+    try std.testing.expectEqualStrings("abc123", parsed.code.?);
+    try std.testing.expect(parsed.id_token == null);
+    try std.testing.expect(parsed.state != null);
+    try std.testing.expectEqualStrings("xyz", parsed.state.?);
+}
+
+test "formatIso8601UtcMillis renders UTC timestamp with milliseconds" {
+    const formatted = try formatIso8601UtcMillis(std.testing.allocator, 0);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000Z", formatted);
 }
