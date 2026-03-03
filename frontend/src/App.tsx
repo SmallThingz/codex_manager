@@ -304,6 +304,39 @@ const accountMetaLine = (account: AccountSummary): string | null => {
   return null;
 };
 
+const DEFAULT_REFRESH_ERROR_MESSAGE = "Credits refresh failed.";
+
+const normalizeRefreshErrorMessage = (value: string | null | undefined): string => {
+  const trimmed = (value ?? "").trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_REFRESH_ERROR_MESSAGE;
+};
+
+const makeErroredCreditsInfo = (message: string, previous?: CreditsInfo): CreditsInfo => ({
+  available: null,
+  used: null,
+  total: null,
+  currency: previous?.currency ?? "USD",
+  source: previous?.source ?? "wham_usage",
+  mode: previous?.mode ?? "balance",
+  unit: previous?.unit ?? "USD",
+  planType: previous?.planType ?? null,
+  isPaidPlan: previous?.isPaidPlan ?? false,
+  hourlyRemainingPercent: null,
+  weeklyRemainingPercent: null,
+  hourlyRefreshAt: null,
+  weeklyRefreshAt: null,
+  status: "error",
+  message: normalizeRefreshErrorMessage(message),
+  checkedAt: nowEpoch(),
+});
+
+const refreshErrorMessageForCredits = (credits: CreditsInfo | undefined): string | null => {
+  if (!credits || credits.status !== "error") {
+    return null;
+  }
+  return normalizeRefreshErrorMessage(credits.message);
+};
+
 const applyTheme = (theme: Theme) => {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("codex-manager-theme", theme);
@@ -543,6 +576,15 @@ function App() {
     });
   };
 
+  const setAccountRefreshError = (accountId: string, reason: unknown): string => {
+    const message = normalizeRefreshErrorMessage(reason instanceof Error ? reason.message : String(reason));
+    setCreditsById((current) => ({
+      ...current,
+      [accountId]: makeErroredCreditsInfo(message, current[accountId]),
+    }));
+    return message;
+  };
+
   const accountStateForBucket = (bucket: AccountBucket): AccountSummary["state"] => {
     if (bucket === "depleted") {
       return "archived";
@@ -710,8 +752,8 @@ function App() {
               failureMessages.push(`Credits check issue: ${credits.message}`);
             }
           } catch (creditsError) {
-            const rendered = creditsError instanceof Error ? creditsError.message : String(creditsError);
-            failureMessages.push(rendered);
+            const message = setAccountRefreshError(id, creditsError);
+            failureMessages.push(`Credits check issue: ${message}`);
           } finally {
             markRefreshing([id], false);
           }
@@ -747,6 +789,9 @@ function App() {
       } else {
         setError(`Credits check issue: ${credits.message}`);
       }
+    } catch (creditsError) {
+      const message = setAccountRefreshError(id, creditsError);
+      setError(`Credits check issue: ${message}`);
     } finally {
       markRefreshing([id], false);
     }
@@ -1853,6 +1898,7 @@ function App() {
                   <For each={activeAccounts()}>
                     {(account) => {
                       const credits = () => creditsById()[account.id];
+                      const refreshErrorMessage = () => refreshErrorMessageForCredits(credits());
                       const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
                       const isCurrent = () => view()?.activeAccountId === account.id;
 
@@ -1874,7 +1920,12 @@ function App() {
                               <IconDragHandle />
                             </span>
                             <div class="account-main">
-                              <p class="account-title account-main-value">{accountTitle(account)}</p>
+                              <p
+                                class={`account-title account-main-value ${refreshErrorMessage() ? "account-main-error" : ""}`}
+                                title={refreshErrorMessage() ?? undefined}
+                              >
+                                {accountTitle(account)}
+                              </p>
                             </div>
                             <Show when={isCurrent()}>
                               <p class="pill pill-active">ACTIVE</p>
@@ -2047,6 +2098,7 @@ function App() {
                     <For each={depletedAccounts()}>
                       {(account) => {
                         const credits = () => creditsById()[account.id];
+                        const refreshErrorMessage = () => refreshErrorMessageForCredits(credits());
                         const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                         return (
@@ -2065,7 +2117,12 @@ function App() {
                                 <IconDragHandle />
                               </span>
                               <div class="account-main">
-                                <p class="account-title account-main-value">{accountTitle(account)}</p>
+                                <p
+                                  class={`account-title account-main-value ${refreshErrorMessage() ? "account-main-error" : ""}`}
+                                  title={refreshErrorMessage() ?? undefined}
+                                >
+                                  {accountTitle(account)}
+                                </p>
                               </div>
                             </header>
 
@@ -2229,6 +2286,7 @@ function App() {
                       {(account) => {
                         const credits = () => creditsById()[account.id];
                         const availablePercent = () => quotaRemainingPercent(credits());
+                        const refreshErrorMessage = () => refreshErrorMessageForCredits(credits());
                         const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                         return (
@@ -2247,7 +2305,12 @@ function App() {
                                 <IconDragHandle />
                               </span>
                               <div class="account-main">
-                                <p class="account-title account-main-value">{accountTitle(account)}</p>
+                                <p
+                                  class={`account-title account-main-value ${refreshErrorMessage() ? "account-main-error" : ""}`}
+                                  title={refreshErrorMessage() ?? undefined}
+                                >
+                                  {accountTitle(account)}
+                                </p>
                               </div>
                             </header>
 

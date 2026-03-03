@@ -670,6 +670,13 @@ select {
   -webkit-user-select: none;
 }
 
+.account-main-error {
+  color: var(--danger);
+  text-decoration: underline dotted;
+  text-underline-offset: 0.15em;
+  cursor: help;
+}
+
 .drag-handle {
   width: 2.25rem;
   height: 2.25rem;

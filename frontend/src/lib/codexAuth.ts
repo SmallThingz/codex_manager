@@ -172,7 +172,7 @@ const normalizeUsageRefreshDisplayMode = (value: unknown): "date" | "remaining" 
   return value === "remaining" ? "remaining" : "date";
 };
 
-const defaultCreditsInfo = (message: string): CreditsInfo => ({
+const errorCreditsInfo = (message: string): CreditsInfo => ({
   available: null,
   used: null,
   total: null,
@@ -186,8 +186,8 @@ const defaultCreditsInfo = (message: string): CreditsInfo => ({
   weeklyRemainingPercent: null,
   hourlyRefreshAt: null,
   weeklyRefreshAt: null,
-  status: "unavailable",
-  message,
+  status: "error",
+  message: message.trim().length > 0 ? message.trim() : "Credits refresh failed.",
   checkedAt: nowEpoch(),
 });
 
@@ -634,24 +634,37 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
   }
 
   const pending = (async (): Promise<CreditsInfo> => {
-    const tauri = await loadBackendApis();
+    try {
+      const tauri = await loadBackendApis();
 
-    while (true) {
-      const payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
-      const record = asRecord(payload);
-      if (record) {
-        const inFlight = valueAsBoolean(record.inFlight) ?? false;
-        if (inFlight) {
-          await new Promise((resolve) => window.setTimeout(resolve, 500));
-          continue;
+      while (true) {
+        let payload: unknown;
+        try {
+          payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
+        } catch (invokeError) {
+          const rendered = invokeError instanceof Error ? invokeError.message : String(invokeError);
+          return errorCreditsInfo(rendered);
         }
 
-        const credits = asCreditsInfo(record.credits);
-        if (credits) {
-          return credits;
+        const record = asRecord(payload);
+        if (record) {
+          const inFlight = valueAsBoolean(record.inFlight) ?? false;
+          if (inFlight) {
+            await new Promise((resolve) => window.setTimeout(resolve, 500));
+            continue;
+          }
+
+          const credits = asCreditsInfo(record.credits);
+          if (credits) {
+            return credits;
+          }
         }
+
+        return errorCreditsInfo("Usage refresh returned an invalid response.");
       }
-      return defaultCreditsInfo("No usage data available for this account.");
+    } catch (refreshError) {
+      const rendered = refreshError instanceof Error ? refreshError.message : String(refreshError);
+      return errorCreditsInfo(rendered);
     }
   })();
 
