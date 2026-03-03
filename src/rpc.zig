@@ -1653,7 +1653,10 @@ fn httpFetch(
     defer client.deinit();
 
     var req = client.request(method, uri, .{
-        .headers = .{ .user_agent = .{ .override = "codex-cli" } },
+        .headers = .{
+            .user_agent = .{ .override = "codex-cli" },
+            .accept_encoding = .omit,
+        },
         .extra_headers = headers,
     }) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http prepare fail") };
     defer req.deinit();

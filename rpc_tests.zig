@@ -1,5 +1,5 @@
-const _ = @import("src/rpc.zig");
+const std = @import("std");
 
 test {
-    // Tests are defined in src/rpc.zig and are included via import.
+    std.testing.refAllDecls(@import("src/rpc.zig"));
 }
