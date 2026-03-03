@@ -3209,3 +3209,40 @@ test "formatIso8601UtcMillis renders UTC timestamp with milliseconds" {
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00.000Z", formatted);
 }
+
+test "json utilities" {
+    try std.testing.expectEqual(true, jsonGetBool(.{ .bool = true }) orelse false);
+    try std.testing.expectEqual(true, jsonGetBool(.{ .integer = 1 }) orelse false);
+    try std.testing.expectEqual(false, jsonGetBool(.{ .integer = 0 }) orelse true);
+    try std.testing.expectEqual(true, jsonGetBool(.{ .string = "true" }) orelse false);
+    try std.testing.expectEqual(false, jsonGetBool(.{ .string = "0" }) orelse true);
+    try std.testing.expectEqual(@as(?bool, null), jsonGetBool(.{ .integer = 2 }));
+
+    try std.testing.expectEqual(@as(?f64, 1.5), jsonGetF64(.{ .float = 1.5 }));
+    try std.testing.expectEqual(@as(?f64, 2.0), jsonGetF64(.{ .integer = 2 }));
+    try std.testing.expectEqual(@as(?f64, 3.14), jsonGetF64(.{ .string = "3.14" }));
+
+    try std.testing.expectEqual(@as(?i64, 42), jsonGetI64(.{ .integer = 42 }));
+    try std.testing.expectEqual(@as(?i64, 42), jsonGetI64(.{ .float = 42.9 }));
+    try std.testing.expectEqual(@as(?i64, 42), jsonGetI64(.{ .string = "42" }));
+}
+
+test "trimOptionalString trims whitespace" {
+    try std.testing.expectEqualStrings("test", trimOptionalString(" test ") orelse return error.Fail);
+    try std.testing.expectEqual(@as(?[]const u8, null), trimOptionalString("   "));
+    try std.testing.expectEqual(@as(?[]const u8, null), trimOptionalString(null));
+}
+
+test "parseAccountBucket returns correct buckets" {
+    try std.testing.expectEqual(AccountBucket.active, parseAccountBucket("active"));
+    try std.testing.expectEqual(AccountBucket.depleted, parseAccountBucket("depleted"));
+    try std.testing.expectEqual(AccountBucket.frozen, parseAccountBucket("frozen"));
+    try std.testing.expectEqual(@as(?AccountBucket, null), parseAccountBucket("unknown"));
+}
+
+test "normalizeAutoRefreshIntervalSec applies bounds" {
+    try std.testing.expectEqual(@as(u64, 300), normalizeAutoRefreshIntervalSec(null));
+    try std.testing.expectEqual(@as(u64, 15), normalizeAutoRefreshIntervalSec(10));
+    try std.testing.expectEqual(@as(u64, 21600), normalizeAutoRefreshIntervalSec(21601));
+    try std.testing.expectEqual(@as(u64, 60), normalizeAutoRefreshIntervalSec(60));
+}
