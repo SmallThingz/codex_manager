@@ -147,8 +147,8 @@ pub fn build(b: *std.Build) void {
     const macos_sdk_auto_download = b.option(
         bool,
         "macos_sdk_auto_download",
-        "Automatically download macOS SDK when needed for macOS cross-compilation.",
-    ) orelse false;
+        "Automatically download macOS SDK when needed for macOS cross-compilation (default: true).",
+    ) orelse true;
     const macos_sdk_url = b.option(
         []const u8,
         "macos_sdk_url",
@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
 
     if (!target.query.isNative() and target.result.os.tag == .macos and b.sysroot == null) {
         const fail = b.addFail(
-            "Cross-compiling to macOS requires --sysroot <sdk>. For matrix builds, use `zig build build-all-targets -Dmacos_sdk_auto_download=true`.",
+            "Cross-compiling to macOS requires --sysroot <sdk>. `build-all-targets` auto-downloads one by default unless `-Dmacos_sdk_auto_download=false` is set.",
         );
         b.default_step.dependOn(&fail.step);
         b.getInstallStep().dependOn(&fail.step);
@@ -304,7 +304,28 @@ pub fn build(b: *std.Build) void {
     const dev_step = b.step("dev", "Build frontend and run Codex Manager in dev mode");
     const installed_exe_name = matrix_name orelse "codex-manager";
     const installed_exe_path = b.getInstallPath(.bin, installed_exe_name);
-    const run_cmd = b.addSystemCommand(&.{installed_exe_path});
+    const dev_runner_script =
+        \\set -euo pipefail
+        \\ulimit -c unlimited || true
+        \\export ZIG_BACKTRACE=full
+        \\if [ "${CM_DEV_NO_GDB:-0}" = "1" ]; then
+        \\  exec "$0" "$@"
+        \\fi
+        \\if command -v gdb >/dev/null 2>&1; then
+        \\  exec gdb -q -nx -batch \
+        \\    -iex "set debuginfod enabled off" \
+        \\    -ex "set pagination off" \
+        \\    -ex "set confirm off" \
+        \\    -ex "set print thread-events off" \
+        \\    -ex "run" \
+        \\    -ex "thread apply all bt full" \
+        \\    -ex "quit" \
+        \\    --args "$0" "$@"
+        \\fi
+        \\exec "$0" "$@"
+    ;
+
+    const run_cmd = b.addSystemCommand(&.{ "bash", "-lc", dev_runner_script, installed_exe_path });
     run_cmd.step.dependOn(&install_artifact.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);

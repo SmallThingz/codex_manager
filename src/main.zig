@@ -7,7 +7,6 @@ const rpc_webui = @import("rpc_webui.zig");
 
 const DEFAULT_WIDTH: u32 = 1000;
 const DEFAULT_HEIGHT: u32 = 760;
-const BROWSER_IDLE_SHUTDOWN_DELAY_MS: i64 = 3000;
 
 const LaunchRequest = struct {
     surfaces: [3]?webui.LaunchSurface = .{ null, null, null },
@@ -165,28 +164,9 @@ fn runModeService(
         std.debug.print("Codex Manager URL: {s}\n", .{url});
     }
 
-    var browser_shutdown_deadline_ms: ?i64 = null;
-    while (true) {
-        try service.run();
-        if (!service.shouldExit()) {
-            browser_shutdown_deadline_ms = null;
-            std.Thread.sleep(16 * std.time.ns_per_ms);
-            continue;
-        }
-
-        const active_surface = service.runtimeRenderState().active_surface;
-        const browser_surface = active_surface == .browser_window or active_surface == .web_url;
-        if (browser_surface) {
-            const now_ms = std.time.milliTimestamp();
-            if (browser_shutdown_deadline_ms == null) {
-                browser_shutdown_deadline_ms = now_ms + BROWSER_IDLE_SHUTDOWN_DELAY_MS;
-            }
-            if (now_ms < browser_shutdown_deadline_ms.?) {
-                std.Thread.sleep(16 * std.time.ns_per_ms);
-                continue;
-            }
-        }
-
-        break;
+    try service.run();
+    while (!service.shouldExit()) {
+        std.Thread.sleep(16 * std.time.ns_per_ms);
     }
+    service.shutdown();
 }
