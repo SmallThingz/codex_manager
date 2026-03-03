@@ -1620,6 +1620,72 @@ fn parseWhamCredits(
     return result;
 }
 
+fn appendUrlEncoded(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const u8) !void {
+    for (raw) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.', '~' => try buf.append(allocator, c),
+            else => {
+                var hex: [3]u8 = undefined;
+                _ = try std.fmt.bufPrint(&hex, "%{X:0>2}", .{c});
+                try buf.appendSlice(allocator, &hex);
+            },
+        }
+    }
+}
+
+fn appendFormField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+    if (buf.items.len > 0) try buf.append(allocator, '&');
+    try appendUrlEncoded(allocator, buf, key);
+    try buf.append(allocator, '=');
+    try appendUrlEncoded(allocator, buf, value);
+}
+
+fn httpFetch(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    uri_string: []const u8,
+    headers: []const std.http.Header,
+    body: ?[]const u8,
+) !UsageResult {
+    const uri = std.Uri.parse(uri_string) catch return .{ .status = 599, .body = try allocator.dupe(u8, "invalid uri") };
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var req = client.request(method, uri, .{
+        .headers = .{ .user_agent = .{ .override = "codex-cli" } },
+        .extra_headers = headers,
+    }) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http prepare fail") };
+    defer req.deinit();
+
+    if (body) |b| {
+        var transfer_buf: [4096]u8 = undefined;
+        req.transfer_encoding = .{ .content_length = b.len };
+        var bw = req.sendBodyUnflushed(&transfer_buf) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http flush fail") };
+        bw.writer.writeAll(b) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http write fail") };
+        bw.end() catch return .{ .status = 599, .body = try allocator.dupe(u8, "http finish fail") };
+        req.connection.?.flush() catch return .{ .status = 599, .body = try allocator.dupe(u8, "http socket fail") };
+    } else {
+        req.sendBodiless() catch return .{ .status = 599, .body = try allocator.dupe(u8, "http fetch fail") };
+    }
+
+    var redirect_buf: [2048]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http parse fail") };
+
+    var transfer_buf: [8192]u8 = undefined;
+    var body_reader = response.reader(&transfer_buf);
+
+    var body_buf = std.ArrayList(u8).empty;
+    defer body_buf.deinit(allocator);
+
+    body_reader.appendRemaining(allocator, &body_buf, std.io.Limit.unlimited) catch {};
+
+    return .{
+        .status = @intFromEnum(response.head.status),
+        .body = try body_buf.toOwnedSlice(allocator),
+    };
+}
+
 fn fetchLegacyCreditsFromApiKey(allocator: std.mem.Allocator, api_key: []const u8, checked_at: i64) !CreditsInfo {
     const endpoints = [_][]const u8{
         "https://api.openai.com/dashboard/billing/credit_grants",
@@ -1630,32 +1696,19 @@ fn fetchLegacyCreditsFromApiKey(allocator: std.mem.Allocator, api_key: []const u
     defer allocator.free(last_error);
 
     for (endpoints) |endpoint| {
-        var argv = std.ArrayList([]const u8).empty;
-        defer argv.deinit(allocator);
-
-        const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(auth_header);
-        try argv.appendSlice(allocator, &.{ "curl", "-sS", "--location", "--write-out", "\n%{http_code}", "-H", auth_header, endpoint });
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = argv.items,
-            .max_output_bytes = 2 * 1024 * 1024,
-        }) catch {
-            continue;
+        var request_headers = [_]std.http.Header{
+            .{ .name = "Authorization", .value = auth_header },
         };
-        defer allocator.free(result.stderr);
-        defer allocator.free(result.stdout);
 
-        const newline_index = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse continue;
-        const body_slice = result.stdout[0..newline_index];
-        const status_slice = std.mem.trim(u8, result.stdout[newline_index + 1 ..], " \r\n\t");
-        const status_code = std.fmt.parseInt(u16, status_slice, 10) catch 599;
-        if (status_code < 200 or status_code >= 300) {
-            continue;
-        }
+        const result = httpFetch(allocator, .GET, endpoint, &request_headers, null) catch continue;
+        defer allocator.free(result.body);
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_slice, .{}) catch continue;
+        if (result.status < 200 or result.status >= 300) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, result.body, .{}) catch continue;
         defer parsed.deinit();
         const payload = jsonGetObject(parsed.value) orelse continue;
         const summary = if (payload.get("credit_summary")) |value| jsonGetObject(value) else null;
@@ -1755,49 +1808,19 @@ fn fetchCreditsFromAuthJson(
 }
 
 fn fetchEmailFromOpenAiApi(allocator: std.mem.Allocator, access_token: []const u8) !?[]u8 {
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{access_token});
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
     defer allocator.free(auth_header);
 
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--write-out",
-        "\n%{http_code}",
-        "-H",
-        auth_header,
-        "-H",
-        "User-Agent: codex-cli",
-        "https://api.openai.com/v1/me",
-    });
+    var request_headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth_header },
+    };
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 1024 * 1024,
-    }) catch return null;
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
+    const result = httpFetch(allocator, .GET, "https://api.openai.com/v1/me", &request_headers, null) catch return null;
+    defer allocator.free(result.body);
 
-    switch (result.term) {
-        .Exited => |code| {
-            if (code != 0) return null;
-        },
-        else => return null,
-    }
+    if (result.status < 200 or result.status >= 300) return null;
 
-    const newline_index = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return null;
-    const body_slice = result.stdout[0..newline_index];
-    const status_slice = std.mem.trim(u8, result.stdout[newline_index + 1 ..], " \r\n\t");
-    const status_code = std.fmt.parseInt(u16, status_slice, 10) catch 599;
-    if (status_code < 200 or status_code >= 300) {
-        return null;
-    }
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body_slice, .{}) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result.body, .{}) catch return null;
     defer parsed.deinit();
     const root = jsonGetObject(parsed.value) orelse return null;
     const email_value = root.get("email") orelse return null;
@@ -2227,75 +2250,25 @@ fn fetchWhamUsage(
     access_token: []const u8,
     account_id: ?[]const u8,
 ) !UsageResult {
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--write-out",
-        "\n%{http_code}",
-        "-H",
-        "User-Agent: codex-cli",
-    });
-
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{access_token});
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
     defer allocator.free(auth_header);
-    try argv.appendSlice(allocator, &.{ "-H", auth_header });
+
+    var header_list = std.ArrayList(std.http.Header).empty;
+    defer header_list.deinit(allocator);
+
+    try header_list.append(allocator, .{ .name = "Authorization", .value = auth_header });
 
     var account_header: ?[]u8 = null;
     defer if (account_header) |header| allocator.free(header);
 
     if (account_id) |id| {
         if (id.len > 0) {
-            const header = try std.fmt.allocPrint(allocator, "ChatGPT-Account-Id: {s}", .{id});
-            account_header = header;
-            try argv.appendSlice(allocator, &.{ "-H", header });
+            account_header = try allocator.dupe(u8, id);
+            try header_list.append(allocator, .{ .name = "ChatGPT-Account-Id", .value = account_header.? });
         }
     }
 
-    try argv.append(allocator, "https://chatgpt.com/backend-api/wham/usage");
-
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 2 * 1024 * 1024,
-    }) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "curl spawn failed: {s}", .{@errorName(err)});
-        return .{ .status = 599, .body = message };
-    };
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-
-    switch (result.term) {
-        .Exited => |code| {
-            if (code != 0) {
-                const stderr_text = std.mem.trim(u8, result.stderr, " \r\n\t");
-                const message = if (stderr_text.len == 0)
-                    try allocator.dupe(u8, "curl failed")
-                else
-                    try allocator.dupe(u8, stderr_text);
-                return .{ .status = 599, .body = message };
-            }
-        },
-        else => {
-            return .{ .status = 599, .body = try allocator.dupe(u8, "curl terminated unexpectedly") };
-        },
-    }
-
-    const newline_index = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse {
-        return .{ .status = 599, .body = try allocator.dupe(u8, "curl returned malformed response") };
-    };
-
-    const body_slice = result.stdout[0..newline_index];
-    const status_slice = std.mem.trim(u8, result.stdout[newline_index + 1 ..], " \r\n\t");
-    const status_code = std.fmt.parseInt(u16, status_slice, 10) catch 599;
-
-    return .{
-        .status = status_code,
-        .body = try allocator.dupe(u8, body_slice),
-    };
+    return httpFetch(allocator, .GET, "https://chatgpt.com/backend-api/wham/usage", header_list.items, null);
 }
 
 fn writeHttpResponse(stream: std.net.Stream, status: []const u8, body: []const u8) void {
@@ -2537,48 +2510,6 @@ fn parseOAuthCallbackQuery(allocator: std.mem.Allocator, callback_url: []const u
     };
 }
 
-fn appendCurlFormField(
-    allocator: std.mem.Allocator,
-    argv: *std.ArrayList([]const u8),
-    owned_fields: *std.ArrayList([]u8),
-    key: []const u8,
-    value: []const u8,
-) !void {
-    const field = try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
-    try owned_fields.append(allocator, field);
-    try argv.appendSlice(allocator, &.{ "--data-urlencode", field });
-}
-
-fn runCurlWithStatus(
-    allocator: std.mem.Allocator,
-    argv: []const []const u8,
-    max_output_bytes: usize,
-) !UsageResult {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = max_output_bytes,
-    }) catch return error.CurlSpawnFailed;
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-
-    switch (result.term) {
-        .Exited => |code| {
-            if (code != 0) return error.CurlCommandFailed;
-        },
-        else => return error.CurlCommandFailed,
-    }
-
-    const newline_index = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.CurlMalformedResponse;
-    const body_slice = result.stdout[0..newline_index];
-    const status_slice = std.mem.trim(u8, result.stdout[newline_index + 1 ..], " \r\n\t");
-    const status_code = std.fmt.parseInt(u16, status_slice, 10) catch return error.CurlMalformedResponse;
-    return .{
-        .status = status_code,
-        .body = try allocator.dupe(u8, body_slice),
-    };
-}
-
 fn exchangeAuthorizationCodeForTokens(
     allocator: std.mem.Allocator,
     issuer: []const u8,
@@ -2590,31 +2521,20 @@ fn exchangeAuthorizationCodeForTokens(
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
     defer allocator.free(endpoint);
 
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-    var owned_fields = std.ArrayList([]u8).empty;
-    defer {
-        for (owned_fields.items) |field| allocator.free(field);
-        owned_fields.deinit(allocator);
-    }
+    var body_buf = std.ArrayList(u8).empty;
+    defer body_buf.deinit(allocator);
 
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--write-out",
-        "\n%{http_code}",
-        "-H",
-        "Content-Type: application/x-www-form-urlencoded",
-    });
-    try appendCurlFormField(allocator, &argv, &owned_fields, "grant_type", "authorization_code");
-    try appendCurlFormField(allocator, &argv, &owned_fields, "code", code);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "redirect_uri", redirect_uri);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "client_id", client_id);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "code_verifier", code_verifier);
-    try argv.append(allocator, endpoint);
+    try appendFormField(allocator, &body_buf, "grant_type", "authorization_code");
+    try appendFormField(allocator, &body_buf, "code", code);
+    try appendFormField(allocator, &body_buf, "redirect_uri", redirect_uri);
+    try appendFormField(allocator, &body_buf, "client_id", client_id);
+    try appendFormField(allocator, &body_buf, "code_verifier", code_verifier);
 
-    const response = try runCurlWithStatus(allocator, argv.items, 2 * 1024 * 1024);
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+    };
+
+    const response = try httpFetch(allocator, .POST, endpoint, &headers, body_buf.items);
     defer allocator.free(response.body);
     if (response.status < 200 or response.status >= 300) {
         return error.AuthorizationCodeExchangeFailed;
@@ -2648,37 +2568,26 @@ fn exchangeApiKeyFromIdToken(
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
     defer allocator.free(endpoint);
 
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-    var owned_fields = std.ArrayList([]u8).empty;
-    defer {
-        for (owned_fields.items) |field| allocator.free(field);
-        owned_fields.deinit(allocator);
-    }
+    var body_buf = std.ArrayList(u8).empty;
+    defer body_buf.deinit(allocator);
 
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--write-out",
-        "\n%{http_code}",
-        "-H",
-        "Content-Type: application/x-www-form-urlencoded",
-    });
-    try appendCurlFormField(allocator, &argv, &owned_fields, "grant_type", TOKEN_EXCHANGE_GRANT);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "client_id", client_id);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "requested_token", "openai-api-key");
-    try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token", id_token);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token_type", ID_TOKEN_TYPE);
+    try appendFormField(allocator, &body_buf, "grant_type", TOKEN_EXCHANGE_GRANT);
+    try appendFormField(allocator, &body_buf, "client_id", client_id);
+    try appendFormField(allocator, &body_buf, "requested_token", "openai-api-key");
+    try appendFormField(allocator, &body_buf, "subject_token", id_token);
+    try appendFormField(allocator, &body_buf, "subject_token_type", ID_TOKEN_TYPE);
     if (organization_id) |org| {
         const trimmed = std.mem.trim(u8, org, " \r\n\t");
         if (trimmed.len > 0) {
-            try appendCurlFormField(allocator, &argv, &owned_fields, "organization_id", trimmed);
+            try appendFormField(allocator, &body_buf, "organization_id", trimmed);
         }
     }
-    try argv.append(allocator, endpoint);
 
-    const response = runCurlWithStatus(allocator, argv.items, 2 * 1024 * 1024) catch return null;
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+    };
+
+    const response = httpFetch(allocator, .POST, endpoint, &headers, body_buf.items) catch return null;
     defer allocator.free(response.body);
     if (response.status < 200 or response.status >= 300) return null;
 
@@ -2700,43 +2609,31 @@ fn exchangeAccessTokenFromIdToken(
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
     defer allocator.free(endpoint);
 
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-    var owned_fields = std.ArrayList([]u8).empty;
-    defer {
-        for (owned_fields.items) |field| allocator.free(field);
-        owned_fields.deinit(allocator);
-    }
+    var body_buf = std.ArrayList(u8).empty;
+    defer body_buf.deinit(allocator);
 
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--write-out",
-        "\n%{http_code}",
-        "-H",
-        "Content-Type: application/x-www-form-urlencoded",
-    });
-    try appendCurlFormField(allocator, &argv, &owned_fields, "grant_type", TOKEN_EXCHANGE_GRANT);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "client_id", client_id);
-    try appendCurlFormField(
+    try appendFormField(allocator, &body_buf, "grant_type", TOKEN_EXCHANGE_GRANT);
+    try appendFormField(allocator, &body_buf, "client_id", client_id);
+    try appendFormField(
         allocator,
-        &argv,
-        &owned_fields,
+        &body_buf,
         "requested_token",
         "urn:ietf:params:oauth:token-type:access_token",
     );
-    try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token", id_token);
-    try appendCurlFormField(allocator, &argv, &owned_fields, "subject_token_type", ID_TOKEN_TYPE);
+    try appendFormField(allocator, &body_buf, "subject_token", id_token);
+    try appendFormField(allocator, &body_buf, "subject_token_type", ID_TOKEN_TYPE);
     if (organization_id) |org| {
         const trimmed = std.mem.trim(u8, org, " \r\n\t");
         if (trimmed.len > 0) {
-            try appendCurlFormField(allocator, &argv, &owned_fields, "organization_id", trimmed);
+            try appendFormField(allocator, &body_buf, "organization_id", trimmed);
         }
     }
-    try argv.append(allocator, endpoint);
 
-    const response = runCurlWithStatus(allocator, argv.items, 2 * 1024 * 1024) catch return null;
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+    };
+
+    const response = httpFetch(allocator, .POST, endpoint, &headers, body_buf.items) catch return null;
     defer allocator.free(response.body);
     if (response.status < 200 or response.status >= 300) return null;
 
