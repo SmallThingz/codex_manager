@@ -601,11 +601,11 @@ export const moveAccount = async (
 ): Promise<void> => {
   const tauri = await loadBackendApis();
   await tauri.invoke<unknown>("move_account", {
-      accountId: id,
-      targetBucket,
-      targetIndex,
-      switchAwayFromMoved: options?.switchAwayFromMoved,
-    });
+    accountId: id,
+    targetBucket,
+    targetIndex,
+    switchAwayFromMoved: options?.switchAwayFromMoved,
+  });
 };
 
 export const archiveAccount = async (
@@ -635,15 +635,24 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
 
   const pending = (async (): Promise<CreditsInfo> => {
     const tauri = await loadBackendApis();
-    const payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
-    const record = asRecord(payload);
-    if (record) {
-      const credits = asCreditsInfo(record.credits);
-      if (credits) {
-        return credits;
+
+    while (true) {
+      const payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
+      const record = asRecord(payload);
+      if (record) {
+        const inFlight = valueAsBoolean(record.inFlight) ?? false;
+        if (inFlight) {
+          await new Promise((resolve) => window.setTimeout(resolve, 500));
+          continue;
+        }
+
+        const credits = asCreditsInfo(record.credits);
+        if (credits) {
+          return credits;
+        }
       }
+      return defaultCreditsInfo("No usage data available for this account.");
     }
-    return defaultCreditsInfo("No usage data available for this account.");
   })();
 
   inflightRefreshByAccountId.set(id, pending);

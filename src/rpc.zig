@@ -1361,6 +1361,7 @@ fn buildRefreshUsageResponseJson(
     account_id: []const u8,
     credits: *const CreditsInfo,
     email: ?[]const u8,
+    in_flight: bool,
 ) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
@@ -1372,6 +1373,8 @@ fn buildRefreshUsageResponseJson(
     try writeCreditsInfoJson(writer, credits);
     try writer.writeAll(",\"email\":");
     try writeJsonOptionalString(writer, email);
+    try writer.writeAll(",\"inFlight\":");
+    try writeJsonBool(writer, in_flight);
     try writer.writeByte('}');
 
     return buffer.toOwnedSlice(allocator);
@@ -2128,42 +2131,16 @@ fn handleUpdateUiPreferencesCommand(allocator: std.mem.Allocator, request: RpcRe
     return jsonOk(allocator, @as(?u8, null));
 }
 
-fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
-    const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "refresh_account_usage requires accountId");
+const RefreshThreadArgs = struct {
+    account_id: []const u8,
+};
 
-    if (shouldDebounceRefresh(account_id)) {
-        managed_files_mutex.lock();
-        defer managed_files_mutex.unlock();
-        var debounced_state = try loadAppState(allocator);
-        defer debounced_state.deinit(allocator);
+fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
+    const allocator = std.heap.page_allocator;
+    const account_id = args.account_id;
+    defer allocator.free(account_id);
 
-        const usage_idx = usageEntryIndex(debounced_state.usage_by_id.items, account_id) orelse {
-            var unavailable = try makeCreditsInfo(allocator, nowEpochSeconds(), .unavailable, "No usage data available for this account.");
-            defer unavailable.deinit(allocator);
-            const email = blk: {
-                const idx = accountIndex(&debounced_state.store, account_id) orelse break :blk null;
-                break :blk debounced_state.store.accounts.items[idx].email;
-            };
-            const debounced_response = try buildRefreshUsageResponseJson(allocator, account_id, &unavailable, email);
-            defer allocator.free(debounced_response);
-            return jsonOkRaw(allocator, debounced_response);
-        };
-
-        const account_email = blk: {
-            const idx = accountIndex(&debounced_state.store, account_id) orelse break :blk null;
-            break :blk debounced_state.store.accounts.items[idx].email;
-        };
-        const debounced_response = try buildRefreshUsageResponseJson(
-            allocator,
-            account_id,
-            &debounced_state.usage_by_id.items[usage_idx].credits,
-            account_email,
-        );
-        defer allocator.free(debounced_response);
-        return jsonOkRaw(allocator, debounced_response);
-    }
-
-    try setRefreshInflight(account_id, true);
+    // Ensure inflight is cleared when done
     defer setRefreshInflight(account_id, false) catch {};
 
     var auth_json_copy: ?[]u8 = null;
@@ -2177,15 +2154,13 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     managed_files_mutex.lock();
     {
         defer managed_files_mutex.unlock();
-        var state = try loadAppState(allocator);
+        var state = loadAppState(allocator) catch return;
         defer state.deinit(allocator);
-        const idx = accountIndex(&state.store, account_id) orelse {
-            return jsonError(allocator, "Account not found.");
-        };
+        const idx = accountIndex(&state.store, account_id) orelse return;
         const account = state.store.accounts.items[idx];
-        auth_json_copy = try allocator.dupe(u8, account.auth_json);
+        auth_json_copy = allocator.dupe(u8, account.auth_json) catch return;
         if (account.account_id) |value| {
-            account_id_hint = try allocator.dupe(u8, value);
+            account_id_hint = allocator.dupe(u8, value) catch return;
         }
         needs_email_backfill = account.email == null;
     }
@@ -2198,20 +2173,20 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         }
     }
 
-    var refreshed_credits = try fetchCreditsFromAuthJson(allocator, auth_json_copy.?, account_id_hint);
+    var refreshed_credits = fetchCreditsFromAuthJson(allocator, auth_json_copy.?, account_id_hint) catch return;
     errdefer refreshed_credits.deinit(allocator);
 
     managed_files_mutex.lock();
     defer managed_files_mutex.unlock();
 
-    var state = try loadAppState(allocator);
+    var state = loadAppState(allocator) catch return;
     defer state.deinit(allocator);
-    const account_idx = accountIndex(&state.store, account_id) orelse return jsonError(allocator, "Account not found.");
+    const account_idx = accountIndex(&state.store, account_id) orelse return;
 
     if (fetched_email) |email| {
         const account = &state.store.accounts.items[account_idx];
         if (account.email == null) {
-            account.email = try allocator.dupe(u8, email);
+            account.email = allocator.dupe(u8, email) catch return;
         }
     }
 
@@ -2220,32 +2195,71 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         old.credits.deinit(allocator);
         allocator.free(old.account_id);
         state.usage_by_id.items[idx] = .{
-            .account_id = try allocator.dupe(u8, account_id),
+            .account_id = allocator.dupe(u8, account_id) catch return,
             .credits = refreshed_credits,
         };
     } else {
-        try state.usage_by_id.append(allocator, .{
-            .account_id = try allocator.dupe(u8, account_id),
+        state.usage_by_id.append(allocator, .{
+            .account_id = allocator.dupe(u8, account_id) catch return,
             .credits = refreshed_credits,
-        });
+        }) catch return;
     }
 
     // Ownership moved into state.usage_by_id.
     refreshed_credits = undefined;
 
-    try persistStateFilesOnly(allocator, &state);
+    persistStateFilesOnly(allocator, &state) catch {};
+}
 
-    const updated_usage_idx = usageEntryIndex(state.usage_by_id.items, account_id) orelse {
-        return jsonError(allocator, "Internal usage update error.");
+fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
+    const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "refresh_account_usage requires accountId");
+
+    const in_flight = shouldDebounceRefresh(account_id);
+
+    if (!in_flight) {
+        try setRefreshInflight(account_id, true);
+        const thread_account_id = allocator.dupe(u8, account_id) catch {
+            try setRefreshInflight(account_id, false);
+            return jsonError(allocator, "Internal memory error.");
+        };
+        const thread = std.Thread.spawn(.{}, backgroundRefreshAccountUsage, .{RefreshThreadArgs{ .account_id = thread_account_id }}) catch {
+            allocator.free(thread_account_id);
+            try setRefreshInflight(account_id, false);
+            return jsonError(allocator, "Failed to spawn refresh thread.");
+        };
+        thread.detach();
+    }
+
+    managed_files_mutex.lock();
+    defer managed_files_mutex.unlock();
+    var state = try loadAppState(allocator);
+    defer state.deinit(allocator);
+
+    const usage_idx = usageEntryIndex(state.usage_by_id.items, account_id) orelse {
+        var unavailable = try makeCreditsInfo(allocator, nowEpochSeconds(), .unavailable, "No usage data available for this account.");
+        defer unavailable.deinit(allocator);
+        const email = blk: {
+            const idx = accountIndex(&state.store, account_id) orelse break :blk null;
+            break :blk state.store.accounts.items[idx].email;
+        };
+        const response = try buildRefreshUsageResponseJson(allocator, account_id, &unavailable, email, true);
+        defer allocator.free(response);
+        return jsonOkRaw(allocator, response);
     };
-    const response_json = try buildRefreshUsageResponseJson(
+
+    const account_email = blk: {
+        const idx = accountIndex(&state.store, account_id) orelse break :blk null;
+        break :blk state.store.accounts.items[idx].email;
+    };
+    const response = try buildRefreshUsageResponseJson(
         allocator,
         account_id,
-        &state.usage_by_id.items[updated_usage_idx].credits,
-        state.store.accounts.items[account_idx].email,
+        &state.usage_by_id.items[usage_idx].credits,
+        account_email,
+        true,
     );
-    defer allocator.free(response_json);
-    return jsonOkRaw(allocator, response_json);
+    defer allocator.free(response);
+    return jsonOkRaw(allocator, response);
 }
 
 fn fetchWhamUsage(
