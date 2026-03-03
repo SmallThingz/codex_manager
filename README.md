@@ -69,7 +69,6 @@ Build-time:
 
 Runtime:
 
-- `curl` in `PATH`
 - `codex` CLI in `PATH`
 - browser available for `--browser` / `--web`
 

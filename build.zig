@@ -1,9 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const DEFAULT_MACOS_SDK_PATH = ".zig-cache/macos-sdk/MacOSX11.3.sdk";
-const DEFAULT_MACOS_SDK_URL = "https://github.com/joseluisq/macosx-sdks/releases/download/11.3/MacOSX11.3.sdk.tar.xz";
-
 fn resolveMacosSdkPath(
     b: *std.Build,
     macos_sdk_option: ?[]const u8,
@@ -51,49 +48,12 @@ fn appendUniqueCFlag(
     return merged;
 }
 
-fn addEnsureMacosSdkStep(
-    b: *std.Build,
-    sdk_root: []const u8,
-    sdk_url: []const u8,
-) *std.Build.Step {
-    const archive_path = b.fmt("{s}.tar.xz", .{sdk_root});
-    const script =
-        \\set -euo pipefail
-        \\if [ -d "$CM_MACOS_SDK_ROOT" ]; then
-        \\  exit 0
-        \\fi
-        \\mkdir -p "$(dirname "$CM_MACOS_SDK_ROOT")"
-        \\if [ ! -f "$CM_MACOS_SDK_ARCHIVE" ]; then
-        \\  if command -v curl >/dev/null 2>&1; then
-        \\    curl -L --fail "$CM_MACOS_SDK_URL" -o "$CM_MACOS_SDK_ARCHIVE"
-        \\  elif command -v wget >/dev/null 2>&1; then
-        \\    wget -O "$CM_MACOS_SDK_ARCHIVE" "$CM_MACOS_SDK_URL"
-        \\  else
-        \\    echo "Neither curl nor wget is available to download macOS SDK." >&2
-        \\    exit 1
-        \\  fi
-        \\fi
-        \\tar -xf "$CM_MACOS_SDK_ARCHIVE" -C "$(dirname "$CM_MACOS_SDK_ROOT")"
-        \\if [ ! -d "$CM_MACOS_SDK_ROOT" ]; then
-        \\  echo "macOS SDK extraction failed: $CM_MACOS_SDK_ROOT not found." >&2
-        \\  exit 1
-        \\fi
-    ;
-
-    const cmd = b.addSystemCommand(&.{ "bash", "-lc", script });
-    cmd.setEnvironmentVariable("CM_MACOS_SDK_ROOT", sdk_root);
-    cmd.setEnvironmentVariable("CM_MACOS_SDK_ARCHIVE", archive_path);
-    cmd.setEnvironmentVariable("CM_MACOS_SDK_URL", sdk_url);
-    return &cmd.step;
-}
-
 fn addMatrixInstallCommand(
     b: *std.Build,
     step: *std.Build.Step,
     target_triple: []const u8,
     install_name: []const u8,
     maybe_sysroot: ?[]const u8,
-    ensure_macos_sdk_step: ?*std.Build.Step,
     frontend_prebuild_step: ?*std.Build.Step,
     optimize: std.builtin.OptimizeMode,
     strip_symbols: bool,
@@ -120,9 +80,6 @@ fn addMatrixInstallCommand(
     argv.append(b.allocator, b.fmt("-Dmatrix_name={s}", .{install_name})) catch @panic("OOM");
 
     const cmd = b.addSystemCommand(argv.items);
-    if (ensure_macos_sdk_step) |download_step| {
-        cmd.step.dependOn(download_step);
-    }
     if (frontend_prebuild_step) |frontend_step| {
         cmd.step.dependOn(frontend_step);
     }
@@ -144,35 +101,15 @@ pub fn build(b: *std.Build) void {
         "macos_sdk",
         "Path to a macOS SDK for macOS cross-compilation (sysroot).",
     );
-    const macos_sdk_auto_download = b.option(
-        bool,
-        "macos_sdk_auto_download",
-        "Automatically download macOS SDK when needed for macOS cross-compilation (default: true).",
-    ) orelse true;
-    const macos_sdk_url = b.option(
-        []const u8,
-        "macos_sdk_url",
-        "URL used when automatically downloading the macOS SDK.",
-    ) orelse DEFAULT_MACOS_SDK_URL;
 
     var macos_sdk_path = resolveMacosSdkPath(b, macos_sdk_option);
-    if (macos_sdk_path == null and macos_sdk_auto_download and builtin.os.tag == .linux) {
-        macos_sdk_path = DEFAULT_MACOS_SDK_PATH;
-    }
     if (macos_sdk_path) |sdk| {
         macos_sdk_path = absolutizePath(b, sdk);
     }
 
-    var ensure_macos_sdk_step: ?*std.Build.Step = null;
-    if (macos_sdk_auto_download and builtin.os.tag == .linux) {
-        if (macos_sdk_path) |sdk| {
-            ensure_macos_sdk_step = addEnsureMacosSdkStep(b, sdk, macos_sdk_url);
-        }
-    }
-
     if (!target.query.isNative() and target.result.os.tag == .macos and b.sysroot == null) {
         const fail = b.addFail(
-            "Cross-compiling to macOS requires --sysroot <sdk>. `build-all-targets` auto-downloads one by default unless `-Dmacos_sdk_auto_download=false` is set.",
+            "Cross-compiling to macOS requires --sysroot <sdk>. Provide one via --sysroot, -Dmacos_sdk=<path>, or MACOS_SDK_ROOT.",
         );
         b.default_step.dependOn(&fail.step);
         b.getInstallStep().dependOn(&fail.step);
@@ -260,18 +197,6 @@ pub fn build(b: *std.Build) void {
                 }
             }
         }
-        if (!target.query.isNative()) {
-            if (ensure_macos_sdk_step) |download_step| {
-                for (webui_module.link_objects.items) |link_object| {
-                    switch (link_object) {
-                        .other_step => |linked_compile| {
-                            linked_compile.step.dependOn(download_step);
-                        },
-                        else => {},
-                    }
-                }
-            }
-        }
     }
 
     const exe = b.addExecutable(.{
@@ -289,12 +214,6 @@ pub fn build(b: *std.Build) void {
     if (frontend_build_step) |frontend_step| {
         exe.step.dependOn(frontend_step);
     }
-    if (!target.query.isNative() and target.result.os.tag == .macos) {
-        if (ensure_macos_sdk_step) |download_step| {
-            exe.step.dependOn(download_step);
-        }
-    }
-
     const install_artifact = b.addInstallArtifact(exe, .{
         .dest_sub_path = matrix_name,
         .pdb_dir = if (matrix_name == null) .default else .disabled,
@@ -360,7 +279,6 @@ pub fn build(b: *std.Build) void {
                 "x86_64-linux-gnu",
                 "codex-manager-linux-x86_64",
                 null,
-                null,
                 frontend_build_step,
                 optimize,
                 strip_symbols,
@@ -370,7 +288,6 @@ pub fn build(b: *std.Build) void {
                 build_all_targets_step,
                 "aarch64-linux-gnu",
                 "codex-manager-linux-aarch64",
-                null,
                 null,
                 frontend_build_step,
                 optimize,
@@ -382,7 +299,6 @@ pub fn build(b: *std.Build) void {
                 "x86_64-windows-gnu",
                 "codex-manager-windows-x86_64.exe",
                 null,
-                null,
                 frontend_build_step,
                 optimize,
                 strip_symbols,
@@ -392,7 +308,6 @@ pub fn build(b: *std.Build) void {
                 build_all_targets_step,
                 "aarch64-windows-gnu",
                 "codex-manager-windows-aarch64.exe",
-                null,
                 null,
                 frontend_build_step,
                 optimize,
@@ -407,7 +322,6 @@ pub fn build(b: *std.Build) void {
                         "x86_64-macos",
                         "codex-manager-macos-x86_64",
                         macos_sdk_root,
-                        ensure_macos_sdk_step,
                         frontend_build_step,
                         optimize,
                         strip_symbols,
@@ -418,12 +332,16 @@ pub fn build(b: *std.Build) void {
                         "aarch64-macos",
                         "codex-manager-macos-aarch64",
                         macos_sdk_root,
-                        ensure_macos_sdk_step,
                         frontend_build_step,
                         optimize,
                         strip_symbols,
                     );
                 }
+            } else {
+                const missing_macos_sdk = b.addFail(
+                    "build-all-targets on Linux requires a macOS SDK. Set -Dmacos_sdk=<path> or MACOS_SDK_ROOT.",
+                );
+                build_all_targets_step.dependOn(&missing_macos_sdk.step);
             }
         },
         .macos => {
@@ -432,7 +350,6 @@ pub fn build(b: *std.Build) void {
                 build_all_targets_step,
                 "x86_64-macos",
                 "codex-manager-macos-x86_64",
-                null,
                 null,
                 frontend_build_step,
                 optimize,
@@ -443,7 +360,6 @@ pub fn build(b: *std.Build) void {
                 build_all_targets_step,
                 "aarch64-macos",
                 "codex-manager-macos-aarch64",
-                null,
                 null,
                 frontend_build_step,
                 optimize,
@@ -457,7 +373,6 @@ pub fn build(b: *std.Build) void {
                 "x86_64-windows-gnu",
                 "codex-manager-windows-x86_64.exe",
                 null,
-                null,
                 frontend_build_step,
                 optimize,
                 strip_symbols,
@@ -467,7 +382,6 @@ pub fn build(b: *std.Build) void {
                 build_all_targets_step,
                 "aarch64-windows-gnu",
                 "codex-manager-windows-aarch64.exe",
-                null,
                 null,
                 frontend_build_step,
                 optimize,

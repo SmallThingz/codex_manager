@@ -721,6 +721,18 @@ fn shouldDebounceRefresh(account_id: []const u8) bool {
     return false;
 }
 
+fn isRefreshInflight(account_id: []const u8) bool {
+    refresh_debounce_state.lock();
+    defer refresh_debounce_state.unlock();
+
+    for (refresh_debounce_entries.items) |entry| {
+        if (std.mem.eql(u8, entry.account_id, account_id)) {
+            return entry.inflight;
+        }
+    }
+    return false;
+}
+
 fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreState {
     var store = StoreState{};
     errdefer store.deinit(allocator);
@@ -2214,10 +2226,12 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
 fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
     const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "refresh_account_usage requires accountId");
 
-    const in_flight = shouldDebounceRefresh(account_id);
+    const should_debounce = shouldDebounceRefresh(account_id);
+    var in_flight = isRefreshInflight(account_id);
 
-    if (!in_flight) {
+    if (!should_debounce) {
         try setRefreshInflight(account_id, true);
+        in_flight = true;
         const thread_account_id = allocator.dupe(u8, account_id) catch {
             try setRefreshInflight(account_id, false);
             return jsonError(allocator, "Internal memory error.");
@@ -2242,7 +2256,7 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
             const idx = accountIndex(&state.store, account_id) orelse break :blk null;
             break :blk state.store.accounts.items[idx].email;
         };
-        const response = try buildRefreshUsageResponseJson(allocator, account_id, &unavailable, email, true);
+        const response = try buildRefreshUsageResponseJson(allocator, account_id, &unavailable, email, in_flight);
         defer allocator.free(response);
         return jsonOkRaw(allocator, response);
     };
@@ -2256,7 +2270,7 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         account_id,
         &state.usage_by_id.items[usage_idx].credits,
         account_email,
-        true,
+        in_flight,
     );
     defer allocator.free(response);
     return jsonOkRaw(allocator, response);
