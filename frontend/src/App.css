@@ -606,17 +606,30 @@ select {
   transform: translateY(0.84rem);
 }
 
-.account.drop-before::after {
+.account.drop-before::after,
+.account.drop-after::after {
   content: "";
   position: absolute;
   left: 0.72rem;
   right: 0.72rem;
-  top: -0.58rem;
   height: 0.22rem;
   border-radius: 999px;
   background: var(--line);
   box-shadow: 0 0 0 1px var(--line-soft);
   pointer-events: none;
+}
+
+.account.drop-before::after {
+  top: -0.58rem;
+}
+
+.account.drop-after {
+  position: relative;
+  transform: translateY(-0.84rem);
+}
+
+.account.drop-after::after {
+  bottom: -0.58rem;
 }
 
 .drop-surface {

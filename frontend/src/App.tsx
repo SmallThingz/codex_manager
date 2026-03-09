@@ -29,6 +29,13 @@ type CreditsByAccount = Record<string, CreditsInfo | undefined>;
 
 type Theme = "light" | "dark";
 type UsageRefreshDisplayMode = "date" | "remaining";
+type DragHoverPlacement = "before" | "after" | "end";
+type DragHoverState = {
+  bucket: AccountBucket;
+  targetId: string | null;
+  placement: DragHoverPlacement;
+};
+
 const QUOTA_EPSILON = 0.0001;
 const DRAG_SELECT_LOCK_CLASS = "drag-select-lock";
 const AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN = true;
@@ -471,7 +478,7 @@ function App() {
   const [showFrozen, setShowFrozen] = createSignal(false);
   const [draggingAccountId, setDraggingAccountId] = createSignal<string | null>(null);
   const [draggingBucket, setDraggingBucket] = createSignal<AccountBucket | null>(null);
-  const [dragHover, setDragHover] = createSignal<{ bucket: AccountBucket; targetId: string | null } | null>(null);
+  const [dragHover, setDragHover] = createSignal<DragHoverState | null>(null);
   const [refreshingById, setRefreshingById] = createSignal<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = createSignal(false);
   const [nowTick, setNowTick] = createSignal(nowEpoch());
@@ -1258,12 +1265,27 @@ function App() {
 
   const isDropBefore = (bucket: AccountBucket, targetId: string): boolean => {
     const current = dragHover();
-    return Boolean(current && current.bucket === bucket && current.targetId === targetId);
+    return Boolean(
+      current &&
+        current.bucket === bucket &&
+        current.targetId === targetId &&
+        current.placement === "before",
+    );
+  };
+
+  const isDropAfter = (bucket: AccountBucket, targetId: string): boolean => {
+    const current = dragHover();
+    return Boolean(
+      current &&
+        current.bucket === bucket &&
+        current.targetId === targetId &&
+        current.placement === "after",
+    );
   };
 
   const isDropAtEnd = (bucket: AccountBucket): boolean => {
     const current = dragHover();
-    return Boolean(current && current.bucket === bucket && current.targetId === null);
+    return Boolean(current && current.bucket === bucket && current.placement === "end");
   };
 
   const isDropBucketHovered = (bucket: AccountBucket): boolean => {
@@ -1320,12 +1342,21 @@ function App() {
     }
   };
 
-  const setDragHoverTarget = (bucket: AccountBucket, targetId: string | null) => {
+  const setDragHoverTarget = (
+    bucket: AccountBucket,
+    targetId: string | null,
+    placement: DragHoverPlacement = targetId === null ? "end" : "before",
+  ) => {
     const current = dragHover();
-    if (current && current.bucket === bucket && current.targetId === targetId) {
+    if (
+      current &&
+      current.bucket === bucket &&
+      current.targetId === targetId &&
+      current.placement === placement
+    ) {
       return;
     }
-    setDragHover({ bucket, targetId });
+    setDragHover({ bucket, targetId, placement });
   };
 
   const accountBucketForId = (accountId: string): AccountBucket | null => {
@@ -1351,6 +1382,26 @@ function App() {
       return sourceBucket === "depleted" && bucket === "depleted";
     }
     return true;
+  };
+
+  const dragPlacementForTarget = (
+    draggedId: string,
+    bucket: AccountBucket,
+    targetId: string,
+  ): Exclude<DragHoverPlacement, "end"> => {
+    const sourceBucket = draggingBucket() ?? accountBucketForId(draggedId);
+    if (sourceBucket !== bucket) {
+      return "before";
+    }
+
+    const accounts = accountsForBucket(bucket);
+    const draggedIndex = accounts.findIndex((account) => account.id === draggedId);
+    const targetIndex = accounts.findIndex((account) => account.id === targetId);
+    if (draggedIndex < 0 || targetIndex < 0) {
+      return "before";
+    }
+
+    return draggedIndex < targetIndex ? "after" : "before";
   };
 
   const handleDragOverBucket = (event: DragEvent, bucket: AccountBucket) => {
@@ -1389,7 +1440,7 @@ function App() {
       setDragHoverTarget(bucket, null);
       return;
     }
-    setDragHoverTarget(bucket, targetId);
+    setDragHoverTarget(bucket, targetId, dragPlacementForTarget(draggedId, bucket, targetId));
   };
 
   const removeDragPreview = () => {
@@ -1473,11 +1524,16 @@ function App() {
     await moveAccountToBucket(draggedId, bucket, accounts.length);
   };
 
-  const handleDropBeforeAccount = async (event: DragEvent, bucket: AccountBucket, targetId: string) => {
+  const handleDropOnAccount = async (event: DragEvent, bucket: AccountBucket, targetId: string) => {
     event.preventDefault();
     event.stopPropagation();
 
     const draggedId = resolveDragId(event);
+    const currentHover = dragHover();
+    const placement =
+      currentHover && currentHover.bucket === bucket && currentHover.targetId === targetId
+        ? currentHover.placement
+        : null;
     document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
     setDraggingAccountId(null);
     setDraggingBucket(null);
@@ -1496,7 +1552,8 @@ function App() {
       return;
     }
 
-    await moveAccountToBucket(draggedId, bucket, targetIndex);
+    const nextIndex = placement === "after" ? targetIndex + 1 : targetIndex;
+    await moveAccountToBucket(draggedId, bucket, nextIndex);
   };
 
   const handleDragStart = (event: DragEvent, account: AccountSummary, bucket: AccountBucket) => {
@@ -1906,14 +1963,20 @@ function App() {
                         <article
                           class={`account ${isCurrent() ? "active" : ""} ${
                             draggingAccountId() === account.id ? "dragging" : ""
-                          } ${isDropBefore("active", account.id) ? "drop-before" : ""}${
+                          } ${
+                            isDropBefore("active", account.id)
+                              ? "drop-before"
+                              : isDropAfter("active", account.id)
+                                ? "drop-after"
+                                : ""
+                          }${
                             draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""
                           }`}
                           draggable={true}
                           onDragStart={(event) => handleDragStart(event, account, "active")}
                           onDragEnd={handleDragEnd}
                           onDragOver={(event) => handleDragOverAccount(event, "active", account.id)}
-                          onDrop={(event) => void handleDropBeforeAccount(event, "active", account.id)}
+                          onDrop={(event) => void handleDropOnAccount(event, "active", account.id)}
                         >
                           <header class="account-head">
                             <span class="icon-btn drag-handle" aria-hidden="true">
@@ -2104,13 +2167,17 @@ function App() {
                         return (
                           <article
                             class={`account account-depleted archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
-                              isDropBefore("depleted", account.id) ? "drop-before" : ""
+                              isDropBefore("depleted", account.id)
+                                ? "drop-before"
+                                : isDropAfter("depleted", account.id)
+                                  ? "drop-after"
+                                  : ""
                             }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
                             draggable={true}
                             onDragStart={(event) => handleDragStart(event, account, "depleted")}
                             onDragEnd={handleDragEnd}
                             onDragOver={(event) => handleDragOverAccount(event, "depleted", account.id)}
-                            onDrop={(event) => void handleDropBeforeAccount(event, "depleted", account.id)}
+                            onDrop={(event) => void handleDropOnAccount(event, "depleted", account.id)}
                           >
                             <header class="account-head">
                               <span class="icon-btn drag-handle" aria-hidden="true">
@@ -2292,13 +2359,17 @@ function App() {
                         return (
                           <article
                             class={`account account-frozen archived ${draggingAccountId() === account.id ? "dragging" : ""} ${
-                              isDropBefore("frozen", account.id) ? "drop-before" : ""
+                              isDropBefore("frozen", account.id)
+                                ? "drop-before"
+                                : isDropAfter("frozen", account.id)
+                                  ? "drop-after"
+                                  : ""
                             }${draggingAccountId() && draggingAccountId() !== account.id ? " drag-context" : ""}`}
                             draggable={true}
                             onDragStart={(event) => handleDragStart(event, account, "frozen")}
                             onDragEnd={handleDragEnd}
                             onDragOver={(event) => handleDragOverAccount(event, "frozen", account.id)}
-                            onDrop={(event) => void handleDropBeforeAccount(event, "frozen", account.id)}
+                            onDrop={(event) => void handleDropOnAccount(event, "frozen", account.id)}
                           >
                             <header class="account-head">
                               <span class="icon-btn drag-handle" aria-hidden="true">

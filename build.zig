@@ -48,6 +48,75 @@ fn appendUniqueCFlag(
     return merged;
 }
 
+fn addMacosSdkAutoDownloadStep(
+    b: *std.Build,
+    cache_dir: []const u8,
+    sdk_dir: []const u8,
+) *std.Build.Step.Run {
+    const script =
+        \\set -euo pipefail
+        \\cache_dir="$1"
+        \\sdk_dir="$2"
+        \\metadata_url="$3"
+        \\release_json="$cache_dir/latest-release.json"
+        \\archive_path="$cache_dir/macos-sdk.tar.xz"
+        \\staging_dir="$cache_dir/staging"
+        \\
+        \\if [ -d "$sdk_dir" ]; then
+        \\  exit 0
+        \\fi
+        \\
+        \\mkdir -p "$cache_dir"
+        \\rm -rf "$staging_dir"
+        \\trap 'rm -rf "$staging_dir"' EXIT
+        \\
+        \\echo "Downloading macOS SDK metadata from $metadata_url" >&2
+        \\curl --fail --silent --show-error --location \
+        \\  -H 'Accept: application/vnd.github+json' \
+        \\  -H 'User-Agent: codex-manager-build' \
+        \\  "$metadata_url" -o "$release_json"
+        \\
+        \\asset_match="$(grep -m 1 -Eo '"browser_download_url":"[^"]*MacOSX[^"]*sdk.tar.xz"' "$release_json" || true)"
+        \\asset_url="${asset_match#\"browser_download_url\":\"}"
+        \\asset_url="${asset_url%\"}"
+        \\if [ -z "$asset_url" ]; then
+        \\  echo "Could not find a MacOSX*.sdk.tar.xz asset in $metadata_url." >&2
+        \\  echo "Set -Dmacos_sdk=<path> or MACOS_SDK_ROOT to use a local SDK instead." >&2
+        \\  echo "Metadata excerpt:" >&2
+        \\  sed -n '1,80p' "$release_json" >&2 || true
+        \\  exit 1
+        \\fi
+        \\
+        \\echo "Downloading macOS SDK archive from $asset_url" >&2
+        \\curl --fail --silent --show-error --location \
+        \\  -H 'User-Agent: codex-manager-build' \
+        \\  "$asset_url" -o "$archive_path"
+        \\
+        \\mkdir -p "$staging_dir"
+        \\tar -xf "$archive_path" -C "$staging_dir"
+        \\
+        \\found_sdk="$(find "$staging_dir" -type d -name 'MacOSX*.sdk' -print -quit)"
+        \\if [ -z "$found_sdk" ]; then
+        \\  echo "Downloaded archive did not contain a MacOSX*.sdk directory." >&2
+        \\  exit 1
+        \\fi
+        \\
+        \\rm -rf "$sdk_dir"
+        \\mv "$found_sdk" "$sdk_dir"
+        \\rm -f "$release_json" "$archive_path"
+    ;
+
+    return b.addSystemCommand(&.{
+        "bash",
+        "-lc",
+        script,
+        "download-macos-sdk",
+        cache_dir,
+        sdk_dir,
+        "https://api.github.com/repos/joseluisq/macosx-sdks/releases/latest",
+    });
+}
+
 fn addMatrixInstallCommand(
     b: *std.Build,
     step: *std.Build.Step,
@@ -55,6 +124,7 @@ fn addMatrixInstallCommand(
     install_name: []const u8,
     maybe_sysroot: ?[]const u8,
     frontend_prebuild_step: ?*std.Build.Step,
+    extra_dependency_step: ?*std.Build.Step,
     optimize: std.builtin.OptimizeMode,
     strip_symbols: bool,
 ) void {
@@ -83,6 +153,9 @@ fn addMatrixInstallCommand(
     if (frontend_prebuild_step) |frontend_step| {
         cmd.step.dependOn(frontend_step);
     }
+    if (extra_dependency_step) |dependency_step| {
+        cmd.step.dependOn(dependency_step);
+    }
     step.dependOn(&cmd.step);
 }
 
@@ -100,6 +173,19 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "macos_sdk",
         "Path to a macOS SDK for macOS cross-compilation (sysroot).",
+    );
+    const auto_download_macos_sdk = b.option(
+        bool,
+        "auto_download_macos_sdk",
+        "Automatically download a cached macOS SDK on Linux when build-all-targets needs one.",
+    ) orelse true;
+    const macos_sdk_cache_dir = absolutizePath(
+        b,
+        b.option(
+            []const u8,
+            "macos_sdk_cache_dir",
+            "Directory used to cache an auto-downloaded macOS SDK on Linux.",
+        ) orelse ".zig-cache/macos-sdk",
     );
 
     var macos_sdk_path = resolveMacosSdkPath(b, macos_sdk_option);
@@ -270,6 +356,19 @@ pub fn build(b: *std.Build) void {
         "build-all-targets",
         "Compile release binaries for supported target matrix into zig-out/bin",
     );
+    const auto_downloaded_macos_sdk_path = b.fmt("{s}/sdk", .{macos_sdk_cache_dir});
+    var matrix_macos_sdk_path = macos_sdk_path;
+    var matrix_macos_sdk_step: ?*std.Build.Step = null;
+
+    if (builtin.os.tag == .linux and matrix_macos_sdk_path == null and auto_download_macos_sdk) {
+        const download_macos_sdk = addMacosSdkAutoDownloadStep(
+            b,
+            macos_sdk_cache_dir,
+            auto_downloaded_macos_sdk_path,
+        );
+        matrix_macos_sdk_path = auto_downloaded_macos_sdk_path;
+        matrix_macos_sdk_step = &download_macos_sdk.step;
+    }
 
     switch (builtin.os.tag) {
         .linux => {
@@ -280,6 +379,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-linux-x86_64",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
@@ -290,6 +390,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-linux-aarch64",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
@@ -300,6 +401,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-windows-x86_64.exe",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
@@ -310,11 +412,12 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-windows-aarch64.exe",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
 
-            if (macos_sdk_path) |macos_sdk_root| {
+            if (matrix_macos_sdk_path) |macos_sdk_root| {
                 if (macos_sdk_root.len > 0) {
                     addMatrixInstallCommand(
                         b,
@@ -323,6 +426,7 @@ pub fn build(b: *std.Build) void {
                         "codex-manager-macos-x86_64",
                         macos_sdk_root,
                         frontend_build_step,
+                        matrix_macos_sdk_step,
                         optimize,
                         strip_symbols,
                     );
@@ -333,13 +437,14 @@ pub fn build(b: *std.Build) void {
                         "codex-manager-macos-aarch64",
                         macos_sdk_root,
                         frontend_build_step,
+                        matrix_macos_sdk_step,
                         optimize,
                         strip_symbols,
                     );
                 }
             } else {
                 const missing_macos_sdk = b.addFail(
-                    "build-all-targets on Linux requires a macOS SDK. Set -Dmacos_sdk=<path> or MACOS_SDK_ROOT.",
+                    "build-all-targets on Linux could not resolve a macOS SDK. Set -Dmacos_sdk=<path>, MACOS_SDK_ROOT, or leave auto-download enabled.",
                 );
                 build_all_targets_step.dependOn(&missing_macos_sdk.step);
             }
@@ -352,6 +457,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-macos-x86_64",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
@@ -362,6 +468,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-macos-aarch64",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
@@ -374,6 +481,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-windows-x86_64.exe",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );
@@ -384,6 +492,7 @@ pub fn build(b: *std.Build) void {
                 "codex-manager-windows-aarch64.exe",
                 null,
                 frontend_build_step,
+                null,
                 optimize,
                 strip_symbols,
             );

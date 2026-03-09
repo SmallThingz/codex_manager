@@ -53,6 +53,14 @@ Release build with stripped symbols:
 zig build install -Doptimize=ReleaseFast -Dstrip=true
 ```
 
+Build the full release matrix:
+
+```bash
+zig build build-all-targets -Doptimize=ReleaseFast
+```
+
+On Linux, `build-all-targets` now auto-downloads and caches a macOS SDK under `.zig-cache/macos-sdk/sdk` if you do not provide `-Dmacos_sdk=<path>` or `MACOS_SDK_ROOT`. Disable that with `-Dauto_download_macos_sdk=false`, or change the cache location with `-Dmacos_sdk_cache_dir=<path>`.
+
 Run installed binary:
 
 ```bash
