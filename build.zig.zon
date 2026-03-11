@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .webui = .{
-            .url = "git+https://github.com/SmallThingz/webui.git#af94549c354c9aa5f16faec73fb3257c844f1583",
+            .url = "git+https://github.com/SmallThingz/webui.git#87b509f16d73d97961b0b0f888b0b1f8215858b6",
             .hash = "webui-0.0.0-NV0cf6toCgA0u52YXCDPqXApWKAc2_pSA36VarRbYmow",
         },
     },
