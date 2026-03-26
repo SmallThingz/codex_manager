@@ -92,6 +92,7 @@ const formatUsageRefreshDateTime = (epoch: number | null | undefined): string =>
   return `${month}/${day}/${year} ${hours}:${minutes}:${seconds}`;
 };
 
+// Formats a refresh timestamp as a relative countdown from the current clock tick.
 const formatUsageRefreshRemaining = (
   epoch: number | null | undefined,
   currentEpoch: number,
@@ -264,6 +265,7 @@ type UsageRefreshRow = {
   value: string;
 };
 
+// Derives the next refresh timestamp for a quota window, falling back to cached check time.
 const refreshEpochFromWindow = (
   refreshAt: number | null | undefined,
   checkedAt: number,
@@ -281,6 +283,7 @@ const refreshEpochFromWindow = (
   return null;
 };
 
+// Builds the user-facing refresh detail rows for the current usage card.
 const usageRefreshRows = (
   credits: CreditsInfo | undefined,
   currentEpoch: number,
@@ -658,6 +661,7 @@ function App() {
     return "active";
   };
 
+  // Rebuilds the in-memory account ordering after a drag/drop move.
   const applyMovedAccountInView = (
     currentView: AccountsView,
     accountId: string,
@@ -729,6 +733,7 @@ function App() {
     };
   };
 
+  // Applies a completed OAuth login result to the current in-memory account view.
   const applyOAuthLoginAccountInView = (
     currentView: AccountsView,
     account: AccountSummary,
@@ -769,6 +774,7 @@ function App() {
     });
   };
 
+  // Refreshes usage data for a list of accounts and merges the results into local state.
   const refreshCreditsForAccounts = async (
     accountIds: string[],
     options: RefreshOptions = {},
@@ -1449,6 +1455,7 @@ function App() {
     }
   };
 
+  // Records the current drag-hover drop target so the list can render insertion markers.
   const setDragHoverTarget = (
     bucket: AccountBucket,
     targetId: string | null,
@@ -1494,6 +1501,7 @@ function App() {
     return true;
   };
 
+  // Determines whether the drag should land before or after the hovered account row.
   const dragPlacementForTarget = (
     draggedId: string,
     bucket: AccountBucket,

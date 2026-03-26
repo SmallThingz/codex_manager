@@ -599,6 +599,14 @@ fn writeTextFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents:
     try std.Io.Dir.renameAbsolute(temp_path, path, process_io);
 }
 
+// Deletes a file if it exists and treats a missing path as already-clean state.
+fn deleteFileIfExists(path: []const u8) !void {
+    std.Io.Dir.deleteFileAbsolute(process_io, path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+}
+
 // Now epoch seconds.
 fn nowEpochSeconds() i64 {
     return @divFloor(nowMilliseconds(), 1000);
@@ -2105,6 +2113,16 @@ fn setStoreActiveAccountId(allocator: std.mem.Allocator, store: *StoreState, acc
     }
 }
 
+// Returns the first active fallback account that can replace a removed or archived active account.
+fn nextFallbackActiveAccount(store: *StoreState, removed_id: ?[]const u8) ?*ManagedAccount {
+    for (store.accounts.items) |*candidate| {
+        if (removed_id != null and std.mem.eql(u8, candidate.id, removed_id.?)) continue;
+        if (candidate.archived or candidate.frozen) continue;
+        return candidate;
+    }
+    return null;
+}
+
 // Switches switch active to fallback.
 fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, removed_id: ?[]const u8) !void {
     if (state.store.active_account_id) |active_id| {
@@ -2115,16 +2133,14 @@ fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, remove
         return;
     }
 
-    for (state.store.accounts.items) |*candidate| {
-        if (removed_id != null and std.mem.eql(u8, candidate.id, removed_id.?)) continue;
-        if (candidate.archived or candidate.frozen) continue;
-
+    if (nextFallbackActiveAccount(&state.store, removed_id)) |candidate| {
         try setStoreActiveAccountId(allocator, &state.store, candidate.id);
         try writeCodexAuthPath(allocator, state.paths.codexAuthPath, candidate.auth_json);
         return;
     }
 
     try setStoreActiveAccountId(allocator, &state.store, null);
+    try deleteFileIfExists(state.paths.codexAuthPath);
 }
 
 // Handles handle switch account command.
@@ -2181,6 +2197,7 @@ fn handleMoveAccountCommand(
             try switchActiveToFallback(allocator, &state, moved.id);
         } else {
             try setStoreActiveAccountId(allocator, &state.store, null);
+            try deleteFileIfExists(state.paths.codexAuthPath);
         }
     }
 
@@ -3514,6 +3531,63 @@ test "isOpenUrlLauncherUnavailableError treats misleading launcher failures as r
 
 test "isOpenUrlLauncherUnavailableError does not hide unrelated errors" {
     try std.testing.expect(!isOpenUrlLauncherUnavailableError(error.CallbackListenerTimeout));
+}
+
+test "nextFallbackActiveAccount skips removed archived and frozen accounts" {
+    var accounts = [_]ManagedAccount{
+        .{
+            .id = @constCast("acct-1"),
+            .archived = false,
+            .frozen = false,
+            .auth_json = @constCast("{}"),
+        },
+        .{
+            .id = @constCast("acct-2"),
+            .archived = true,
+            .frozen = false,
+            .auth_json = @constCast("{}"),
+        },
+        .{
+            .id = @constCast("acct-3"),
+            .archived = false,
+            .frozen = false,
+            .auth_json = @constCast("{}"),
+        },
+    };
+    var store = StoreState{
+        .accounts = .{
+            .items = accounts[0..],
+            .capacity = accounts.len,
+        },
+    };
+
+    const fallback = nextFallbackActiveAccount(&store, "acct-1") orelse return error.ExpectedFallbackAccount;
+    try std.testing.expectEqualStrings("acct-3", fallback.id);
+}
+
+test "nextFallbackActiveAccount returns null when no active replacement exists" {
+    var accounts = [_]ManagedAccount{
+        .{
+            .id = @constCast("acct-1"),
+            .archived = true,
+            .frozen = false,
+            .auth_json = @constCast("{}"),
+        },
+        .{
+            .id = @constCast("acct-2"),
+            .archived = false,
+            .frozen = true,
+            .auth_json = @constCast("{}"),
+        },
+    };
+    var store = StoreState{
+        .accounts = .{
+            .items = accounts[0..],
+            .capacity = accounts.len,
+        },
+    };
+
+    try std.testing.expect(nextFallbackActiveAccount(&store, "acct-1") == null);
 }
 
 test "computePollTimeoutMs returns polling slice when timeout is disabled" {

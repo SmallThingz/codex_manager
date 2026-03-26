@@ -346,7 +346,7 @@ const asSnapshot = (value: unknown): AppStateSnapshot => {
   };
 };
 
-// Decode bridge value.
+// Unwraps the bridge response and throws when the backend returned a JSON error envelope.
 const decodeBridgeValue = <T>(op: string, value: unknown): T => {
   if (typeof value === "string") {
     try {
@@ -401,7 +401,7 @@ const waitForWebuiBridge = async (): Promise<WebuiRpcBridge> => {
   throw new Error("WebUI bridge is unavailable (webuiRpc.cm_rpc missing).");
 };
 
-// Call bridge.
+// Sends a request through the injected webui bridge and decodes the backend response.
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
   const request = { op, ...payload };
   const bridge = await waitForWebuiBridge();
@@ -477,6 +477,7 @@ const sha256Base64Url = async (value: string): Promise<string> => {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
 
+// Builds the authorize URL to match Codex CLI's OAuth query ordering and encoding.
 const buildAuthorizeUrl = (
   issuer: string,
   clientId: string,
