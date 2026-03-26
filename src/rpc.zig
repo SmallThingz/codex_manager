@@ -1,6 +1,34 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const embedded_index = @import("embedded_index.zig");
+const process_io: std.Io = if (builtin.is_test) std.testing.io else std.Options.debug_io;
+var process_environ_map: ?*std.process.Environ.Map = null;
+
+// Locks an I/O mutex using the process I/O context shared by this module.
+inline fn lockIoMutex(mutex: *std.Io.Mutex) void {
+    mutex.lockUncancelable(process_io);
+}
+
+// Unlocks an I/O mutex using the process I/O context shared by this module.
+inline fn unlockIoMutex(mutex: *std.Io.Mutex) void {
+    mutex.unlock(process_io);
+}
+
+// Wakes all waiters on an I/O condition variable.
+inline fn broadcastIoCondition(cond: *std.Io.Condition) void {
+    cond.broadcast(process_io);
+}
+
+// Returns the current wall-clock time in milliseconds.
+inline fn nowMilliseconds() i64 {
+    return std.Io.Clock.real.now(process_io).toMilliseconds();
+}
+
+/// Stores the startup environment map so backend env resolution and spawned helpers work without
+/// relying on global libc process state.
+pub fn setEnvironMap(environ_map: *std.process.Environ.Map) void {
+    process_environ_map = environ_map;
+}
 
 const APP_ID = "com.codex.manager";
 const CODEX_DIR = ".codex";
@@ -9,6 +37,12 @@ const STORE_FILE = "accounts.json";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token";
+const OAUTH_CALLBACK_LISTEN_HOST = "127.0.0.1";
+const OAUTH_CALLBACK_PUBLIC_HOST = "localhost";
+const OAUTH_CALLBACK_PORT: u16 = 1455;
+const OAUTH_CALLBACK_BIND_RETRY_ATTEMPTS: u32 = 10;
+const OAUTH_CALLBACK_BIND_RETRY_DELAY_MS: u64 = 200;
+const OAUTH_CANCEL_REQUEST_TIMEOUT_MS: i64 = 2_000;
 const OAUTH_CALLBACK_SUCCESS_HTML =
     \\<!doctype html>
     \\<html lang="en">
@@ -114,6 +148,7 @@ const ManagedPaths = struct {
     storePath: []u8,
     bootstrapStatePath: []u8,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *ManagedPaths, allocator: std.mem.Allocator) void {
         allocator.free(self.codexHome);
         allocator.free(self.codexAuthPath);
@@ -129,6 +164,7 @@ const OAuthReadyAccount = struct {
     email: ?[]u8 = null,
     state: []const u8 = "active",
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *OAuthReadyAccount, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         if (self.accountId) |value| allocator.free(value);
@@ -137,8 +173,8 @@ const OAuthReadyAccount = struct {
 };
 
 const OAuthListenerState = struct {
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     thread: ?std.Thread = null,
     running: bool = false,
     callback_url: ?[]u8 = null,
@@ -152,6 +188,7 @@ const OAuthPollResult = struct {
     account: ?OAuthReadyAccount = null,
     @"error": ?[]const u8 = null,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *OAuthPollResult, allocator: std.mem.Allocator) void {
         if (self.account) |*account| {
             account.deinit(allocator);
@@ -168,13 +205,13 @@ var oauth_listener_state = OAuthListenerState{};
 
 const USAGE_FETCH_DEBOUNCE_MS: i64 = 15 * 1000;
 
-var managed_files_mutex: std.Thread.Mutex = .{};
-var refresh_debounce_state: std.Thread.Mutex = .{};
+var managed_files_mutex: std.Io.Mutex = .init;
+var refresh_debounce_state: std.Io.Mutex = .init;
 var refresh_debounce_entries: std.ArrayListUnmanaged(struct {
     account_id: []u8,
     inflight: bool,
     last_started_ms: i64,
-}) = .{};
+}) = .empty;
 
 const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC: u64 = 300;
 const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC: u64 = 15;
@@ -228,6 +265,7 @@ const CreditsInfo = struct {
     message: []u8,
     checked_at: i64 = 0,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *CreditsInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.currency);
         allocator.free(self.message);
@@ -241,6 +279,7 @@ const UsageCacheEntry = struct {
     account_id: []u8,
     credits: CreditsInfo,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *UsageCacheEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.account_id);
         self.credits.deinit(allocator);
@@ -256,6 +295,7 @@ const ManagedAccount = struct {
     frozen: bool = false,
     auth_json: []u8,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *ManagedAccount, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         if (self.label) |value| allocator.free(value);
@@ -267,8 +307,9 @@ const ManagedAccount = struct {
 
 const StoreState = struct {
     active_account_id: ?[]u8 = null,
-    accounts: std.ArrayListUnmanaged(ManagedAccount) = .{},
+    accounts: std.ArrayListUnmanaged(ManagedAccount) = .empty,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *StoreState, allocator: std.mem.Allocator) void {
         if (self.active_account_id) |value| allocator.free(value);
         for (self.accounts.items) |*account| {
@@ -287,6 +328,7 @@ const UiPreferences = struct {
     auto_refresh_active_interval_sec: u64 = AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC,
     usage_refresh_display_mode: []u8,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *UiPreferences, allocator: std.mem.Allocator) void {
         if (self.theme) |value| allocator.free(value);
         allocator.free(self.usage_refresh_display_mode);
@@ -297,9 +339,10 @@ const AppState = struct {
     paths: ManagedPaths,
     store: StoreState,
     preferences: UiPreferences,
-    usage_by_id: std.ArrayListUnmanaged(UsageCacheEntry) = .{},
+    usage_by_id: std.ArrayListUnmanaged(UsageCacheEntry) = .empty,
     saved_at: i64 = 0,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *AppState, allocator: std.mem.Allocator) void {
         self.paths.deinit(allocator);
         self.store.deinit(allocator);
@@ -311,22 +354,30 @@ const AppState = struct {
     }
 };
 
+/// Executes a backend RPC request and returns a JSON payload owned by `allocator`.
+///
+/// The caller is responsible for freeing the returned slice. Cancellation-sensitive flows such as
+/// the OAuth callback listener use `cancel_ptr` to coordinate stop requests across threads.
 pub fn handleRpcRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     return rpcHandleRequest(allocator, request, cancel_ptr);
 }
 
+// Json error.
 fn jsonError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .@"error" = message }, .{})});
 }
 
+// Json ok.
 fn jsonOk(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
 }
 
+// Json ok raw.
 fn jsonOkRaw(allocator: std.mem.Allocator, raw_value: []const u8) ![]u8 {
     return allocator.dupe(u8, raw_value);
 }
 
+// Rpc handle request.
 fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     if (std.mem.eql(u8, request.op, "shell:open_url")) {
         const url = request.url orelse return jsonError(allocator, "open_url requires url");
@@ -390,7 +441,7 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
         }
 
         if (std.mem.eql(u8, command, "start_oauth_callback_listener")) {
-            const timeout_seconds = request.timeoutSeconds orelse 180;
+            const timeout_seconds = request.timeoutSeconds orelse 0;
             const issuer = trimOptionalString(request.issuer) orelse return jsonError(allocator, "start_oauth_callback_listener requires issuer");
             const client_id = trimOptionalString(request.clientId) orelse return jsonError(allocator, "start_oauth_callback_listener requires clientId");
             const redirect_uri = trimOptionalString(request.redirectUri) orelse return jsonError(allocator, "start_oauth_callback_listener requires redirectUri");
@@ -432,22 +483,48 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
     return jsonError(allocator, "unknown RPC op");
 }
 
+// Path exists.
 fn pathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(process_io, path, .{}) catch return false;
     return true;
 }
 
-fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
-    if (builtin.os.tag == .windows) {
-        return std.process.getEnvVarOwned(allocator, "USERPROFILE");
+// Returns get env var owned compat.
+fn getEnvVarOwnedCompat(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    if (process_environ_map) |environ_map| {
+        if (environ_map.get(key)) |value| {
+            return allocator.dupe(u8, value);
+        }
     }
 
-    return std.process.getEnvVarOwned(allocator, "HOME");
+    if (builtin.link_libc) {
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+
+        const value_z = std.c.getenv(key_z.ptr) orelse return error.EnvironmentVariableNotFound;
+        return allocator.dupe(u8, std.mem.span(value_z));
+    }
+
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding or builtin.os.tag == .other) {
+        return std.process.Environ.getAlloc(.{ .block = .global }, allocator, key);
+    }
+
+    return error.EnvironmentVariableNotFound;
 }
 
+// Returns get home dir.
+fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return getEnvVarOwnedCompat(allocator, "USERPROFILE");
+    }
+
+    return getEnvVarOwnedCompat(allocator, "HOME");
+}
+
+// Returns get app local data dir.
 fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     if (builtin.os.tag == .windows) {
-        const appdata = try std.process.getEnvVarOwned(allocator, "APPDATA");
+        const appdata = try getEnvVarOwnedCompat(allocator, "APPDATA");
         defer allocator.free(appdata);
         return std.fs.path.join(allocator, &.{ appdata, APP_ID });
     }
@@ -462,6 +539,7 @@ fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".local", "share", APP_ID });
 }
 
+// Returns get managed paths.
 fn getManagedPaths(allocator: std.mem.Allocator) !ManagedPaths {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -490,6 +568,7 @@ fn getManagedPaths(allocator: std.mem.Allocator) !ManagedPaths {
     };
 }
 
+// Reads read optional text file.
 fn readOptionalTextFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     if (!pathExists(path)) {
         return null;
@@ -498,39 +577,34 @@ fn readOptionalTextFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     return text;
 }
 
+// Reads read text file.
 fn readTextFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-
-    return file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(process_io, path, allocator, .limited(16 * 1024 * 1024));
 }
 
+// Writes write text file atomic.
 fn writeTextFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        try std.fs.cwd().makePath(parent);
+        try std.Io.Dir.cwd().createDirPath(process_io, parent);
     }
 
     const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temp_path);
 
-    const temp_file = try std.fs.createFileAbsolute(temp_path, .{ .truncate = true });
-    defer temp_file.close();
-    try temp_file.writeAll(contents);
-    try temp_file.sync();
+    const temp_file = try std.Io.Dir.createFileAbsolute(process_io, temp_path, .{ .truncate = true });
+    defer temp_file.close(process_io);
+    try temp_file.writeStreamingAll(process_io, contents);
+    try temp_file.sync(process_io);
 
-    std.fs.renameAbsolute(temp_path, path) catch |err| switch (err) {
-        error.PathAlreadyExists => {
-            try std.fs.deleteFileAbsolute(path);
-            try std.fs.renameAbsolute(temp_path, path);
-        },
-        else => return err,
-    };
+    try std.Io.Dir.renameAbsolute(temp_path, path, process_io);
 }
 
+// Now epoch seconds.
 fn nowEpochSeconds() i64 {
-    return @divFloor(std.time.milliTimestamp(), 1000);
+    return @divFloor(nowMilliseconds(), 1000);
 }
 
+// Trims trim optional string.
 fn trimOptionalString(value: ?[]const u8) ?[]const u8 {
     const raw = value orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \r\n\t");
@@ -538,6 +612,7 @@ fn trimOptionalString(value: ?[]const u8) ?[]const u8 {
     return trimmed;
 }
 
+// Normalizes normalize auto refresh interval sec.
 fn normalizeAutoRefreshIntervalSec(value: ?u64) u64 {
     const raw = value orelse AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC;
     if (raw < AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC) return AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC;
@@ -545,6 +620,7 @@ fn normalizeAutoRefreshIntervalSec(value: ?u64) u64 {
     return raw;
 }
 
+// Json get object.
 fn jsonGetObject(value: std.json.Value) ?std.json.ObjectMap {
     return switch (value) {
         .object => |object| object,
@@ -552,6 +628,7 @@ fn jsonGetObject(value: std.json.Value) ?std.json.ObjectMap {
     };
 }
 
+// Json get array.
 fn jsonGetArray(value: std.json.Value) ?std.json.Array {
     return switch (value) {
         .array => |array| array,
@@ -559,6 +636,7 @@ fn jsonGetArray(value: std.json.Value) ?std.json.Array {
     };
 }
 
+// Json get string.
 fn jsonGetString(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |s| if (std.mem.trim(u8, s, " \r\n\t").len > 0) s else null,
@@ -566,6 +644,7 @@ fn jsonGetString(value: std.json.Value) ?[]const u8 {
     };
 }
 
+// Json get bool.
 fn jsonGetBool(value: std.json.Value) ?bool {
     return switch (value) {
         .bool => |b| b,
@@ -581,6 +660,7 @@ fn jsonGetBool(value: std.json.Value) ?bool {
     };
 }
 
+// Json get f64.
 fn jsonGetF64(value: std.json.Value) ?f64 {
     const parsed: ?f64 = switch (value) {
         .float => |n| n,
@@ -593,6 +673,7 @@ fn jsonGetF64(value: std.json.Value) ?f64 {
     return parsed;
 }
 
+// Json get i64.
 fn jsonGetI64(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |n| n,
@@ -602,11 +683,13 @@ fn jsonGetI64(value: std.json.Value) ?i64 {
     };
 }
 
+// Dup maybe string.
 fn dupMaybeString(allocator: std.mem.Allocator, input: ?[]const u8) !?[]u8 {
     const value = input orelse return null;
     return try allocator.dupe(u8, value);
 }
 
+// Parses parse account bucket.
 fn parseAccountBucket(value: []const u8) ?AccountBucket {
     if (std.mem.eql(u8, value, "active")) return .active;
     if (std.mem.eql(u8, value, "depleted")) return .depleted;
@@ -614,6 +697,7 @@ fn parseAccountBucket(value: []const u8) ?AccountBucket {
     return null;
 }
 
+// Credits source string.
 fn creditsSourceString(value: CreditsSource) []const u8 {
     return switch (value) {
         .wham_usage => "wham_usage",
@@ -621,6 +705,7 @@ fn creditsSourceString(value: CreditsSource) []const u8 {
     };
 }
 
+// Credits mode string.
 fn creditsModeString(value: CreditsMode) []const u8 {
     return switch (value) {
         .balance => "balance",
@@ -629,6 +714,7 @@ fn creditsModeString(value: CreditsMode) []const u8 {
     };
 }
 
+// Credits unit string.
 fn creditsUnitString(value: CreditsUnit) []const u8 {
     return switch (value) {
         .USD => "USD",
@@ -636,6 +722,7 @@ fn creditsUnitString(value: CreditsUnit) []const u8 {
     };
 }
 
+// Credits status string.
 fn creditsStatusString(value: CreditsStatus) []const u8 {
     return switch (value) {
         .available => "available",
@@ -644,10 +731,12 @@ fn creditsStatusString(value: CreditsStatus) []const u8 {
     };
 }
 
+// Writes write json string.
 fn writeJsonString(writer: anytype, value: []const u8) !void {
     try writer.print("{f}", .{std.json.fmt(value, .{})});
 }
 
+// Writes write json optional string.
 fn writeJsonOptionalString(writer: anytype, value: ?[]const u8) !void {
     if (value) |text| {
         try writeJsonString(writer, text);
@@ -656,6 +745,7 @@ fn writeJsonOptionalString(writer: anytype, value: ?[]const u8) !void {
     }
 }
 
+// Writes write json optional i64.
 fn writeJsonOptionalI64(writer: anytype, value: ?i64) !void {
     if (value) |n| {
         try writer.print("{}", .{n});
@@ -664,6 +754,7 @@ fn writeJsonOptionalI64(writer: anytype, value: ?i64) !void {
     }
 }
 
+// Writes write json optional f64.
 fn writeJsonOptionalF64(writer: anytype, value: ?f64) !void {
     if (value) |n| {
         if (std.math.isFinite(n)) {
@@ -676,15 +767,17 @@ fn writeJsonOptionalF64(writer: anytype, value: ?f64) !void {
     }
 }
 
+// Writes write json bool.
 fn writeJsonBool(writer: anytype, value: bool) !void {
     try writer.writeAll(if (value) "true" else "false");
 }
 
+// Sets set refresh inflight.
 fn setRefreshInflight(account_id: []const u8, inflight: bool) !void {
-    refresh_debounce_state.lock();
-    defer refresh_debounce_state.unlock();
+    lockIoMutex(&refresh_debounce_state);
+    defer unlockIoMutex(&refresh_debounce_state);
 
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = nowMilliseconds();
 
     for (refresh_debounce_entries.items) |*entry| {
         if (std.mem.eql(u8, entry.account_id, account_id)) {
@@ -705,11 +798,12 @@ fn setRefreshInflight(account_id: []const u8, inflight: bool) !void {
     });
 }
 
+// Determines should debounce refresh.
 fn shouldDebounceRefresh(account_id: []const u8) bool {
-    refresh_debounce_state.lock();
-    defer refresh_debounce_state.unlock();
+    lockIoMutex(&refresh_debounce_state);
+    defer unlockIoMutex(&refresh_debounce_state);
 
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = nowMilliseconds();
     for (refresh_debounce_entries.items) |*entry| {
         if (!std.mem.eql(u8, entry.account_id, account_id)) continue;
         if (entry.inflight) return true;
@@ -721,9 +815,10 @@ fn shouldDebounceRefresh(account_id: []const u8) bool {
     return false;
 }
 
+// Checks is refresh inflight.
 fn isRefreshInflight(account_id: []const u8) bool {
-    refresh_debounce_state.lock();
-    defer refresh_debounce_state.unlock();
+    lockIoMutex(&refresh_debounce_state);
+    defer unlockIoMutex(&refresh_debounce_state);
 
     for (refresh_debounce_entries.items) |entry| {
         if (std.mem.eql(u8, entry.account_id, account_id)) {
@@ -733,6 +828,7 @@ fn isRefreshInflight(account_id: []const u8) bool {
     return false;
 }
 
+// Loads load store state.
 fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreState {
     var store = StoreState{};
     errdefer store.deinit(allocator);
@@ -807,6 +903,7 @@ fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreSt
     return store;
 }
 
+// Parses parse credits info.
 fn parseCreditsInfo(allocator: std.mem.Allocator, value: std.json.Value) !?CreditsInfo {
     const obj = jsonGetObject(value) orelse return null;
 
@@ -848,6 +945,7 @@ fn parseCreditsInfo(allocator: std.mem.Allocator, value: std.json.Value) !?Credi
     return info;
 }
 
+// Loads load preferences and usage.
 fn loadPreferencesAndUsage(
     allocator: std.mem.Allocator,
     bootstrap_path: []const u8,
@@ -867,7 +965,7 @@ fn loadPreferencesAndUsage(
     };
     errdefer preferences.deinit(allocator);
 
-    var usage = std.ArrayListUnmanaged(UsageCacheEntry){};
+    var usage = std.ArrayListUnmanaged(UsageCacheEntry).empty;
     errdefer {
         for (usage.items) |*entry| entry.deinit(allocator);
         usage.deinit(allocator);
@@ -946,6 +1044,7 @@ fn loadPreferencesAndUsage(
     };
 }
 
+// Loads load app state.
 fn loadAppState(allocator: std.mem.Allocator) !AppState {
     const paths = try getManagedPaths(allocator);
     errdefer {
@@ -974,6 +1073,7 @@ fn loadAppState(allocator: std.mem.Allocator) !AppState {
     };
 }
 
+// Usage entry index.
 fn usageEntryIndex(usage: []const UsageCacheEntry, account_id: []const u8) ?usize {
     for (usage, 0..) |entry, idx| {
         if (std.mem.eql(u8, entry.account_id, account_id)) return idx;
@@ -981,6 +1081,7 @@ fn usageEntryIndex(usage: []const UsageCacheEntry, account_id: []const u8) ?usiz
     return null;
 }
 
+// Account index.
 fn accountIndex(store: *const StoreState, account_id: []const u8) ?usize {
     for (store.accounts.items, 0..) |account, idx| {
         if (std.mem.eql(u8, account.id, account_id)) return idx;
@@ -988,23 +1089,27 @@ fn accountIndex(store: *const StoreState, account_id: []const u8) ?usize {
     return null;
 }
 
+// Account bucket.
 fn accountBucket(account: *const ManagedAccount) AccountBucket {
     if (account.frozen) return .frozen;
     if (account.archived) return .depleted;
     return .active;
 }
 
+// Applies apply bucket.
 fn applyBucket(account: *ManagedAccount, bucket: AccountBucket) void {
     account.archived = bucket == .depleted;
     account.frozen = bucket == .frozen;
 }
 
+// Account state string.
 fn accountStateString(account: *const ManagedAccount) []const u8 {
     if (account.frozen) return "frozen";
     if (account.archived) return "archived";
     return "active";
 }
 
+// Sanitize store active account.
 fn sanitizeStoreActiveAccount(allocator: std.mem.Allocator, store: *StoreState) !void {
     if (store.active_account_id) |active_id| {
         const idx = accountIndex(store, active_id);
@@ -1032,14 +1137,17 @@ fn sanitizeStoreActiveAccount(allocator: std.mem.Allocator, store: *StoreState) 
     }
 }
 
+// Loads load codex auth json.
 fn loadCodexAuthJson(allocator: std.mem.Allocator, codex_auth_path: []const u8) !?[]u8 {
     return readOptionalTextFile(allocator, codex_auth_path);
 }
 
+// Writes write codex auth path.
 fn writeCodexAuthPath(allocator: std.mem.Allocator, codex_auth_path: []const u8, contents: []const u8) !void {
     try writeTextFileAtomic(allocator, codex_auth_path, contents);
 }
 
+// Extracts extract access token from auth json.
 fn extractAccessTokenFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
     defer parsed.deinit();
@@ -1052,6 +1160,7 @@ fn extractAccessTokenFromAuthJson(allocator: std.mem.Allocator, auth_json: []con
     return allocator.dupe(u8, access_token) catch null;
 }
 
+// Extracts extract api key from auth json.
 fn extractApiKeyFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
     defer parsed.deinit();
@@ -1062,6 +1171,7 @@ fn extractApiKeyFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8
     return allocator.dupe(u8, api_key) catch null;
 }
 
+// Extracts extract account id from auth json.
 fn extractAccountIdFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
     defer parsed.deinit();
@@ -1074,6 +1184,7 @@ fn extractAccountIdFromAuthJson(allocator: std.mem.Allocator, auth_json: []const
     return allocator.dupe(u8, account_id) catch null;
 }
 
+// Extracts extract email from id token.
 fn extractEmailFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
     const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
     const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
@@ -1103,6 +1214,7 @@ fn extractEmailFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?
     return null;
 }
 
+// Extracts extract account id from id token.
 fn extractAccountIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
     const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
     const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
@@ -1125,6 +1237,7 @@ fn extractAccountIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u
     return allocator.dupe(u8, account_id) catch null;
 }
 
+// Extracts extract organization id from id token.
 fn extractOrganizationIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
     const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
     const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
@@ -1161,6 +1274,7 @@ fn extractOrganizationIdFromIdToken(allocator: std.mem.Allocator, id_token: []co
     return null;
 }
 
+// Extracts extract email from auth json.
 fn extractEmailFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
     defer parsed.deinit();
@@ -1200,10 +1314,11 @@ fn extractEmailFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8)
     return null;
 }
 
+// Serializes serialize store state.
 fn serializeStoreState(allocator: std.mem.Allocator, store: *const StoreState) ![]u8 {
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     try writer.writeAll("{\"activeAccountId\":");
     try writeJsonOptionalString(writer, store.active_account_id);
@@ -1227,9 +1342,10 @@ fn serializeStoreState(allocator: std.mem.Allocator, store: *const StoreState) !
     }
 
     try writer.writeAll("]}");
-    return buffer.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
+// Writes write credits info json.
 fn writeCreditsInfoJson(writer: anytype, credits: *const CreditsInfo) !void {
     try writer.writeByte('{');
     try writer.writeAll("\"available\":");
@@ -1267,14 +1383,15 @@ fn writeCreditsInfoJson(writer: anytype, credits: *const CreditsInfo) !void {
     try writer.writeByte('}');
 }
 
+// Builds build snapshot json.
 fn buildSnapshotJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try sanitizeStoreActiveAccount(allocator, &state.store);
     const view_json = try buildAccountsViewJson(allocator, state);
     defer allocator.free(view_json);
 
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     try writer.writeByte('{');
     try writer.writeAll("\"theme\":");
@@ -1305,9 +1422,10 @@ fn buildSnapshotJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try writer.print("{}", .{state.saved_at});
     try writer.writeByte('}');
 
-    return buffer.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
+// Builds build accounts view json.
 fn buildAccountsViewJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try sanitizeStoreActiveAccount(allocator, &state.store);
 
@@ -1319,9 +1437,9 @@ fn buildAccountsViewJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
 
     const codex_auth_exists = current_auth != null;
 
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     try writer.writeAll("{\"accounts\":[");
 
@@ -1351,9 +1469,10 @@ fn buildAccountsViewJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
     try writeJsonString(writer, state.paths.storePath);
     try writer.writeByte('}');
 
-    return buffer.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
+// Persist state files only.
 fn persistStateFilesOnly(allocator: std.mem.Allocator, state: *AppState) !void {
     state.saved_at = nowEpochSeconds();
 
@@ -1368,6 +1487,7 @@ fn persistStateFilesOnly(allocator: std.mem.Allocator, state: *AppState) !void {
     defer allocator.free(live_index_path);
 }
 
+// Builds build refresh usage response json.
 fn buildRefreshUsageResponseJson(
     allocator: std.mem.Allocator,
     account_id: []const u8,
@@ -1375,9 +1495,9 @@ fn buildRefreshUsageResponseJson(
     email: ?[]const u8,
     in_flight: bool,
 ) ![]u8 {
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     try writer.writeAll("{\"accountId\":");
     try writeJsonString(writer, account_id);
@@ -1389,9 +1509,10 @@ fn buildRefreshUsageResponseJson(
     try writeJsonBool(writer, in_flight);
     try writer.writeByte('}');
 
-    return buffer.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
+// Creates make credits info.
 fn makeCreditsInfo(
     allocator: std.mem.Allocator,
     checked_at: i64,
@@ -1418,6 +1539,7 @@ fn makeCreditsInfo(
     };
 }
 
+// Parses parse epoch seconds.
 fn parseEpochSeconds(value: std.json.Value) ?i64 {
     const parsed = jsonGetI64(value) orelse return null;
     if (parsed > 1_000_000_000_000) {
@@ -1432,6 +1554,7 @@ const RateLimitWindow = struct {
     refresh_at: ?i64,
 };
 
+// Parses parse rate limit window object.
 fn parseRateLimitWindowObject(
     windows: *std.ArrayListUnmanaged(RateLimitWindow),
     allocator: std.mem.Allocator,
@@ -1479,6 +1602,7 @@ fn parseRateLimitWindowObject(
     }
 }
 
+// Pick weekly window.
 fn pickWeeklyWindow(windows: []const RateLimitWindow) ?RateLimitWindow {
     if (windows.len == 0) return null;
 
@@ -1501,6 +1625,7 @@ fn pickWeeklyWindow(windows: []const RateLimitWindow) ?RateLimitWindow {
     return fallback;
 }
 
+// Pick hourly window.
 fn pickHourlyWindow(windows: []const RateLimitWindow, weekly: ?RateLimitWindow) ?RateLimitWindow {
     if (windows.len == 0) return null;
 
@@ -1528,16 +1653,19 @@ fn pickHourlyWindow(windows: []const RateLimitWindow, weekly: ?RateLimitWindow) 
     return best;
 }
 
+// Remaining from window.
 fn remainingFromWindow(window: ?RateLimitWindow) ?f64 {
     if (window) |value| return @max(0.0, @min(100.0, 100.0 - value.used_percent));
     return null;
 }
 
+// Refresh from window.
 fn refreshFromWindow(window: ?RateLimitWindow) ?i64 {
     if (window) |value| return value.refresh_at;
     return null;
 }
 
+// Parses parse wham credits.
 fn parseWhamCredits(
     allocator: std.mem.Allocator,
     payload: std.json.ObjectMap,
@@ -1546,7 +1674,7 @@ fn parseWhamCredits(
     var result = try makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned no balance or usage data.");
     errdefer result.deinit(allocator);
 
-    var windows = std.ArrayListUnmanaged(RateLimitWindow){};
+    var windows = std.ArrayListUnmanaged(RateLimitWindow).empty;
     defer windows.deinit(allocator);
 
     if (payload.get("rate_limit")) |rate_limit| {
@@ -1635,6 +1763,7 @@ fn parseWhamCredits(
     return result;
 }
 
+// Appends append url encoded.
 fn appendUrlEncoded(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const u8) !void {
     for (raw) |c| {
         switch (c) {
@@ -1648,6 +1777,7 @@ fn appendUrlEncoded(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), raw: 
     }
 }
 
+// Appends append form field.
 fn appendFormField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
     if (buf.items.len > 0) try buf.append(allocator, '&');
     try appendUrlEncoded(allocator, buf, key);
@@ -1655,6 +1785,7 @@ fn appendFormField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: [
     try appendUrlEncoded(allocator, buf, value);
 }
 
+// Http fetch.
 fn httpFetch(
     allocator: std.mem.Allocator,
     method: std.http.Method,
@@ -1664,7 +1795,10 @@ fn httpFetch(
 ) !UsageResult {
     const uri = std.Uri.parse(uri_string) catch return .{ .status = 599, .body = try allocator.dupe(u8, "invalid uri") };
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{
+        .allocator = allocator,
+        .io = process_io,
+    };
     defer client.deinit();
 
     var req = client.request(method, uri, .{
@@ -1676,6 +1810,42 @@ fn httpFetch(
     }) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http prepare fail") };
     defer req.deinit();
 
+    return sendHttpRequest(allocator, &req, body);
+}
+
+// Http fetch without user agent.
+fn httpFetchWithoutUserAgent(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    uri_string: []const u8,
+    headers: []const std.http.Header,
+    body: ?[]const u8,
+) !UsageResult {
+    const uri = std.Uri.parse(uri_string) catch return .{ .status = 599, .body = try allocator.dupe(u8, "invalid uri") };
+
+    var client = std.http.Client{
+        .allocator = allocator,
+        .io = process_io,
+    };
+    defer client.deinit();
+
+    var req = client.request(method, uri, .{
+        .headers = .{
+            .accept_encoding = .omit,
+        },
+        .extra_headers = headers,
+    }) catch return .{ .status = 599, .body = try allocator.dupe(u8, "http prepare fail") };
+    defer req.deinit();
+
+    return sendHttpRequest(allocator, &req, body);
+}
+
+// Send http request.
+fn sendHttpRequest(
+    allocator: std.mem.Allocator,
+    req: *std.http.Client.Request,
+    body: ?[]const u8,
+) !UsageResult {
     if (body) |b| {
         var transfer_buf: [4096]u8 = undefined;
         req.transfer_encoding = .{ .content_length = b.len };
@@ -1696,7 +1866,7 @@ fn httpFetch(
     var body_buf = std.ArrayList(u8).empty;
     defer body_buf.deinit(allocator);
 
-    body_reader.appendRemaining(allocator, &body_buf, std.io.Limit.unlimited) catch {};
+    body_reader.appendRemaining(allocator, &body_buf, std.Io.Limit.unlimited) catch {};
 
     return .{
         .status = @intFromEnum(response.head.status),
@@ -1704,6 +1874,7 @@ fn httpFetch(
     };
 }
 
+// Fetches fetch legacy credits from api key.
 fn fetchLegacyCreditsFromApiKey(allocator: std.mem.Allocator, api_key: []const u8, checked_at: i64) !CreditsInfo {
     const endpoints = [_][]const u8{
         "https://api.openai.com/dashboard/billing/credit_grants",
@@ -1777,6 +1948,7 @@ fn fetchLegacyCreditsFromApiKey(allocator: std.mem.Allocator, api_key: []const u
     };
 }
 
+// Fetches fetch credits from auth json.
 fn fetchCreditsFromAuthJson(
     allocator: std.mem.Allocator,
     auth_json: []const u8,
@@ -1825,6 +1997,7 @@ fn fetchCreditsFromAuthJson(
     return makeCreditsInfo(allocator, checked_at, .unavailable, "No access token available for this account.");
 }
 
+// Fetches fetch email from open ai api.
 fn fetchEmailFromOpenAiApi(allocator: std.mem.Allocator, access_token: []const u8) !?[]u8 {
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
     defer allocator.free(auth_header);
@@ -1846,17 +2019,20 @@ fn fetchEmailFromOpenAiApi(allocator: std.mem.Allocator, access_token: []const u
     return try allocator.dupe(u8, email);
 }
 
+// Account matches identity.
 fn accountMatchesIdentity(account: *const ManagedAccount, account_id: ?[]const u8, email: ?[]const u8) bool {
     if (account_id != null and account.account_id != null and std.mem.eql(u8, account_id.?, account.account_id.?)) return true;
     if (email != null and account.email != null and std.mem.eql(u8, email.?, account.email.?)) return true;
     return false;
 }
 
+// Generate account id.
 fn generateAccountId(allocator: std.mem.Allocator) ![]u8 {
-    const random_value = std.crypto.random.int(u32);
-    return std.fmt.allocPrint(allocator, "acct-{}-{x:0>8}", .{ std.time.milliTimestamp(), random_value });
+    const random_value = (std.Random.IoSource{ .io = process_io }).interface().int(u32);
+    return std.fmt.allocPrint(allocator, "acct-{}-{x:0>8}", .{ nowMilliseconds(), random_value });
 }
 
+// Upsert account from auth.
 fn upsertAccountFromAuth(
     allocator: std.mem.Allocator,
     store: *StoreState,
@@ -1918,6 +2094,7 @@ fn upsertAccountFromAuth(
     return store.accounts.items[store.accounts.items.len - 1].id;
 }
 
+// Sets set store active account id.
 fn setStoreActiveAccountId(allocator: std.mem.Allocator, store: *StoreState, account_id: ?[]const u8) !void {
     if (store.active_account_id) |existing| {
         allocator.free(existing);
@@ -1928,6 +2105,7 @@ fn setStoreActiveAccountId(allocator: std.mem.Allocator, store: *StoreState, acc
     }
 }
 
+// Switches switch active to fallback.
 fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, removed_id: ?[]const u8) !void {
     if (state.store.active_account_id) |active_id| {
         if (removed_id != null and !std.mem.eql(u8, active_id, removed_id.?)) {
@@ -1949,11 +2127,12 @@ fn switchActiveToFallback(allocator: std.mem.Allocator, state: *AppState, remove
     try setStoreActiveAccountId(allocator, &state.store, null);
 }
 
+// Handles handle switch account command.
 fn handleSwitchAccountCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
     const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "switch_account requires accountId");
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -1973,6 +2152,7 @@ fn handleSwitchAccountCommand(allocator: std.mem.Allocator, account_id_raw: []co
     return jsonOkRaw(allocator, view_json);
 }
 
+// Handles handle move account command.
 fn handleMoveAccountCommand(
     allocator: std.mem.Allocator,
     account_id_raw: []const u8,
@@ -1984,8 +2164,8 @@ fn handleMoveAccountCommand(
     const bucket_string = trimOptionalString(target_bucket_raw) orelse return jsonError(allocator, "move_account requires targetBucket");
     const target_bucket = parseAccountBucket(bucket_string) orelse return jsonError(allocator, "targetBucket must be active, depleted, or frozen");
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -2004,7 +2184,7 @@ fn handleMoveAccountCommand(
         }
     }
 
-    var bucket_indices = std.ArrayListUnmanaged(usize){};
+    var bucket_indices = std.ArrayListUnmanaged(usize).empty;
     defer bucket_indices.deinit(allocator);
     for (state.store.accounts.items, 0..) |account, idx| {
         if (accountBucket(&account) == target_bucket) {
@@ -2014,7 +2194,7 @@ fn handleMoveAccountCommand(
 
     const normalized_target_index: usize = blk: {
         if (target_index <= 0) break :blk 0;
-        const as_usize: usize = @intCast(target_index);
+        const as_usize = std.math.cast(usize, target_index) orelse std.math.maxInt(usize);
         break :blk @min(as_usize, bucket_indices.items.len);
     };
 
@@ -2031,11 +2211,12 @@ fn handleMoveAccountCommand(
     return jsonOk(allocator, @as(?u8, null));
 }
 
+// Handles handle remove account command.
 fn handleRemoveAccountCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
     const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "remove_account requires accountId");
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -2059,11 +2240,12 @@ fn handleRemoveAccountCommand(allocator: std.mem.Allocator, account_id_raw: []co
     return jsonOkRaw(allocator, view_json);
 }
 
+// Handles handle import current account command.
 fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[]const u8) ![]u8 {
     const normalized_label = trimOptionalString(label_raw);
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -2080,6 +2262,7 @@ fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[
     return jsonOkRaw(allocator, view_json);
 }
 
+// Handles handle login with api key command.
 fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []const u8, label_raw: ?[]const u8) ![]u8 {
     const api_key = trimOptionalString(api_key_raw) orelse return jsonError(allocator, "login_with_api_key requires apiKey");
     const label = trimOptionalString(label_raw);
@@ -2089,8 +2272,8 @@ fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []con
     });
     defer allocator.free(auth_json);
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -2104,9 +2287,10 @@ fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []con
     return jsonOkRaw(allocator, view_json);
 }
 
+// Handles handle update ui preferences command.
 fn handleUpdateUiPreferencesCommand(allocator: std.mem.Allocator, request: RpcRequest) ![]u8 {
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -2147,6 +2331,7 @@ const RefreshThreadArgs = struct {
     account_id: []const u8,
 };
 
+// Background refresh account usage.
 fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     const allocator = std.heap.page_allocator;
     const account_id = args.account_id;
@@ -2163,9 +2348,9 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     var fetched_email: ?[]u8 = null;
     defer if (fetched_email) |email| allocator.free(email);
 
-    managed_files_mutex.lock();
+    lockIoMutex(&managed_files_mutex);
     {
-        defer managed_files_mutex.unlock();
+        defer unlockIoMutex(&managed_files_mutex);
         var state = loadAppState(allocator) catch return;
         defer state.deinit(allocator);
         const idx = accountIndex(&state.store, account_id) orelse return;
@@ -2188,8 +2373,8 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     var refreshed_credits = fetchCreditsFromAuthJson(allocator, auth_json_copy.?, account_id_hint) catch return;
     errdefer refreshed_credits.deinit(allocator);
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = loadAppState(allocator) catch return;
     defer state.deinit(allocator);
@@ -2223,6 +2408,7 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     persistStateFilesOnly(allocator, &state) catch {};
 }
 
+// Handles handle refresh account usage command.
 fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
     const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "refresh_account_usage requires accountId");
 
@@ -2244,8 +2430,8 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
         thread.detach();
     }
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
 
@@ -2276,6 +2462,7 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     return jsonOkRaw(allocator, response);
 }
 
+// Fetches fetch wham usage.
 fn fetchWhamUsage(
     allocator: std.mem.Allocator,
     access_token: []const u8,
@@ -2302,7 +2489,8 @@ fn fetchWhamUsage(
     return httpFetch(allocator, .GET, "https://chatgpt.com/backend-api/wham/usage", header_list.items, null);
 }
 
-fn writeHttpResponse(stream: std.net.Stream, status: []const u8, body: []const u8) void {
+// Writes write http response.
+fn writeHttpResponse(stream: std.Io.net.Stream, status: []const u8, body: []const u8) void {
     var header_buffer: [512]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buffer,
@@ -2310,13 +2498,15 @@ fn writeHttpResponse(stream: std.net.Stream, status: []const u8, body: []const u
         .{ status, body.len },
     ) catch return;
 
-    stream.writeAll(header) catch {};
-    stream.writeAll(body) catch {};
+    var writer = stream.writer(process_io, &.{});
+    writer.interface.writeAll(header) catch {};
+    writer.interface.writeAll(body) catch {};
 }
 
+// Extracts extract request target.
 fn extractRequestTarget(request: []const u8) ?[]const u8 {
     const first_line_end = std.mem.indexOfScalar(u8, request, '\n') orelse request.len;
-    const first_line = std.mem.trimRight(u8, request[0..first_line_end], "\r");
+    const first_line = std.mem.trimEnd(u8, request[0..first_line_end], "\r");
 
     var parts = std.mem.tokenizeScalar(u8, first_line, ' ');
     const method = parts.next() orelse return null;
@@ -2329,6 +2519,89 @@ fn extractRequestTarget(request: []const u8) ?[]const u8 {
     return target;
 }
 
+// Checks is oauth callback target.
+fn isOAuthCallbackTarget(target: []const u8) bool {
+    if (!std.mem.startsWith(u8, target, "/auth/callback")) {
+        return false;
+    }
+    if (target.len == "/auth/callback".len) {
+        return true;
+    }
+
+    const separator = target["/auth/callback".len];
+    return separator == '?' or separator == '#';
+}
+
+// Checks is oauth cancel target.
+fn isOAuthCancelTarget(target: []const u8) bool {
+    if (!std.mem.startsWith(u8, target, "/cancel")) {
+        return false;
+    }
+    if (target.len == "/cancel".len) {
+        return true;
+    }
+
+    const separator = target["/cancel".len];
+    return separator == '?' or separator == '#';
+}
+
+// Send oauth cancel request.
+fn sendOAuthCancelRequest(port: u16) !void {
+    const address = try std.Io.net.IpAddress.parseIp4(OAUTH_CALLBACK_LISTEN_HOST, port);
+    var stream = try std.Io.net.IpAddress.connect(address, process_io, .{
+        .mode = .stream,
+        .timeout = .{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(OAUTH_CANCEL_REQUEST_TIMEOUT_MS),
+            .clock = .real,
+        } },
+    });
+    defer stream.close(process_io);
+
+    var host_buffer: [64]u8 = undefined;
+    const host_header = try std.fmt.bufPrint(&host_buffer, "Host: {s}:{}\r\n", .{
+        OAUTH_CALLBACK_LISTEN_HOST,
+        port,
+    });
+
+    var writer = stream.writer(process_io, &.{});
+    try writer.interface.writeAll("GET /cancel HTTP/1.1\r\n");
+    try writer.interface.writeAll(host_header);
+    try writer.interface.writeAll("Connection: close\r\n\r\n");
+
+    var reader_buffer: [64]u8 = undefined;
+    var reader = stream.reader(process_io, &reader_buffer);
+    _ = reader.interface.readSliceShort(&reader_buffer) catch {};
+}
+
+// Bind oauth callback server.
+fn bindOAuthCallbackServer(port: u16) !std.Io.net.Server {
+    const address = try std.Io.net.IpAddress.parseIp4(OAUTH_CALLBACK_LISTEN_HOST, port);
+    var cancel_attempted = false;
+    var attempts: u32 = 0;
+
+    while (true) {
+        return address.listen(process_io, .{
+            .reuse_address = true,
+        }) catch |err| switch (err) {
+            error.AddressInUse => {
+                attempts += 1;
+                if (!cancel_attempted) {
+                    cancel_attempted = true;
+                    sendOAuthCancelRequest(port) catch {};
+                }
+
+                if (attempts >= OAUTH_CALLBACK_BIND_RETRY_ATTEMPTS) {
+                    return error.AddressInUse;
+                }
+
+                std.Io.sleep(process_io, .fromMilliseconds(OAUTH_CALLBACK_BIND_RETRY_DELAY_MS), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 const OAuthThreadArgs = struct {
     timeout_seconds: u64,
     external_cancel: *std.atomic.Value(bool),
@@ -2339,6 +2612,7 @@ const OAuthThreadArgs = struct {
     code_verifier: ?[]u8 = null,
     label: ?[]u8 = null,
 
+    // Initializes and returns this value.
     fn init(
         issuer: []const u8,
         client_id: []const u8,
@@ -2377,6 +2651,7 @@ const OAuthThreadArgs = struct {
         };
     }
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *OAuthThreadArgs) void {
         std.heap.page_allocator.free(self.issuer);
         std.heap.page_allocator.free(self.client_id);
@@ -2396,6 +2671,7 @@ const OAuthTokenPair = struct {
     access_token: []u8,
     refresh_token: []u8,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *OAuthTokenPair, allocator: std.mem.Allocator) void {
         allocator.free(self.id_token);
         allocator.free(self.access_token);
@@ -2405,22 +2681,20 @@ const OAuthTokenPair = struct {
 
 const OAuthCallbackQuery = struct {
     code: ?[]u8 = null,
-    id_token: ?[]u8 = null,
     state: ?[]u8 = null,
-    org_id: ?[]u8 = null,
     auth_error: ?[]u8 = null,
     auth_error_description: ?[]u8 = null,
 
+    // Cleans up resources owned by this value.
     fn deinit(self: *OAuthCallbackQuery, allocator: std.mem.Allocator) void {
         if (self.code) |value| allocator.free(value);
-        if (self.id_token) |value| allocator.free(value);
         if (self.state) |value| allocator.free(value);
-        if (self.org_id) |value| allocator.free(value);
         if (self.auth_error) |value| allocator.free(value);
         if (self.auth_error_description) |value| allocator.free(value);
     }
 };
 
+// Clears clear oauth listener result locked.
 fn clearOAuthListenerResultLocked() void {
     if (oauth_listener_state.callback_url) |url| {
         std.heap.page_allocator.free(url);
@@ -2436,6 +2710,7 @@ fn clearOAuthListenerResultLocked() void {
     }
 }
 
+// Joins join oauth listener thread locked.
 fn joinOAuthListenerThreadLocked() void {
     if (oauth_listener_state.thread) |thread| {
         thread.join();
@@ -2443,6 +2718,7 @@ fn joinOAuthListenerThreadLocked() void {
     }
 }
 
+// Decodes decode hex nibble.
 fn decodeHexNibble(byte: u8) ?u8 {
     if (byte >= '0' and byte <= '9') return byte - '0';
     if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
@@ -2450,6 +2726,7 @@ fn decodeHexNibble(byte: u8) ?u8 {
     return null;
 }
 
+// Decodes decode url component.
 fn decodeUrlComponent(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
@@ -2480,6 +2757,7 @@ fn decodeUrlComponent(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return buffer.toOwnedSlice(allocator);
 }
 
+// Returns get decoded query param value.
 fn getDecodedQueryParamValue(allocator: std.mem.Allocator, query: []const u8, key: []const u8) !?[]u8 {
     var parts = std.mem.splitScalar(u8, query, '&');
     while (parts.next()) |segment| {
@@ -2497,6 +2775,7 @@ fn getDecodedQueryParamValue(allocator: std.mem.Allocator, query: []const u8, ke
     return null;
 }
 
+// Parses parse oauth callback query.
 fn parseOAuthCallbackQuery(allocator: std.mem.Allocator, callback_url: []const u8) !OAuthCallbackQuery {
     const query_start = std.mem.indexOfScalar(u8, callback_url, '?') orelse return error.CallbackMissingQuery;
     const query_end = std.mem.indexOfScalarPos(u8, callback_url, query_start + 1, '#') orelse callback_url.len;
@@ -2505,42 +2784,32 @@ fn parseOAuthCallbackQuery(allocator: std.mem.Allocator, callback_url: []const u
 
     const code = try getDecodedQueryParamValue(allocator, query, "code");
     errdefer if (code) |value| allocator.free(value);
-    const id_token = try getDecodedQueryParamValue(allocator, query, "id_token");
-    errdefer if (id_token) |value| allocator.free(value);
     const oauth_state = try getDecodedQueryParamValue(allocator, query, "state");
     errdefer if (oauth_state) |value| allocator.free(value);
-    var org_id = try getDecodedQueryParamValue(allocator, query, "org_id");
-    if (org_id == null) {
-        org_id = try getDecodedQueryParamValue(allocator, query, "organization_id");
-    }
-    errdefer if (org_id) |value| allocator.free(value);
     const auth_error = try getDecodedQueryParamValue(allocator, query, "error");
     errdefer if (auth_error) |value| allocator.free(value);
     const auth_error_description = try getDecodedQueryParamValue(allocator, query, "error_description");
     errdefer if (auth_error_description) |value| allocator.free(value);
 
-    if (auth_error != null and code == null and id_token == null) {
+    if (auth_error != null and code == null) {
         return .{
             .code = null,
-            .id_token = null,
             .state = oauth_state,
-            .org_id = org_id,
             .auth_error = auth_error,
             .auth_error_description = auth_error_description,
         };
     }
 
-    if (code == null and id_token == null) return error.CallbackMissingAuthorizationCode;
+    if (code == null) return error.CallbackMissingAuthorizationCode;
     return .{
         .code = code,
-        .id_token = id_token,
         .state = oauth_state,
-        .org_id = org_id,
         .auth_error = auth_error,
         .auth_error_description = auth_error_description,
     };
 }
 
+// Exchange authorization code for tokens.
 fn exchangeAuthorizationCodeForTokens(
     allocator: std.mem.Allocator,
     issuer: []const u8,
@@ -2565,7 +2834,7 @@ fn exchangeAuthorizationCodeForTokens(
         .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
     };
 
-    const response = try httpFetch(allocator, .POST, endpoint, &headers, body_buf.items);
+    const response = try httpFetchWithoutUserAgent(allocator, .POST, endpoint, &headers, body_buf.items);
     defer allocator.free(response.body);
     if (response.status < 200 or response.status >= 300) {
         return error.AuthorizationCodeExchangeFailed;
@@ -2589,12 +2858,12 @@ fn exchangeAuthorizationCodeForTokens(
     };
 }
 
+// Exchange api key from id token.
 fn exchangeApiKeyFromIdToken(
     allocator: std.mem.Allocator,
     issuer: []const u8,
     client_id: []const u8,
     id_token: []const u8,
-    organization_id: ?[]const u8,
 ) !?[]u8 {
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
     defer allocator.free(endpoint);
@@ -2607,18 +2876,12 @@ fn exchangeApiKeyFromIdToken(
     try appendFormField(allocator, &body_buf, "requested_token", "openai-api-key");
     try appendFormField(allocator, &body_buf, "subject_token", id_token);
     try appendFormField(allocator, &body_buf, "subject_token_type", ID_TOKEN_TYPE);
-    if (organization_id) |org| {
-        const trimmed = std.mem.trim(u8, org, " \r\n\t");
-        if (trimmed.len > 0) {
-            try appendFormField(allocator, &body_buf, "organization_id", trimmed);
-        }
-    }
 
     const headers = [_]std.http.Header{
         .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
     };
 
-    const response = httpFetch(allocator, .POST, endpoint, &headers, body_buf.items) catch return null;
+    const response = httpFetchWithoutUserAgent(allocator, .POST, endpoint, &headers, body_buf.items) catch return null;
     defer allocator.free(response.body);
     if (response.status < 200 or response.status >= 300) return null;
 
@@ -2630,52 +2893,7 @@ fn exchangeApiKeyFromIdToken(
     return try allocator.dupe(u8, access_token.?);
 }
 
-fn exchangeAccessTokenFromIdToken(
-    allocator: std.mem.Allocator,
-    issuer: []const u8,
-    client_id: []const u8,
-    id_token: []const u8,
-    organization_id: ?[]const u8,
-) !?[]u8 {
-    const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
-    defer allocator.free(endpoint);
-
-    var body_buf = std.ArrayList(u8).empty;
-    defer body_buf.deinit(allocator);
-
-    try appendFormField(allocator, &body_buf, "grant_type", TOKEN_EXCHANGE_GRANT);
-    try appendFormField(allocator, &body_buf, "client_id", client_id);
-    try appendFormField(
-        allocator,
-        &body_buf,
-        "requested_token",
-        "urn:ietf:params:oauth:token-type:access_token",
-    );
-    try appendFormField(allocator, &body_buf, "subject_token", id_token);
-    try appendFormField(allocator, &body_buf, "subject_token_type", ID_TOKEN_TYPE);
-    if (organization_id) |org| {
-        const trimmed = std.mem.trim(u8, org, " \r\n\t");
-        if (trimmed.len > 0) {
-            try appendFormField(allocator, &body_buf, "organization_id", trimmed);
-        }
-    }
-
-    const headers = [_]std.http.Header{
-        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
-    };
-
-    const response = httpFetch(allocator, .POST, endpoint, &headers, body_buf.items) catch return null;
-    defer allocator.free(response.body);
-    if (response.status < 200 or response.status >= 300) return null;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch return null;
-    defer parsed.deinit();
-    const payload = jsonGetObject(parsed.value) orelse return null;
-    const access_token = if (payload.get("access_token")) |value| jsonGetString(value) else null;
-    if (access_token == null) return null;
-    return try allocator.dupe(u8, access_token.?);
-}
-
+// Builds build chatgpt auth payload json.
 fn buildChatgptAuthPayloadJson(
     allocator: std.mem.Allocator,
     tokens: *const OAuthTokenPair,
@@ -2684,9 +2902,9 @@ fn buildChatgptAuthPayloadJson(
     const account_id = extractAccountIdFromIdToken(allocator, tokens.id_token);
     defer if (account_id) |value| allocator.free(value);
 
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-    const writer = buffer.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     try writer.writeAll("{\"auth_mode\":\"chatgpt\",\"tokens\":{\"id_token\":");
     try writeJsonString(writer, tokens.id_token);
@@ -2698,7 +2916,7 @@ fn buildChatgptAuthPayloadJson(
     try writeJsonOptionalString(writer, account_id);
     try writer.writeAll("},\"last_refresh\":");
 
-    const last_refresh = try formatIso8601UtcMillis(allocator, std.time.milliTimestamp());
+    const last_refresh = try formatIso8601UtcMillis(allocator, nowMilliseconds());
     defer allocator.free(last_refresh);
     try writeJsonString(writer, last_refresh);
 
@@ -2708,9 +2926,10 @@ fn buildChatgptAuthPayloadJson(
     }
 
     try writer.writeByte('}');
-    return buffer.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
+// Formats format iso8601 utc millis.
 fn formatIso8601UtcMillis(allocator: std.mem.Allocator, timestamp_ms: i64) ![]u8 {
     const clamped_ms: i64 = if (timestamp_ms < 0) 0 else timestamp_ms;
     const seconds_since_epoch: u64 = @intCast(@divTrunc(clamped_ms, 1000));
@@ -2737,84 +2956,37 @@ fn formatIso8601UtcMillis(allocator: std.mem.Allocator, timestamp_ms: i64) ![]u8
     );
 }
 
+// Complete oauth login from callback.
 fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAuthThreadArgs, callback_url: []const u8) !OAuthReadyAccount {
     var callback_query = try parseOAuthCallbackQuery(allocator, callback_url);
     defer callback_query.deinit(allocator);
-
-    if (callback_query.auth_error != null) {
-        return error.OAuthAuthorizationFailed;
-    }
 
     const callback_state = callback_query.state orelse return error.OAuthStateMismatch;
     if (!std.mem.eql(u8, callback_state, args.oauth_state)) {
         return error.OAuthStateMismatch;
     }
 
-    var tokens: OAuthTokenPair = undefined;
-    if (callback_query.code) |authorization_code| {
-        const code_verifier = args.code_verifier orelse return error.AuthorizationCodeExchangeFailed;
-        tokens = try exchangeAuthorizationCodeForTokens(
-            allocator,
-            args.issuer,
-            args.client_id,
-            args.redirect_uri,
-            authorization_code,
-            code_verifier,
-        );
-    } else if (callback_query.id_token) |id_token| {
-        var org_id_owned: ?[]u8 = null;
-        defer if (org_id_owned) |value| allocator.free(value);
-
-        if (callback_query.org_id) |org_id| {
-            const trimmed = std.mem.trim(u8, org_id, " \r\n\t");
-            if (trimmed.len > 0) {
-                org_id_owned = try allocator.dupe(u8, trimmed);
-            }
-        }
-        if (org_id_owned == null) {
-            org_id_owned = extractOrganizationIdFromIdToken(allocator, id_token);
-        }
-
-        const exchanged_access_token = exchangeAccessTokenFromIdToken(
-            allocator,
-            args.issuer,
-            args.client_id,
-            id_token,
-            org_id_owned,
-        ) catch null;
-        if (exchanged_access_token == null) {
-            return error.AuthorizationCodeExchangeFailed;
-        }
-
-        tokens = .{
-            .id_token = try allocator.dupe(u8, id_token),
-            .access_token = exchanged_access_token.?,
-            // Token exchange callback flow does not provide refresh token.
-            .refresh_token = try allocator.dupe(u8, ""),
-        };
-    } else {
-        return error.CallbackMissingAuthorizationCode;
+    if (callback_query.auth_error != null) {
+        return error.OAuthAuthorizationFailed;
     }
+
+    const authorization_code = callback_query.code orelse return error.CallbackMissingAuthorizationCode;
+    const code_verifier = args.code_verifier orelse return error.AuthorizationCodeExchangeFailed;
+    var tokens = try exchangeAuthorizationCodeForTokens(
+        allocator,
+        args.issuer,
+        args.client_id,
+        args.redirect_uri,
+        authorization_code,
+        code_verifier,
+    );
     defer tokens.deinit(allocator);
-
-    var organization_id_owned: ?[]u8 = null;
-    defer if (organization_id_owned) |value| allocator.free(value);
-    if (callback_query.org_id) |org_id| {
-        const trimmed = std.mem.trim(u8, org_id, " \r\n\t");
-        if (trimmed.len > 0) {
-            organization_id_owned = try allocator.dupe(u8, trimmed);
-        }
-    }
-    if (organization_id_owned == null) {
-        organization_id_owned = extractOrganizationIdFromIdToken(allocator, tokens.id_token);
-    }
 
     const api_key = try exchangeApiKeyFromIdToken(
         allocator,
         args.issuer,
         args.client_id,
         tokens.id_token,
-        organization_id_owned,
     );
     defer if (api_key) |value| allocator.free(value);
 
@@ -2829,8 +3001,8 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
         null;
     defer if (fetched_email) |value| allocator.free(value);
 
-    managed_files_mutex.lock();
-    defer managed_files_mutex.unlock();
+    lockIoMutex(&managed_files_mutex);
+    defer unlockIoMutex(&managed_files_mutex);
 
     var state = try loadAppState(allocator);
     defer state.deinit(allocator);
@@ -2854,6 +3026,7 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
     };
 }
 
+// Start oauth callback listener.
 fn startOAuthCallbackListener(
     timeout_seconds: u64,
     external_cancel: *std.atomic.Value(bool),
@@ -2864,8 +3037,8 @@ fn startOAuthCallbackListener(
     code_verifier: ?[]const u8,
     label: ?[]const u8,
 ) !void {
-    oauth_listener_state.mutex.lock();
-    defer oauth_listener_state.mutex.unlock();
+    lockIoMutex(&oauth_listener_state.mutex);
+    defer unlockIoMutex(&oauth_listener_state.mutex);
 
     if (oauth_listener_state.running) {
         return error.CallbackListenerAlreadyRunning;
@@ -2897,9 +3070,10 @@ fn startOAuthCallbackListener(
     };
 }
 
+// Polls poll oauth callback listener.
 fn pollOAuthCallbackListener(allocator: std.mem.Allocator) !OAuthPollResult {
-    oauth_listener_state.mutex.lock();
-    defer oauth_listener_state.mutex.unlock();
+    lockIoMutex(&oauth_listener_state.mutex);
+    defer unlockIoMutex(&oauth_listener_state.mutex);
 
     if (oauth_listener_state.running) {
         return .{ .status = "running" };
@@ -2941,11 +3115,13 @@ fn pollOAuthCallbackListener(allocator: std.mem.Allocator) !OAuthPollResult {
     return .{ .status = "idle" };
 }
 
+// Cancel oauth callback listener.
 fn cancelOAuthCallbackListener(external_cancel: *std.atomic.Value(bool)) void {
     oauth_listener_state.cancel.store(true, .seq_cst);
     external_cancel.store(true, .seq_cst);
 }
 
+// Oauth callback thread main.
 fn oauthCallbackThreadMain(args: OAuthThreadArgs) void {
     var owned_args = args;
     defer owned_args.deinit();
@@ -2955,39 +3131,40 @@ fn oauthCallbackThreadMain(args: OAuthThreadArgs) void {
         owned_args.timeout_seconds,
         &oauth_listener_state.cancel,
     ) catch |err| {
-        oauth_listener_state.mutex.lock();
+        lockIoMutex(&oauth_listener_state.mutex);
         clearOAuthListenerResultLocked();
         oauth_listener_state.error_name = std.heap.page_allocator.dupe(u8, @errorName(err)) catch null;
         oauth_listener_state.running = false;
-        oauth_listener_state.cond.broadcast();
-        oauth_listener_state.mutex.unlock();
+        broadcastIoCondition(&oauth_listener_state.cond);
+        unlockIoMutex(&oauth_listener_state.mutex);
         owned_args.external_cancel.store(false, .seq_cst);
         return;
     };
 
     const oauth_account = completeOAuthLoginFromCallback(std.heap.page_allocator, &owned_args, callback_url) catch |err| {
         std.heap.page_allocator.free(callback_url);
-        oauth_listener_state.mutex.lock();
+        lockIoMutex(&oauth_listener_state.mutex);
         clearOAuthListenerResultLocked();
         oauth_listener_state.error_name = std.heap.page_allocator.dupe(u8, @errorName(err)) catch null;
         oauth_listener_state.running = false;
-        oauth_listener_state.cond.broadcast();
-        oauth_listener_state.mutex.unlock();
+        broadcastIoCondition(&oauth_listener_state.cond);
+        unlockIoMutex(&oauth_listener_state.mutex);
         owned_args.external_cancel.store(false, .seq_cst);
         return;
     };
 
-    oauth_listener_state.mutex.lock();
+    lockIoMutex(&oauth_listener_state.mutex);
     clearOAuthListenerResultLocked();
     oauth_listener_state.callback_url = callback_url;
     oauth_listener_state.ready_account = oauth_account;
     oauth_listener_state.running = false;
-    oauth_listener_state.cond.broadcast();
-    oauth_listener_state.mutex.unlock();
+    broadcastIoCondition(&oauth_listener_state.cond);
+    unlockIoMutex(&oauth_listener_state.mutex);
 
     owned_args.external_cancel.store(false, .seq_cst);
 }
 
+// Wait for oauth callback.
 fn waitForOAuthCallback(
     allocator: std.mem.Allocator,
     timeout_seconds: u64,
@@ -2995,16 +3172,14 @@ fn waitForOAuthCallback(
 ) ![]u8 {
     cancel_ptr.store(false, .seq_cst);
 
-    const address = try std.net.Address.parseIp4("127.0.0.1", 1455);
-    var server = try address.listen(.{
-        .reuse_address = true,
-        .force_nonblocking = true,
-    });
-    defer server.deinit();
+    var server = try bindOAuthCallbackServer(OAUTH_CALLBACK_PORT);
+    defer server.deinit(process_io);
 
-    const timeout_ms_total_u64 = timeout_seconds * 1000;
-    const timeout_ms_total_i64 = std.math.cast(i64, timeout_ms_total_u64) orelse std.math.maxInt(i64);
-    const deadline_ms = std.time.milliTimestamp() + timeout_ms_total_i64;
+    const deadline_ms: ?i64 = if (timeout_seconds == 0) null else blk: {
+        const timeout_ms_total_u64 = timeout_seconds * 1000;
+        const timeout_ms_total_i64 = std.math.cast(i64, timeout_ms_total_u64) orelse std.math.maxInt(i64);
+        break :blk nowMilliseconds() + timeout_ms_total_i64;
+    };
 
     accept_loop: while (true) {
         if (cancel_ptr.load(.seq_cst)) {
@@ -3016,30 +3191,23 @@ fn waitForOAuthCallback(
             return error.CallbackListenerTimeout;
         }
 
-        var accept_fds = [_]std.posix.pollfd{
-            .{
-                .fd = server.stream.handle,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-
-        const accept_ready = try std.posix.poll(&accept_fds, accept_timeout_ms);
-        if (accept_ready == 0) {
+        const accept_poll = try pollSocketReadable(server.socket.handle, accept_timeout_ms);
+        if (!accept_poll.ready) {
             continue;
         }
 
-        if ((accept_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+        if (socketPollHasError(accept_poll.revents)) {
             return error.CallbackListenerSocketError;
         }
 
-        const connection = server.accept() catch |err| switch (err) {
+        const connection = server.accept(process_io) catch |err| switch (err) {
             error.WouldBlock => continue,
             else => return err,
         };
 
         var conn = connection;
-        defer conn.stream.close();
+        defer conn.close(process_io);
+        var conn_reader = conn.reader(process_io, &.{});
 
         var request_buffer = std.ArrayList(u8).empty;
         defer request_buffer.deinit(allocator);
@@ -3054,34 +3222,23 @@ fn waitForOAuthCallback(
                 return error.CallbackListenerTimeout;
             }
 
-            var read_fds = [_]std.posix.pollfd{
-                .{
-                    .fd = conn.stream.handle,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
-            };
-
-            const read_ready = try std.posix.poll(&read_fds, read_timeout_ms);
-            if (read_ready == 0) {
+            const read_poll = try pollSocketReadable(conn.socket.handle, read_timeout_ms);
+            if (!read_poll.ready) {
                 continue;
             }
 
-            if ((read_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) {
+            if (socketPollHasDisconnect(read_poll.revents)) {
                 continue :accept_loop;
             }
 
-            const read_size = conn.stream.read(&chunk) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => continue :accept_loop,
-            };
+            const read_size = conn_reader.interface.readSliceShort(&chunk) catch continue :accept_loop;
             if (read_size == 0) {
                 continue :accept_loop;
             }
 
             try request_buffer.appendSlice(allocator, chunk[0..read_size]);
             if (request_buffer.items.len > 64 * 1024) {
-                writeHttpResponse(conn.stream, "413 Payload Too Large", "<html><body>Callback request too large.</body></html>");
+                writeHttpResponse(conn, "413 Payload Too Large", "<html><body>Callback request too large.</body></html>");
                 continue :accept_loop;
             }
 
@@ -3092,57 +3249,198 @@ fn waitForOAuthCallback(
             const maybe_target = extractRequestTarget(request_buffer.items);
 
             if (maybe_target) |target| {
-                if (std.mem.startsWith(u8, target, "/auth/callback")) {
-                    writeHttpResponse(conn.stream, "200 OK", OAUTH_CALLBACK_SUCCESS_HTML);
-                    return std.fmt.allocPrint(allocator, "http://localhost:1455{s}", .{target});
+                if (isOAuthCancelTarget(target)) {
+                    writeHttpResponse(conn, "200 OK", "<html><body>Login cancelled</body></html>");
+                    return error.CallbackListenerStopped;
                 }
 
-                writeHttpResponse(conn.stream, "404 Not Found", "<html><body>Not Found</body></html>");
+                if (isOAuthCallbackTarget(target)) {
+                    writeHttpResponse(conn, "200 OK", OAUTH_CALLBACK_SUCCESS_HTML);
+                    return std.fmt.allocPrint(allocator, "http://{s}:{}{s}", .{
+                        OAUTH_CALLBACK_PUBLIC_HOST,
+                        OAUTH_CALLBACK_PORT,
+                        target,
+                    });
+                }
+
+                writeHttpResponse(conn, "404 Not Found", "<html><body>Not Found</body></html>");
                 continue :accept_loop;
             }
 
-            writeHttpResponse(conn.stream, "400 Bad Request", "<html><body>Invalid callback request.</body></html>");
+            writeHttpResponse(conn, "400 Bad Request", "<html><body>Invalid callback request.</body></html>");
             continue :accept_loop;
         }
     }
 }
 
-fn computePollTimeoutMs(deadline_ms: i64) i32 {
-    const now = std.time.milliTimestamp();
-    if (now >= deadline_ms) {
+const SocketPollResult = struct {
+    ready: bool,
+    revents: i16,
+};
+
+// Polls poll socket readable.
+fn pollSocketReadable(socket: std.posix.socket_t, timeout_ms: i32) !SocketPollResult {
+    if (builtin.os.tag == .windows) {
+        const ws2_32 = std.os.windows.ws2_32;
+        var fds = [_]ws2_32.WSAPOLLFD{
+            .{
+                .fd = socket,
+                .events = ws2_32.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        const rc = ws2_32.WSAPoll(&fds, 1, timeout_ms);
+        if (rc == ws2_32.SOCKET_ERROR) {
+            return error.CallbackListenerSocketError;
+        }
+
+        return .{
+            .ready = rc != 0,
+            .revents = fds[0].revents,
+        };
+    }
+
+    var fds = [_]std.posix.pollfd{
+        .{
+            .fd = socket,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+    };
+    const rc = try std.posix.poll(&fds, timeout_ms);
+    return .{
+        .ready = rc != 0,
+        .revents = fds[0].revents,
+    };
+}
+
+// Socket poll has error.
+fn socketPollHasError(revents: i16) bool {
+    if (builtin.os.tag == .windows) {
+        const ws2_32 = std.os.windows.ws2_32;
+        const err_mask: i16 = ws2_32.POLL.ERR | ws2_32.POLL.NVAL;
+        return (revents & err_mask) != 0;
+    }
+
+    const err_mask: i16 = std.posix.POLL.ERR | std.posix.POLL.NVAL;
+    return (revents & err_mask) != 0;
+}
+
+// Socket poll has disconnect.
+fn socketPollHasDisconnect(revents: i16) bool {
+    if (builtin.os.tag == .windows) {
+        const ws2_32 = std.os.windows.ws2_32;
+        const err_mask: i16 = ws2_32.POLL.ERR | ws2_32.POLL.HUP | ws2_32.POLL.NVAL;
+        return (revents & err_mask) != 0;
+    }
+
+    const err_mask: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
+    return (revents & err_mask) != 0;
+}
+
+// Computes compute poll timeout ms.
+fn computePollTimeoutMs(deadline_ms: ?i64) i32 {
+    if (deadline_ms == null) {
+        return 250;
+    }
+
+    const deadline = deadline_ms.?;
+    const now = nowMilliseconds();
+    if (now >= deadline) {
         return -1;
     }
 
-    const remaining = deadline_ms - now;
+    const remaining = deadline - now;
     const slice_ms: i64 = 250;
     const next = @min(remaining, slice_ms);
     return @intCast(next);
 }
 
+/// Opens `url` with the platform launcher and returns an error only when every known launcher path
+/// fails.
+///
+/// The environment captured at startup is propagated to child launcher processes so GUI-session
+/// context such as desktop bus variables remains available in no-libc builds.
 pub fn openUrl(url: []const u8, allocator: std.mem.Allocator) !void {
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
+    _ = allocator;
 
     switch (builtin.os.tag) {
         .windows => {
-            try argv.appendSlice(allocator, &.{ "rundll32", "url.dll,FileProtocolHandler", url });
+            if (try runOpenUrlCommand(&.{ "rundll32", "url.dll,FileProtocolHandler", url })) return;
+            return error.OpenUrlFailed;
         },
         .macos => {
-            try argv.appendSlice(allocator, &.{ "open", url });
+            if (try runOpenUrlCommand(&.{ "/usr/bin/open", url })) return;
+            if (try runOpenUrlCommand(&.{ "open", url })) return;
+            return error.OpenUrlFailed;
         },
         else => {
-            try argv.appendSlice(allocator, &.{ "xdg-open", url });
+            // Prefer absolute paths first to avoid PATH scanning failures being
+            // reported as misleading spawn errors.
+            if (try runOpenUrlCommand(&.{ "/usr/bin/xdg-open", url })) return;
+            if (try runOpenUrlCommand(&.{ "/bin/xdg-open", url })) return;
+            if (try runOpenUrlCommand(&.{ "/usr/bin/gio", "open", url })) return;
+            if (try runOpenUrlCommand(&.{ "/bin/gio", "open", url })) return;
+            if (try runOpenUrlCommand(&.{ "xdg-open", url })) return;
+            if (try runOpenUrlCommand(&.{ "gio", "open", url })) return;
+            if (try runOpenUrlCommand(&.{ "sensible-browser", url })) return;
+            return error.OpenUrlFailed;
         },
     }
-
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = child.wait() catch {};
 }
 
+// Runs run open url command.
+fn runOpenUrlCommand(argv: []const []const u8) !bool {
+    var child = std.process.spawn(process_io, .{
+        .argv = argv,
+        .environ_map = openUrlChildEnvironMap(),
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |err| {
+        if (isOpenUrlLauncherUnavailableError(err)) return false;
+        return err;
+    };
+
+    const term = child.wait(process_io) catch |err| switch (err) {
+        error.AccessDenied => return false,
+        else => return err,
+    };
+
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+// Opens open url child environ map.
+fn openUrlChildEnvironMap() ?*const std.process.Environ.Map {
+    if (process_environ_map) |environ_map| {
+        return environ_map;
+    }
+
+    return null;
+}
+
+// Checks is open url launcher unavailable error.
+fn isOpenUrlLauncherUnavailableError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound,
+        error.InvalidExe,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.OutOfMemory,
+        error.SystemResources,
+        error.NameTooLong,
+        error.InvalidWtf8,
+        error.InvalidBatchScriptArg,
+        => true,
+        else => false,
+    };
+}
+
+// Expect rpc error contains.
 fn expectRpcErrorContains(response: []const u8, needle: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3188,6 +3486,47 @@ test "rpcHandleRequest cancel listener command sets cancel flag" {
     try std.testing.expect(cancel.load(.seq_cst));
 }
 
+test "openUrl uses configured environ map for launcher child process" {
+    const previous = process_environ_map;
+    defer process_environ_map = previous;
+
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+
+    process_environ_map = &map;
+    try std.testing.expect(openUrlChildEnvironMap() != null);
+    try std.testing.expect(openUrlChildEnvironMap().? == &map);
+}
+
+test "openUrl child environ map is null when no environ map configured" {
+    const previous = process_environ_map;
+    defer process_environ_map = previous;
+
+    process_environ_map = null;
+    try std.testing.expect(openUrlChildEnvironMap() == null);
+}
+
+test "isOpenUrlLauncherUnavailableError treats misleading launcher failures as recoverable" {
+    try std.testing.expect(isOpenUrlLauncherUnavailableError(error.OutOfMemory));
+    try std.testing.expect(isOpenUrlLauncherUnavailableError(error.FileNotFound));
+    try std.testing.expect(isOpenUrlLauncherUnavailableError(error.SystemResources));
+}
+
+test "isOpenUrlLauncherUnavailableError does not hide unrelated errors" {
+    try std.testing.expect(!isOpenUrlLauncherUnavailableError(error.CallbackListenerTimeout));
+}
+
+test "computePollTimeoutMs returns polling slice when timeout is disabled" {
+    const timeout_ms = computePollTimeoutMs(null);
+    try std.testing.expect(timeout_ms > 0);
+    try std.testing.expect(timeout_ms <= 250);
+}
+
+test "computePollTimeoutMs returns timeout when deadline passed" {
+    const timeout_ms = computePollTimeoutMs(nowMilliseconds() - 1);
+    try std.testing.expectEqual(@as(i32, -1), timeout_ms);
+}
+
 test "extractRequestTarget returns callback target for valid GET request" {
     const request =
         "GET /auth/callback?code=test&state=abc HTTP/1.1\r\n" ++
@@ -3203,19 +3542,39 @@ test "extractRequestTarget rejects non-GET methods" {
     try std.testing.expectEqual(@as(?[]const u8, null), extractRequestTarget(request));
 }
 
-test "parseOAuthCallbackQuery accepts id_token callback without state" {
+test "isOAuthCallbackTarget matches only exact callback path" {
+    try std.testing.expect(isOAuthCallbackTarget("/auth/callback"));
+    try std.testing.expect(isOAuthCallbackTarget("/auth/callback?code=test&state=abc"));
+    try std.testing.expect(!isOAuthCallbackTarget("/auth/callbackx?code=test&state=abc"));
+}
+
+test "isOAuthCancelTarget matches only exact cancel path" {
+    try std.testing.expect(isOAuthCancelTarget("/cancel"));
+    try std.testing.expect(isOAuthCancelTarget("/cancel?source=retry"));
+    try std.testing.expect(!isOAuthCancelTarget("/cancelled"));
+    try std.testing.expect(!isOAuthCancelTarget("/auth/cancel"));
+}
+
+test "oauth callback listener constants match upstream codex flow" {
+    try std.testing.expectEqualStrings("127.0.0.1", OAUTH_CALLBACK_LISTEN_HOST);
+    try std.testing.expectEqualStrings("localhost", OAUTH_CALLBACK_PUBLIC_HOST);
+    try std.testing.expectEqual(@as(u16, 1455), OAUTH_CALLBACK_PORT);
+}
+
+test "parseOAuthCallbackQuery accepts oauth error callback with state" {
     var parsed = try parseOAuthCallbackQuery(
         std.testing.allocator,
-        "http://localhost:1455/auth/callback?id_token=a.b.c&org_id=org_test&needs_setup=false",
+        "http://localhost:1455/auth/callback?state=xyz&error=access_denied&error_description=missing_codex_entitlement",
     );
     defer parsed.deinit(std.testing.allocator);
 
     try std.testing.expect(parsed.code == null);
-    try std.testing.expect(parsed.id_token != null);
-    try std.testing.expectEqualStrings("a.b.c", parsed.id_token.?);
-    try std.testing.expect(parsed.state == null);
-    try std.testing.expect(parsed.org_id != null);
-    try std.testing.expectEqualStrings("org_test", parsed.org_id.?);
+    try std.testing.expect(parsed.state != null);
+    try std.testing.expectEqualStrings("xyz", parsed.state.?);
+    try std.testing.expect(parsed.auth_error != null);
+    try std.testing.expectEqualStrings("access_denied", parsed.auth_error.?);
+    try std.testing.expect(parsed.auth_error_description != null);
+    try std.testing.expectEqualStrings("missing_codex_entitlement", parsed.auth_error_description.?);
 }
 
 test "parseOAuthCallbackQuery accepts authorization code callback" {
@@ -3227,9 +3586,9 @@ test "parseOAuthCallbackQuery accepts authorization code callback" {
 
     try std.testing.expect(parsed.code != null);
     try std.testing.expectEqualStrings("abc123", parsed.code.?);
-    try std.testing.expect(parsed.id_token == null);
     try std.testing.expect(parsed.state != null);
     try std.testing.expectEqualStrings("xyz", parsed.state.?);
+    try std.testing.expect(parsed.auth_error == null);
 }
 
 test "formatIso8601UtcMillis renders UTC timestamp with milliseconds" {

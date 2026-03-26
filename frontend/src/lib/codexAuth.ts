@@ -2,7 +2,7 @@ const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_ORIGINATOR = "codex_cli_rs";
-const CODEX_SCOPE = "openid profile email offline_access";
+const CODEX_SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
 const AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC = 15;
 const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
@@ -96,8 +96,10 @@ let backendApisPromise: Promise<BackendApis> | null = null;
 let pendingBrowserLogin: PendingBrowserLogin | null = null;
 const inflightRefreshByAccountId = new Map<string, Promise<CreditsInfo>>();
 
+// Now epoch.
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
+// Normalizes normalize optional.
 const normalizeOptional = (value: string | null | undefined): string | null => {
   if (!value) {
     return null;
@@ -107,6 +109,7 @@ const normalizeOptional = (value: string | null | undefined): string | null => {
   return trimmed.length > 0 ? trimmed : null;
 };
 
+// Parses as record.
 const asRecord = (value: unknown): Record<string, unknown> | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
@@ -115,6 +118,7 @@ const asRecord = (value: unknown): Record<string, unknown> | null => {
   return value as Record<string, unknown>;
 };
 
+// Value as boolean.
 const valueAsBoolean = (value: unknown): boolean | null => {
   if (typeof value === "boolean") {
     return value;
@@ -142,6 +146,7 @@ const valueAsBoolean = (value: unknown): boolean | null => {
   return null;
 };
 
+// Value as number.
 const valueAsNumber = (value: unknown): number | null => {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -155,6 +160,7 @@ const valueAsNumber = (value: unknown): number | null => {
   return null;
 };
 
+// Normalizes normalize auto refresh interval sec.
 const normalizeAutoRefreshIntervalSec = (value: unknown): number => {
   const parsed = valueAsNumber(value);
   if (parsed === null) {
@@ -168,10 +174,12 @@ const normalizeAutoRefreshIntervalSec = (value: unknown): number => {
   );
 };
 
+// Normalizes normalize usage refresh display mode.
 const normalizeUsageRefreshDisplayMode = (value: unknown): "date" | "remaining" => {
   return value === "remaining" ? "remaining" : "date";
 };
 
+// Error credits info.
 const errorCreditsInfo = (message: string): CreditsInfo => ({
   available: null,
   used: null,
@@ -191,6 +199,7 @@ const errorCreditsInfo = (message: string): CreditsInfo => ({
   checkedAt: nowEpoch(),
 });
 
+// Parses as accounts view.
 const asAccountsView = (value: unknown): AccountsView | null => {
   const parsed = asRecord(value);
   if (!parsed) {
@@ -214,6 +223,7 @@ const asAccountsView = (value: unknown): AccountsView | null => {
   };
 };
 
+// Parses as account summary.
 const asAccountSummary = (value: unknown): AccountSummary | null => {
   const account = asRecord(value);
   if (!account || typeof account.id !== "string") {
@@ -231,6 +241,7 @@ const asAccountSummary = (value: unknown): AccountSummary | null => {
   };
 };
 
+// Parses as oauth callback listener poll result.
 const asOAuthCallbackListenerPollResult = (value: unknown): OAuthCallbackListenerPollResult => {
   const parsed = asRecord(value);
   if (!parsed) {
@@ -260,6 +271,7 @@ const asOAuthCallbackListenerPollResult = (value: unknown): OAuthCallbackListene
   return { status: "error", error: "Unknown callback listener status." };
 };
 
+// Parses as credits info.
 const asCreditsInfo = (value: unknown): CreditsInfo | null => {
   const parsed = asRecord(value);
   if (!parsed) {
@@ -291,6 +303,7 @@ const asCreditsInfo = (value: unknown): CreditsInfo | null => {
   };
 };
 
+// Parses as snapshot.
 const asSnapshot = (value: unknown): AppStateSnapshot => {
   const parsed = asRecord(value);
   if (!parsed) {
@@ -333,6 +346,7 @@ const asSnapshot = (value: unknown): AppStateSnapshot => {
   };
 };
 
+// Decode bridge value.
 const decodeBridgeValue = <T>(op: string, value: unknown): T => {
   if (typeof value === "string") {
     try {
@@ -360,6 +374,7 @@ const decodeBridgeValue = <T>(op: string, value: unknown): T => {
   return value as T;
 };
 
+// Returns get webui bridge.
 const getWebuiBridge = (): WebuiRpcBridge | null => {
   const bridge = (globalThis as { webuiRpc?: WebuiRpcBridge }).webuiRpc;
   if (!bridge || typeof bridge.cm_rpc !== "function") {
@@ -368,6 +383,7 @@ const getWebuiBridge = (): WebuiRpcBridge | null => {
   return bridge;
 };
 
+// Wait for webui bridge.
 const waitForWebuiBridge = async (): Promise<WebuiRpcBridge> => {
   const immediate = getWebuiBridge();
   if (immediate) {
@@ -385,6 +401,7 @@ const waitForWebuiBridge = async (): Promise<WebuiRpcBridge> => {
   throw new Error("WebUI bridge is unavailable (webuiRpc.cm_rpc missing).");
 };
 
+// Call bridge.
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
   const request = { op, ...payload };
   const bridge = await waitForWebuiBridge();
@@ -392,6 +409,7 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
   return decodeBridgeValue<T>(op, rawResponse);
 };
 
+// Loads load backend apis.
 const loadBackendApis = async (): Promise<BackendApis> => {
   if (!backendApisPromise) {
     backendApisPromise = Promise.resolve({
@@ -406,6 +424,32 @@ const loadBackendApis = async (): Promise<BackendApis> => {
   return backendApisPromise;
 };
 
+// Try open url from window context.
+const tryOpenUrlFromWindowContext = (url: string): boolean => {
+  if (typeof window === "undefined" || typeof window.open !== "function") {
+    return false;
+  }
+
+  try {
+    const popup = window.open(url, "_blank");
+
+    if (popup) {
+      try {
+        popup.focus();
+      } catch {
+        // Ignore focus errors; a successful open attempt is enough.
+      }
+    }
+
+    // Browsers may return null for security/popup-policy reasons even when
+    // the navigation is accepted. Do not treat null as a hard failure here.
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Parses parse accounts view response.
 const parseAccountsViewResponse = (payload: unknown, opName: string): AccountsView => {
   const view = asAccountsView(payload);
   if (view) {
@@ -415,16 +459,20 @@ const parseAccountsViewResponse = (payload: unknown, opName: string): AccountsVi
   throw new Error(`Unexpected ${opName} response from backend.`);
 };
 
+// Random base64 url.
 const randomBase64Url = (size: number): string => {
   const bytes = new Uint8Array(size);
   crypto.getRandomValues(bytes);
+  // Binary.
   const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
 
+// Sha256 base64 url.
 const sha256Base64Url = async (value: string): Promise<string> => {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   const bytes = new Uint8Array(digest);
+  // Binary.
   const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
@@ -436,22 +484,26 @@ const buildAuthorizeUrl = (
   codeChallenge: string,
   state: string,
 ): string => {
-  const query = new URLSearchParams({
-    response_type: "code",
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: CODEX_SCOPE,
-    code_challenge: codeChallenge,
-    code_challenge_method: "S256",
-    id_token_add_organizations: "true",
-    codex_cli_simplified_flow: "true",
-    state,
-    originator: CODEX_ORIGINATOR,
-  });
+  const pairs: Array<[string, string]> = [
+    ["response_type", "code"],
+    ["client_id", clientId],
+    ["redirect_uri", redirectUri],
+    ["scope", CODEX_SCOPE],
+    ["code_challenge", codeChallenge],
+    ["code_challenge_method", "S256"],
+    ["id_token_add_organizations", "true"],
+    ["codex_cli_simplified_flow", "true"],
+    ["state", state],
+    ["originator", CODEX_ORIGINATOR],
+  ];
 
-  return `${issuer}/oauth/authorize?${query.toString()}`;
+  const query = pairs
+    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+    .join("&");
+  return `${issuer}/oauth/authorize?${query}`;
 };
 
+// Creates create pending browser login.
 const createPendingBrowserLogin = (): PendingBrowserLogin => ({
   issuer: CODEX_OAUTH_ISSUER,
   clientId: CODEX_CLIENT_ID,
@@ -461,6 +513,7 @@ const createPendingBrowserLogin = (): PendingBrowserLogin => ({
   startedAt: nowEpoch(),
 });
 
+// Ensure pending browser login.
 const ensurePendingBrowserLogin = (): PendingBrowserLogin => {
   if (!pendingBrowserLogin) {
     pendingBrowserLogin = createPendingBrowserLogin();
@@ -468,6 +521,7 @@ const ensurePendingBrowserLogin = (): PendingBrowserLogin => {
   return pendingBrowserLogin;
 };
 
+// Builds build browser login start.
 const buildBrowserLoginStart = async (pending: PendingBrowserLogin): Promise<BrowserLoginStart> => {
   const codeChallenge = await sha256Base64Url(pending.codeVerifier);
   const authUrl = buildAuthorizeUrl(
@@ -483,6 +537,9 @@ const buildBrowserLoginStart = async (pending: PendingBrowserLogin): Promise<Bro
   };
 };
 
+/**
+ * Reads the bootstrap snapshot injected into the served HTML, if one is present.
+ */
 export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
   if (typeof window === "undefined") {
     return null;
@@ -501,10 +558,16 @@ export const getEmbeddedBootstrapState = (): EmbeddedBootstrapState | null => {
   }
 };
 
+/**
+ * Persists the selected UI theme through the backend preference store.
+ */
 export const saveTheme = async (theme: "light" | "dark"): Promise<void> => {
   await updateUiPreferences({ theme });
 };
 
+/**
+ * Writes the supplied UI preference subset without disturbing unspecified settings.
+ */
 export const updateUiPreferences = async (
   payload: Partial<{
     autoRefreshActiveEnabled: boolean;
@@ -517,26 +580,37 @@ export const updateUiPreferences = async (
   await tauri.invoke<unknown>("update_ui_preferences", payload as Record<string, unknown>);
 };
 
+/**
+ * Imports the currently active Codex CLI account into the manager store.
+ */
 export const importCurrentAccount = async (label?: string): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
   const view = await tauri.invoke<unknown>("import_current_account", { label });
   return parseAccountsViewResponse(view, "import_current_account");
 };
 
+/**
+ * Builds or reuses the pending OAuth login session and returns the browser launch payload.
+ */
 export const prepareCodexLoginSession = async (): Promise<BrowserLoginStart> => {
   const pending = ensurePendingBrowserLogin();
   return buildBrowserLoginStart(pending);
 };
 
+/**
+ * Drops any pending OAuth login session state held in the frontend.
+ */
 export const resetCodexLoginSession = (): void => {
   pendingBrowserLogin = null;
 };
 
+/**
+ * Starts the backend OAuth callback listener for the current pending login session.
+ */
 export const startCodexCallbackListener = async (label?: string): Promise<void> => {
   const pending = ensurePendingBrowserLogin();
   const tauri = await loadBackendApis();
   await tauri.invoke<unknown>("start_oauth_callback_listener", {
-    timeoutSeconds: 180,
     issuer: pending.issuer,
     clientId: pending.clientId,
     redirectUri: pending.redirectUri,
@@ -546,26 +620,48 @@ export const startCodexCallbackListener = async (label?: string): Promise<void> 
   });
 };
 
+/**
+ * Polls the backend callback listener for completion, failure, or idle state.
+ */
 export const pollCodexCallbackListener = async (): Promise<OAuthCallbackListenerPollResult> => {
   const tauri = await loadBackendApis();
   const payload = await tauri.invoke<unknown>("poll_oauth_callback_listener");
   return asOAuthCallbackListenerPollResult(payload);
 };
 
+/**
+ * Opens the current OAuth authorize URL while preserving the pending callback listener session.
+ */
 export const beginCodexLogin = async (): Promise<BrowserLoginStart> => {
   const pending = ensurePendingBrowserLogin();
   const start = await buildBrowserLoginStart(pending);
 
+  if (tryOpenUrlFromWindowContext(start.authUrl)) {
+    return start;
+  }
+
   const tauri = await loadBackendApis();
-  await tauri.openUrl(start.authUrl);
+  try {
+    await tauri.openUrl(start.authUrl);
+  } catch (openError) {
+    // Keep login session/listener alive even when external launcher reports
+    // flaky desktop integration errors.
+    console.warn("Codex login browser open fallback failed:", openError);
+  }
   return start;
 };
 
+/**
+ * Stops the backend OAuth callback listener for the active login session.
+ */
 export const stopCodexCallbackListener = async (): Promise<void> => {
   const tauri = await loadBackendApis();
   await tauri.invoke<boolean>("cancel_oauth_callback_listener");
 };
 
+/**
+ * Saves an API-key account directly without going through the browser OAuth flow.
+ */
 export const codexLoginWithApiKey = async (apiKey: string, label?: string): Promise<LoginResult> => {
   const normalized = normalizeOptional(apiKey);
   if (!normalized) {
@@ -587,12 +683,18 @@ export const codexLoginWithApiKey = async (apiKey: string, label?: string): Prom
   };
 };
 
+/**
+ * Switches the active managed account and returns the refreshed account view.
+ */
 export const switchAccount = async (id: string): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
   const view = await tauri.invoke<unknown>("switch_account", { accountId: id });
   return parseAccountsViewResponse(view, "switch_account");
 };
 
+/**
+ * Reorders an account into the requested bucket/index position.
+ */
 export const moveAccount = async (
   id: string,
   targetBucket: AccountBucket,
@@ -608,6 +710,9 @@ export const moveAccount = async (
   });
 };
 
+/**
+ * Moves an account into the archived/depleted bucket.
+ */
 export const archiveAccount = async (
   id: string,
   options?: { switchAwayFromArchived?: boolean },
@@ -617,22 +722,32 @@ export const archiveAccount = async (
   });
 };
 
+/**
+ * Restores an archived account back into the active bucket.
+ */
 export const unarchiveAccount = async (id: string): Promise<void> => {
   return moveAccount(id, "active", Number.MAX_SAFE_INTEGER);
 };
 
+/**
+ * Deletes an account from the managed store and returns the refreshed account view.
+ */
 export const removeAccount = async (id: string): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
   const view = await tauri.invoke<unknown>("remove_account", { accountId: id });
   return parseAccountsViewResponse(view, "remove_account");
 };
 
+/**
+ * Fetches the latest remaining-credits snapshot for a managed account.
+ */
 export const getRemainingCreditsForAccount = async (id: string): Promise<CreditsInfo> => {
   const existing = inflightRefreshByAccountId.get(id);
   if (existing) {
     return existing;
   }
 
+  // Pending.
   const pending = (async (): Promise<CreditsInfo> => {
     try {
       const tauri = await loadBackendApis();

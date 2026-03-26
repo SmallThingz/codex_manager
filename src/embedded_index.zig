@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const process_io: std.Io = if (builtin.is_test) std.testing.io else std.Options.debug_io;
+var process_environ_map: ?*std.process.Environ.Map = null;
 
 const APP_ID = "com.codex.manager";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
@@ -19,6 +21,12 @@ const INDEX_TEMPLATE: IndexTemplate = splitIndexTemplate(INDEX_HTML) orelse @com
     "frontend/dist/index.html is missing bootstrap placeholder",
 );
 
+/// Stores the startup environment map so no-libc builds can still resolve environment variables.
+pub fn setEnvironMap(environ_map: *std.process.Environ.Map) void {
+    process_environ_map = environ_map;
+}
+
+// Split index template.
 fn splitIndexTemplate(html: []const u8) ?IndexTemplate {
     const marker_index = std.mem.indexOf(u8, html, BOOTSTRAP_PLACEHOLDER) orelse return null;
     return .{
@@ -27,21 +35,47 @@ fn splitIndexTemplate(html: []const u8) ?IndexTemplate {
     };
 }
 
+// Path exists.
 fn pathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(process_io, path, .{}) catch return false;
     return true;
 }
 
-fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
-    if (builtin.os.tag == .windows) {
-        return std.process.getEnvVarOwned(allocator, "USERPROFILE");
+// Returns get env var owned compat.
+fn getEnvVarOwnedCompat(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    if (process_environ_map) |environ_map| {
+        if (environ_map.get(key)) |value| {
+            return allocator.dupe(u8, value);
+        }
     }
-    return std.process.getEnvVarOwned(allocator, "HOME");
+
+    if (builtin.link_libc) {
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+
+        const value_z = std.c.getenv(key_z.ptr) orelse return error.EnvironmentVariableNotFound;
+        return allocator.dupe(u8, std.mem.span(value_z));
+    }
+
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding or builtin.os.tag == .other) {
+        return std.process.Environ.getAlloc(.{ .block = .global }, allocator, key);
+    }
+
+    return error.EnvironmentVariableNotFound;
 }
 
+// Returns get home dir.
+fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return getEnvVarOwnedCompat(allocator, "USERPROFILE");
+    }
+    return getEnvVarOwnedCompat(allocator, "HOME");
+}
+
+// Returns get app local data dir.
 fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     if (builtin.os.tag == .windows) {
-        const appdata = try std.process.getEnvVarOwned(allocator, "APPDATA");
+        const appdata = try getEnvVarOwnedCompat(allocator, "APPDATA");
         defer allocator.free(appdata);
         return std.fs.path.join(allocator, &.{ appdata, APP_ID });
     }
@@ -56,40 +90,38 @@ fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".local", "share", APP_ID });
 }
 
+// Builds the bootstrap-state file path in the per-user application data directory.
 fn bootstrapStatePath(allocator: std.mem.Allocator) ![]u8 {
     const app_dir = try getAppLocalDataDir(allocator);
     defer allocator.free(app_dir);
     return std.fs.path.join(allocator, &.{ app_dir, BOOTSTRAP_STATE_FILE });
 }
 
+/// Returns the path to the generated live `index.html` that webui serves at runtime.
 pub fn liveIndexPath(allocator: std.mem.Allocator) ![]u8 {
     const app_dir = try getAppLocalDataDir(allocator);
     defer allocator.free(app_dir);
     return std.fs.path.join(allocator, &.{ app_dir, LIVE_INDEX_FILE });
 }
 
+// Writes write text file atomic.
 fn writeTextFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        try std.fs.cwd().makePath(parent);
+        try std.Io.Dir.cwd().createDirPath(process_io, parent);
     }
 
     const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temp_path);
 
-    const temp_file = try std.fs.createFileAbsolute(temp_path, .{ .truncate = true });
-    defer temp_file.close();
-    try temp_file.writeAll(contents);
-    try temp_file.sync();
+    const temp_file = try std.Io.Dir.createFileAbsolute(process_io, temp_path, .{ .truncate = true });
+    defer temp_file.close(process_io);
+    try temp_file.writeStreamingAll(process_io, contents);
+    try temp_file.sync(process_io);
 
-    std.fs.renameAbsolute(temp_path, path) catch |err| switch (err) {
-        error.PathAlreadyExists => {
-            try std.fs.deleteFileAbsolute(path);
-            try std.fs.renameAbsolute(temp_path, path);
-        },
-        else => return err,
-    };
+    try std.Io.Dir.renameAbsolute(temp_path, path, process_io);
 }
 
+// Loads the saved bootstrap-state JSON or falls back to the built-in default payload.
 fn readBootstrapStateJsonOrDefault(allocator: std.mem.Allocator) ![]u8 {
     const state_path = bootstrapStatePath(allocator) catch {
         return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
@@ -100,12 +132,7 @@ fn readBootstrapStateJsonOrDefault(allocator: std.mem.Allocator) ![]u8 {
         return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
     }
 
-    const file = std.fs.openFileAbsolute(state_path, .{}) catch {
-        return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
-    };
-    defer file.close();
-
-    const raw = file.readToEndAlloc(allocator, 8 * 1024 * 1024) catch {
+    const raw = std.Io.Dir.cwd().readFileAlloc(process_io, state_path, allocator, .limited(8 * 1024 * 1024)) catch {
         return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
     };
 
@@ -127,10 +154,12 @@ fn readBootstrapStateJsonOrDefault(allocator: std.mem.Allocator) ![]u8 {
     return normalized;
 }
 
+// Serializes the in-memory default bootstrap-state payload.
 fn fallbackBootstrapStateJson(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, DEFAULT_BOOTSTRAP_STATE_JSON);
 }
 
+// Normalizes bootstrap JSON before it is embedded into the live HTML shell.
 fn canonicalizeBootstrapJson(allocator: std.mem.Allocator, bootstrap_json: []const u8) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, bootstrap_json, .{}) catch {
         return fallbackBootstrapStateJson(allocator);
@@ -147,6 +176,7 @@ fn canonicalizeBootstrapJson(allocator: std.mem.Allocator, bootstrap_json: []con
     });
 }
 
+// Makes sure the generated HTML includes the webui bridge bootstrap script.
 fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     const script_tag = "<script src=\"/webui_bridge.js\"></script>";
 
@@ -165,6 +195,7 @@ fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8
     return std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ html, script_tag });
 }
 
+/// Injects the current bootstrap JSON into the built frontend HTML and returns the live page.
 pub fn buildLiveIndexHtml(allocator: std.mem.Allocator, bootstrap_json: []const u8) ![]u8 {
     const canonical_json = try canonicalizeBootstrapJson(allocator, bootstrap_json);
     defer allocator.free(canonical_json);
@@ -184,6 +215,7 @@ pub fn buildLiveIndexHtml(allocator: std.mem.Allocator, bootstrap_json: []const 
     return ensureModuleWebUiScript(allocator, html);
 }
 
+/// Writes the generated live HTML to disk and returns its final path.
 pub fn writeLiveIndexFromBootstrapJson(allocator: std.mem.Allocator, bootstrap_json: []const u8) ![]u8 {
     const html = try buildLiveIndexHtml(allocator, bootstrap_json);
     defer allocator.free(html);
@@ -194,6 +226,7 @@ pub fn writeLiveIndexFromBootstrapJson(allocator: std.mem.Allocator, bootstrap_j
     return path;
 }
 
+/// Rebuilds the live HTML from the persisted bootstrap-state file and returns the output path.
 pub fn refreshLiveIndexFromBootstrapFile(allocator: std.mem.Allocator) ![]u8 {
     const bootstrap_json = try readBootstrapStateJsonOrDefault(allocator);
     defer allocator.free(bootstrap_json);

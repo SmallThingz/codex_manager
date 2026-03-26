@@ -46,10 +46,13 @@ const AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC = 300;
 const AUTO_REFRESH_DEPLETED_COOLDOWN_SEC = 30;
 const AUTO_REFRESH_DEPLETED_GRACE_SEC = 5;
 
+// Now epoch.
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
 
+// Pad2.
 const pad2 = (value: number): string => String(value).padStart(2, "0");
 
+// Normalizes normalize auto refresh interval sec.
 const normalizeAutoRefreshIntervalSec = (value: number | null | undefined): number => {
   if (value === null || value === undefined || !Number.isFinite(value)) {
     return AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC;
@@ -62,6 +65,7 @@ const normalizeAutoRefreshIntervalSec = (value: number | null | undefined): numb
   );
 };
 
+// Formats format auto refresh interval.
 const formatAutoRefreshInterval = (intervalSec: number): string => {
   const hours = Math.floor(intervalSec / 3600);
   const minutes = Math.floor((intervalSec % 3600) / 60);
@@ -72,6 +76,7 @@ const formatAutoRefreshInterval = (intervalSec: number): string => {
   return `${minutes}m ${pad2(seconds)}s`;
 };
 
+// Formats format usage refresh date time.
 const formatUsageRefreshDateTime = (epoch: number | null | undefined): string => {
   if (!epoch) {
     return "Unknown";
@@ -103,6 +108,7 @@ const formatUsageRefreshRemaining = (
   return `${days}d ${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}`;
 };
 
+// Normalizes normalize usage refresh display mode.
 const normalizeUsageRefreshDisplayMode = (value: string | null | undefined): UsageRefreshDisplayMode => {
   if (value === "remaining") {
     return "remaining";
@@ -111,6 +117,7 @@ const normalizeUsageRefreshDisplayMode = (value: string | null | undefined): Usa
   return "date";
 };
 
+// Empty accounts view.
 const emptyAccountsView = (): AccountsView => ({
   accounts: [],
   activeAccountId: null,
@@ -120,6 +127,7 @@ const emptyAccountsView = (): AccountsView => ({
   storePath: "",
 });
 
+// Number or dash.
 const numberOrDash = (value: number | null): string => {
   if (value === null) {
     return "-";
@@ -128,6 +136,7 @@ const numberOrDash = (value: number | null): string => {
   return value.toFixed(2);
 };
 
+// Percent from credits.
 const percentFromCredits = (credits: CreditsInfo | undefined): number => {
   if (!credits) {
     return 0;
@@ -146,6 +155,7 @@ const percentFromCredits = (credits: CreditsInfo | undefined): number => {
   return Math.max(0, Math.min(100, ratio));
 };
 
+// Credits unit.
 const creditsUnit = (credits: CreditsInfo | undefined): string => {
   if (!credits) {
     return "USD";
@@ -154,6 +164,7 @@ const creditsUnit = (credits: CreditsInfo | undefined): string => {
   return credits.unit;
 };
 
+// Render credit value.
 const renderCreditValue = (value: number | null, credits: CreditsInfo | undefined): string => {
   const amount = numberOrDash(value);
   if (amount === "-") {
@@ -164,6 +175,7 @@ const renderCreditValue = (value: number | null, credits: CreditsInfo | undefine
   return unit === "%" ? `${amount}%` : `${amount} ${unit}`;
 };
 
+// Percent or dash.
 const percentOrDash = (value: number | null): string => {
   if (value === null) {
     return "-";
@@ -172,6 +184,7 @@ const percentOrDash = (value: number | null): string => {
   return `${value.toFixed(1)}%`;
 };
 
+// Percent width.
 const percentWidth = (value: number | null): number => {
   if (value === null) {
     return 0;
@@ -180,6 +193,7 @@ const percentWidth = (value: number | null): number => {
   return Math.max(0, Math.min(100, value));
 };
 
+// Quota remaining percent.
 const quotaRemainingPercent = (credits: CreditsInfo | undefined): number | null => {
   if (!credits || credits.status !== "available") {
     return null;
@@ -200,16 +214,19 @@ const quotaRemainingPercent = (credits: CreditsInfo | undefined): number | null 
   return percentFromCredits(credits);
 };
 
+// Determines has zero quota remaining.
 const hasZeroQuotaRemaining = (credits: CreditsInfo | undefined): boolean => {
   const remaining = quotaRemainingPercent(credits);
   return remaining !== null && remaining <= QUOTA_EPSILON;
 };
 
+// Determines has non zero quota remaining.
 const hasNonZeroQuotaRemaining = (credits: CreditsInfo | undefined): boolean => {
   const remaining = quotaRemainingPercent(credits);
   return remaining !== null && remaining > QUOTA_EPSILON;
 };
 
+// Usage refresh epoch.
 const usageRefreshEpoch = (credits: CreditsInfo | undefined, currentEpoch: number): number | null => {
   if (!credits || credits.status !== "available") {
     return null;
@@ -219,6 +236,7 @@ const usageRefreshEpoch = (credits: CreditsInfo | undefined, currentEpoch: numbe
     (value): value is number => value !== null && Number.isFinite(value) && value > 0,
   );
 
+  // Upcoming.
   const upcoming = candidates.filter((value) => value >= currentEpoch);
   if (upcoming.length > 0) {
     return Math.min(...upcoming);
@@ -268,6 +286,7 @@ const usageRefreshRows = (
   currentEpoch: number,
   mode: UsageRefreshDisplayMode,
 ): UsageRefreshRow[] => {
+  // Formats format value.
   const formatValue = (epoch: number | null): string =>
     mode === "remaining" ? formatUsageRefreshRemaining(epoch, currentEpoch) : formatUsageRefreshDateTime(epoch);
 
@@ -294,14 +313,17 @@ const usageRefreshRows = (
   return [{ label: null, value: formatValue(usageRefreshEpoch(credits, currentEpoch)) }];
 };
 
+// Account title.
 const accountTitle = (account: AccountSummary): string => {
   return account.email || account.accountId || account.id;
 };
 
+// Account main identity.
 const accountMainIdentity = (account: AccountSummary): string => {
   return account.accountId || account.id;
 };
 
+// Account meta line.
 const accountMetaLine = (account: AccountSummary): string | null => {
   const title = accountTitle(account);
   const id = account.accountId || account.id;
@@ -313,11 +335,13 @@ const accountMetaLine = (account: AccountSummary): string | null => {
 
 const DEFAULT_REFRESH_ERROR_MESSAGE = "Credits refresh failed.";
 
+// Normalizes normalize refresh error message.
 const normalizeRefreshErrorMessage = (value: string | null | undefined): string => {
   const trimmed = (value ?? "").trim();
   return trimmed.length > 0 ? trimmed : DEFAULT_REFRESH_ERROR_MESSAGE;
 };
 
+// Creates make errored credits info.
 const makeErroredCreditsInfo = (message: string, previous?: CreditsInfo): CreditsInfo => ({
   available: null,
   used: null,
@@ -337,6 +361,7 @@ const makeErroredCreditsInfo = (message: string, previous?: CreditsInfo): Credit
   checkedAt: nowEpoch(),
 });
 
+// Refresh error message for credits.
 const refreshErrorMessageForCredits = (credits: CreditsInfo | undefined): string | null => {
   if (!credits || credits.status !== "error") {
     return null;
@@ -344,23 +369,27 @@ const refreshErrorMessageForCredits = (credits: CreditsInfo | undefined): string
   return normalizeRefreshErrorMessage(credits.message);
 };
 
+// Applies apply theme.
 const applyTheme = (theme: Theme) => {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("codex-manager-theme", theme);
 };
 
+// Renders the plus icon glyph.
 const IconPlus = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M12 5v14M5 12h14" />
   </svg>
 );
 
+// Renders the moon icon glyph.
 const IconMoon = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M20 14.4A8.5 8.5 0 1 1 9.6 4 7.1 7.1 0 0 0 20 14.4Z" />
   </svg>
 );
 
+// Renders the sun icon glyph.
 const IconSun = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <circle cx="12" cy="12" r="4" />
@@ -368,12 +397,14 @@ const IconSun = () => (
   </svg>
 );
 
+// Renders the settings icon glyph.
 const IconSettings = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.57 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
   </svg>
 );
 
+// Renders the refresh icon glyph.
 const IconRefresh = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -385,6 +416,7 @@ const IconRefresh = () => (
   </svg>
 );
 
+// Renders the animated refresh icon glyph.
 const IconRefreshing = () => (
   <svg class="icon-rotor" viewBox="0 0 24 24" aria-hidden="true">
     <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -396,6 +428,7 @@ const IconRefreshing = () => (
   </svg>
 );
 
+// Renders the drag-handle icon glyph.
 const IconDragHandle = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <circle cx="8" cy="7" r="1.2" />
@@ -407,6 +440,7 @@ const IconDragHandle = () => (
   </svg>
 );
 
+// Renders the frozen-account icon glyph.
 const IconFrost = () => (
   <svg class="icon-frost" viewBox="0 0 100 100" aria-hidden="true">
     <g fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
@@ -439,6 +473,7 @@ const IconFrost = () => (
   </svg>
 );
 
+// Renders the trash icon glyph.
 const IconTrash = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M4 7h16" />
@@ -447,6 +482,7 @@ const IconTrash = () => (
   </svg>
 );
 
+// Renders the close icon glyph.
 const IconClose = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="M6 6l12 12M18 6 6 18" />
@@ -517,6 +553,7 @@ function App() {
   const settingsMenuVisible = createMemo(
     () => !initializing() && settingsMenuOpen(),
   );
+  // Visible notice.
   const visibleNotice = createMemo(() => {
     if (initializing()) {
       return null;
@@ -528,6 +565,7 @@ function App() {
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
   });
+  // Visible busy.
   const visibleBusy = createMemo(() => {
     if (initializing()) {
       return null;
@@ -546,16 +584,20 @@ function App() {
     skipAutoSync?: boolean;
   };
 
+  // Active account ids.
   const activeAccountIds = (nextView: AccountsView): string[] =>
     nextView.accounts.filter((account) => account.state === "active").map((account) => account.id);
 
+  // Newly added account ids.
   const newlyAddedAccountIds = (previousView: AccountsView | null, nextView: AccountsView): string[] => {
+    // Previous ids.
     const previousIds = new Set((previousView?.accounts ?? []).map((account) => account.id));
     return nextView.accounts
       .filter((account) => !previousIds.has(account.id))
       .map((account) => account.id);
   };
 
+  // Run action.
   const runAction = async <T,>(message: string, action: () => Promise<T>): Promise<T | undefined> => {
     batch(() => {
       setBusy(message);
@@ -574,6 +616,7 @@ function App() {
     }
   };
 
+  // Sets set view state.
   const setViewState = (nextView: AccountsView) => {
     batch(() => {
       setView(nextView);
@@ -583,6 +626,7 @@ function App() {
     });
   };
 
+  // Sets set account refresh error.
   const setAccountRefreshError = (accountId: string, reason: unknown): string => {
     const message = normalizeRefreshErrorMessage(reason instanceof Error ? reason.message : String(reason));
     setCreditsById((current) => ({
@@ -592,6 +636,7 @@ function App() {
     return message;
   };
 
+  // Account state for bucket.
   const accountStateForBucket = (bucket: AccountBucket): AccountSummary["state"] => {
     if (bucket === "depleted") {
       return "archived";
@@ -602,6 +647,7 @@ function App() {
     return "active";
   };
 
+  // Account bucket from state.
   const accountBucketFromState = (state: AccountSummary["state"]): AccountBucket => {
     if (state === "archived") {
       return "depleted";
@@ -619,12 +665,14 @@ function App() {
     targetIndex: number,
     switchAwayFromMoved: boolean,
   ): AccountsView => {
+    // Source index.
     const sourceIndex = currentView.accounts.findIndex((account) => account.id === accountId);
     if (sourceIndex < 0) {
       return currentView;
     }
 
     const source = currentView.accounts[sourceIndex];
+    // Remaining.
     const remaining = currentView.accounts.filter((_, index) => index !== sourceIndex);
     const moved: AccountSummary = {
       ...source,
@@ -634,6 +682,7 @@ function App() {
     let nextActiveAccountId = currentView.activeAccountId;
     if (nextActiveAccountId === moved.id && targetBucket !== "active") {
       if (switchAwayFromMoved) {
+        // Fallback.
         const fallback = remaining.find((account) => account.state === "active");
         nextActiveAccountId = fallback?.id ?? null;
       } else {
@@ -660,6 +709,7 @@ function App() {
     nextAccounts.splice(insertIndex, 0, moved);
 
     if (nextActiveAccountId) {
+      // Active entry.
       const activeEntry = nextAccounts.find((account) => account.id === nextActiveAccountId);
       if (!activeEntry || activeEntry.state !== "active") {
         nextActiveAccountId = nextAccounts.find((account) => account.state === "active")?.id ?? null;
@@ -683,6 +733,7 @@ function App() {
     currentView: AccountsView,
     account: AccountSummary,
   ): AccountsView => {
+    // Remaining.
     const remaining = currentView.accounts.filter((entry) => entry.id !== account.id);
     const nextAccounts = [...remaining, account];
     return {
@@ -694,6 +745,7 @@ function App() {
     };
   };
 
+  // Marks mark refreshing.
   const markRefreshing = (accountIds: string[], refreshing: boolean) => {
     setRefreshingById((previous) => {
       let changed = false;
@@ -780,6 +832,7 @@ function App() {
     }
   };
 
+  // Refresh account credits.
   const refreshAccountCredits = async (id: string) => {
     markRefreshing([id], true);
     setError(null);
@@ -806,6 +859,7 @@ function App() {
     await syncAutoQuotaPolicies();
   };
 
+  // Sync auto quota policies.
   const syncAutoQuotaPolicies = async () => {
     autoQuotaSyncRequested = true;
     if (autoQuotaSyncInFlight) {
@@ -888,6 +942,7 @@ function App() {
     }
   };
 
+  // Handles handle refresh all credits.
   const handleRefreshAllCredits = async () => {
     const currentView = view();
     if (!currentView) {
@@ -899,7 +954,9 @@ function App() {
     setNotice("All credits refreshed.");
   };
 
+  // Handles handle refresh depleted credits.
   const handleRefreshDepletedCredits = async () => {
+    // Ids.
     const ids = depletedAccounts().map((account) => account.id);
     if (ids.length === 0) {
       setNotice("No depleted accounts to refresh.");
@@ -910,7 +967,9 @@ function App() {
     setNotice("Depleted account credits refreshed.");
   };
 
+  // Handles handle refresh frozen credits.
   const handleRefreshFrozenCredits = async () => {
+    // Ids.
     const ids = frozenAccounts().map((account) => account.id);
     if (ids.length === 0) {
       setNotice("No frozen accounts to refresh.");
@@ -921,6 +980,7 @@ function App() {
     setNotice("Frozen account credits refreshed.");
   };
 
+  // Maybe auto refresh depleted.
   const maybeAutoRefreshDepleted = async (currentEpoch: number) => {
     if (autoDepletedRefreshInFlight || currentEpoch < depletedAutoRefreshCooldownUntil) {
       return;
@@ -952,6 +1012,7 @@ function App() {
     }
   };
 
+  // Maybe auto refresh active.
   const maybeAutoRefreshActive = async (currentEpoch: number) => {
     if (!autoRefreshActiveEnabled() || autoActiveRefreshInFlight) {
       return;
@@ -980,6 +1041,7 @@ function App() {
     }
   };
 
+  // Handles handle toggle auto refresh active.
   const handleToggleAutoRefreshActive = (event: Event) => {
     const input = event.currentTarget as HTMLInputElement | null;
     const next = input ? input.checked : !autoRefreshActiveEnabled();
@@ -992,6 +1054,7 @@ function App() {
     }).catch(() => {});
   };
 
+  // Handles handle auto refresh interval input.
   const handleAutoRefreshIntervalInput = (event: Event) => {
     const input = event.currentTarget as HTMLInputElement | null;
     if (!input) {
@@ -1006,6 +1069,7 @@ function App() {
     }).catch(() => {});
   };
 
+  // Handles handle usage refresh display mode change.
   const handleUsageRefreshDisplayModeChange = (event: Event) => {
     const select = event.currentTarget as HTMLSelectElement | null;
     if (!select) {
@@ -1019,20 +1083,42 @@ function App() {
     }).catch(() => {});
   };
 
+  // Handles handle add chatgpt start.
   const handleAddChatgptStart = async () => {
-    const started = await runAction("Opening Codex login in browser", () => beginCodexLogin());
-
-    if (!started) {
+    const prepared =
+      browserStart() ?? (await runAction("Preparing callback listener", () => prepareCodexLoginSession()));
+    if (!prepared) {
       return;
     }
 
-    setBrowserStart(started);
-    setNotice(`Browser opened. Listening for callback at ${started.redirectUri}.`);
+    setBrowserStart(prepared);
+
     if (!isListeningForCallback()) {
-      void startCallbackListener();
+      await startCallbackListener();
+      if (!isListeningForCallback()) {
+        return;
+      }
+    }
+
+    batch(() => {
+      setBusy("Opening Codex login in browser");
+      setError(null);
+      setNotice(null);
+    });
+
+    try {
+      const started = await beginCodexLogin();
+      setBrowserStart(started);
+      setNotice(`Browser opened. Listening for callback at ${started.redirectUri}.`);
+    } catch (actionError) {
+      const rendered = actionError instanceof Error ? actionError.message : String(actionError);
+      setError(rendered);
+    } finally {
+      setBusy(isListeningForCallback() ? "Listening for browser callback" : null);
     }
   };
 
+  // Render callback error.
   const renderCallbackError = (errorCode: string): string => {
     if (errorCode === "CallbackListenerStopped") return "Callback listener stopped.";
     if (errorCode === "CallbackListenerTimeout") return "Callback listener timed out.";
@@ -1043,6 +1129,7 @@ function App() {
     return errorCode;
   };
 
+  // Clears clear callback poll timer.
   const clearCallbackPollTimer = () => {
     if (callbackPollTimer !== undefined) {
       window.clearTimeout(callbackPollTimer);
@@ -1050,6 +1137,7 @@ function App() {
     }
   };
 
+  // Poll callback listener.
   const pollCallbackListener = async (runId: number) => {
     try {
       const polled = await pollCodexCallbackListener();
@@ -1124,6 +1212,7 @@ function App() {
     }
   };
 
+  // Start callback listener.
   const startCallbackListener = async () => {
     const runId = ++callbackListenRunId;
     clearCallbackPollTimer();
@@ -1157,6 +1246,7 @@ function App() {
     }
   };
 
+  // Stop callback listener.
   const stopCallbackListener = async () => {
     callbackListenRunId += 1;
     clearCallbackPollTimer();
@@ -1176,6 +1266,7 @@ function App() {
     }
   };
 
+  // Handles handle toggle callback listener.
   const handleToggleCallbackListener = async () => {
     if (isListeningForCallback()) {
       await stopCallbackListener();
@@ -1183,6 +1274,7 @@ function App() {
     }
 
     if (!browserStart()) {
+      // Prepared.
       const prepared = await runAction("Preparing callback listener", () => prepareCodexLoginSession());
       if (!prepared) {
         return;
@@ -1193,6 +1285,7 @@ function App() {
     await startCallbackListener();
   };
 
+  // Handles handle add api key.
   const handleAddApiKey = async () => {
     const apiKey = apiKeyDraft().trim();
     if (!apiKey) {
@@ -1200,6 +1293,7 @@ function App() {
       return;
     }
 
+    // Login.
     const login = await runAction("Saving API key account", () => codexLoginWithApiKey(apiKey));
 
     if (!login) {
@@ -1220,7 +1314,9 @@ function App() {
     }
   };
 
+  // Handles handle import current.
   const handleImportCurrent = async () => {
+    // Next.
     const next = await runAction("Importing current auth.json", () => importCurrentAccount());
 
     if (!next) {
@@ -1241,7 +1337,9 @@ function App() {
     }
   };
 
+  // Handles handle switch.
   const handleSwitch = async (id: string) => {
+    // Next.
     const next = await runAction("Switching account", () => switchAccount(id));
 
     if (!next) {
@@ -1253,6 +1351,7 @@ function App() {
     await refreshAccountCredits(id);
   };
 
+  // Accounts for bucket.
   const accountsForBucket = (bucket: AccountBucket): AccountSummary[] => {
     if (bucket === "active") {
       return activeAccounts();
@@ -1263,6 +1362,7 @@ function App() {
     return frozenAccounts();
   };
 
+  // Determines is drop before.
   const isDropBefore = (bucket: AccountBucket, targetId: string): boolean => {
     const current = dragHover();
     return Boolean(
@@ -1273,6 +1373,7 @@ function App() {
     );
   };
 
+  // Determines is drop after.
   const isDropAfter = (bucket: AccountBucket, targetId: string): boolean => {
     const current = dragHover();
     return Boolean(
@@ -1283,21 +1384,25 @@ function App() {
     );
   };
 
+  // Determines is drop at end.
   const isDropAtEnd = (bucket: AccountBucket): boolean => {
     const current = dragHover();
     return Boolean(current && current.bucket === bucket && current.placement === "end");
   };
 
+  // Determines is drop bucket hovered.
   const isDropBucketHovered = (bucket: AccountBucket): boolean => {
     const current = dragHover();
     return Boolean(current && current.bucket === bucket);
   };
 
+  // Move account to bucket.
   const moveAccountToBucket = async (id: string, bucket: AccountBucket, targetIndex: number) => {
     if (!view()) {
       return;
     }
 
+    // Moved.
     const moved = await runAction("Moving account", async () => {
       await moveAccount(id, bucket, targetIndex, {
         switchAwayFromMoved: AUTO_SWITCH_AWAY_FROM_DEPLETED_OR_FROZEN,
@@ -1325,6 +1430,7 @@ function App() {
     setNotice("Account moved.");
   };
 
+  // Resolves resolve drag id.
   const resolveDragId = (event: DragEvent): string | null => {
     const inMemory = draggingAccountId();
     if (inMemory) {
@@ -1335,6 +1441,7 @@ function App() {
     return transfer && transfer.trim().length > 0 ? transfer : null;
   };
 
+  // Allow drop.
   const allowDrop = (event: DragEvent) => {
     event.preventDefault();
     if (event.dataTransfer) {
@@ -1359,7 +1466,9 @@ function App() {
     setDragHover({ bucket, targetId, placement });
   };
 
+  // Account bucket for id.
   const accountBucketForId = (accountId: string): AccountBucket | null => {
+    // Account.
     const account = view()?.accounts.find((entry) => entry.id === accountId);
     if (!account) {
       return null;
@@ -1373,6 +1482,7 @@ function App() {
     return "active";
   };
 
+  // Determines can drop in bucket.
   const canDropInBucket = (draggedId: string, bucket: AccountBucket): boolean => {
     const sourceBucket = draggingBucket() ?? accountBucketForId(draggedId);
     if (!sourceBucket) {
@@ -1395,7 +1505,9 @@ function App() {
     }
 
     const accounts = accountsForBucket(bucket);
+    // Dragged index.
     const draggedIndex = accounts.findIndex((account) => account.id === draggedId);
+    // Target index.
     const targetIndex = accounts.findIndex((account) => account.id === targetId);
     if (draggedIndex < 0 || targetIndex < 0) {
       return "before";
@@ -1404,6 +1516,7 @@ function App() {
     return draggedIndex < targetIndex ? "after" : "before";
   };
 
+  // Handles handle drag over bucket.
   const handleDragOverBucket = (event: DragEvent, bucket: AccountBucket) => {
     allowDrop(event);
     const draggedId = resolveDragId(event);
@@ -1421,6 +1534,7 @@ function App() {
     setDragHoverTarget(bucket, null);
   };
 
+  // Handles handle drag over account.
   const handleDragOverAccount = (event: DragEvent, bucket: AccountBucket, targetId: string) => {
     event.stopPropagation();
     allowDrop(event);
@@ -1443,6 +1557,7 @@ function App() {
     setDragHoverTarget(bucket, targetId, dragPlacementForTarget(draggedId, bucket, targetId));
   };
 
+  // Remove drag preview.
   const removeDragPreview = () => {
     if (dragPreviewElement?.parentNode) {
       dragPreviewElement.parentNode.removeChild(dragPreviewElement);
@@ -1450,6 +1565,7 @@ function App() {
     dragPreviewElement = undefined;
   };
 
+  // Creates create drag preview element.
   const createDragPreviewElement = (account: AccountSummary): HTMLDivElement => {
     const element = document.createElement("div");
     element.className = "drag-preview";
@@ -1469,6 +1585,7 @@ function App() {
     return element;
   };
 
+  // Resolves resolve event element.
   const resolveEventElement = (target: EventTarget | null): Element | null => {
     if (target instanceof Element) {
       return target;
@@ -1479,12 +1596,14 @@ function App() {
     return null;
   };
 
+  // Account copy selection active.
   const accountCopySelectionActive = (): boolean => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
       return false;
     }
 
+    // Determines is copyable node.
     const isCopyableNode = (node: Node | null): boolean => {
       if (!node) {
         return false;
@@ -1496,6 +1615,7 @@ function App() {
     return isCopyableNode(selection.anchorNode) || isCopyableNode(selection.focusNode);
   };
 
+  // Drag start blocked.
   const dragStartBlocked = (target: EventTarget | null): boolean => {
     const element = resolveEventElement(target);
     if (element?.closest("button, input, select, textarea, a, .account-copyable, .account-main-value")) {
@@ -1505,6 +1625,7 @@ function App() {
     return accountCopySelectionActive();
   };
 
+  // Handles handle drop on bucket.
   const handleDropOnBucket = async (event: DragEvent, bucket: AccountBucket) => {
     event.preventDefault();
     const draggedId = resolveDragId(event);
@@ -1520,10 +1641,12 @@ function App() {
       return;
     }
 
+    // Accounts.
     const accounts = accountsForBucket(bucket).filter((account) => account.id !== draggedId);
     await moveAccountToBucket(draggedId, bucket, accounts.length);
   };
 
+  // Handles handle drop on account.
   const handleDropOnAccount = async (event: DragEvent, bucket: AccountBucket, targetId: string) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1546,16 +1669,23 @@ function App() {
       return;
     }
 
+    // Accounts.
     const accounts = accountsForBucket(bucket).filter((account) => account.id !== draggedId);
+    // Target index.
     const targetIndex = accounts.findIndex((account) => account.id === targetId);
     if (targetIndex < 0) {
       return;
     }
 
-    const nextIndex = placement === "after" ? targetIndex + 1 : targetIndex;
+    const effectivePlacement =
+      placement === "after" || placement === "before"
+        ? placement
+        : dragPlacementForTarget(draggedId, bucket, targetId);
+    const nextIndex = effectivePlacement === "after" ? targetIndex + 1 : targetIndex;
     await moveAccountToBucket(draggedId, bucket, nextIndex);
   };
 
+  // Handles handle drag start.
   const handleDragStart = (event: DragEvent, account: AccountSummary, bucket: AccountBucket) => {
     if (dragStartBlocked(event.target)) {
       event.preventDefault();
@@ -1576,6 +1706,7 @@ function App() {
     }
   };
 
+  // Handles handle drag end.
   const handleDragEnd = () => {
     document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
     setDraggingAccountId(null);
@@ -1584,12 +1715,14 @@ function App() {
     removeDragPreview();
   };
 
+  // Release drag selection lock.
   const releaseDragSelectionLock = () => {
     if (!draggingAccountId()) {
       document.body.classList.remove(DRAG_SELECT_LOCK_CLASS);
     }
   };
 
+  // Normalizes normalize content scroll after collapse.
   const normalizeContentScrollAfterCollapse = (forceTop: boolean) => {
     if (!contentScrollRef) {
       return;
@@ -1612,6 +1745,7 @@ function App() {
     });
   };
 
+  // Handles handle toggle depleted section.
   const handleToggleDepletedSection = () => {
     const nextVisible = !showDepleted();
     setShowDepleted(nextVisible);
@@ -1620,6 +1754,7 @@ function App() {
     }
   };
 
+  // Handles handle toggle frozen section.
   const handleToggleFrozenSection = () => {
     const nextVisible = !showFrozen();
     setShowFrozen(nextVisible);
@@ -1628,23 +1763,29 @@ function App() {
     }
   };
 
+  // Handles handle freeze.
   const handleFreeze = async (id: string) => {
+    // Target index.
     const targetIndex = frozenAccounts().filter((account) => account.id !== id).length;
     await moveAccountToBucket(id, "frozen", targetIndex);
   };
 
+  // Handles handle thaw.
   const handleThaw = async (id: string) => {
+    // Target index.
     const targetIndex = activeAccounts().filter((account) => account.id !== id).length;
     await moveAccountToBucket(id, "active", targetIndex);
     await refreshAccountCredits(id);
   };
 
+  // Handles handle remove.
   const handleRemove = async (id: string) => {
     const confirmed = window.confirm("Remove this account permanently?");
     if (!confirmed) {
       return;
     }
 
+    // Next.
     const next = await runAction("Removing account", () => removeAccount(id));
 
     if (!next) {
@@ -1660,6 +1801,7 @@ function App() {
     setNotice("Account removed.");
   };
 
+  // Toggles toggle theme.
   const toggleTheme = () => {
     const nextTheme: Theme = theme() === "light" ? "dark" : "light";
     setTheme(nextTheme);
@@ -1673,6 +1815,7 @@ function App() {
     setTheme(initialTheme);
     applyTheme(initialTheme);
 
+    // Handles handle pointer down.
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (!target) {
@@ -1954,9 +2097,13 @@ function App() {
                 >
                   <For each={activeAccounts()}>
                     {(account) => {
+                      // Credits.
                       const credits = () => creditsById()[account.id];
+                      // Refresh error message.
                       const refreshErrorMessage = () => refreshErrorMessageForCredits(credits());
+                      // Refresh rows.
                       const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
+                      // Determines is current.
                       const isCurrent = () => view()?.activeAccountId === account.id;
 
                       return (
@@ -2160,8 +2307,11 @@ function App() {
                   >
                     <For each={depletedAccounts()}>
                       {(account) => {
+                        // Credits.
                         const credits = () => creditsById()[account.id];
+                        // Refresh error message.
                         const refreshErrorMessage = () => refreshErrorMessageForCredits(credits());
+                        // Refresh rows.
                         const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                         return (
@@ -2351,9 +2501,13 @@ function App() {
                   >
                     <For each={frozenAccounts()}>
                       {(account) => {
+                        // Credits.
                         const credits = () => creditsById()[account.id];
+                        // Available percent.
                         const availablePercent = () => quotaRemainingPercent(credits());
+                        // Refresh error message.
                         const refreshErrorMessage = () => refreshErrorMessageForCredits(credits());
+                        // Refresh rows.
                         const refreshRows = () => usageRefreshRows(credits(), nowTick(), usageRefreshDisplayMode());
 
                         return (

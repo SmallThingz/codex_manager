@@ -2,7 +2,7 @@
 
 A Zig + SolidJS account manager for Codex with backend-authoritative state, typed WebUI RPC, and deterministic launch behavior.
 
-![zig](https://img.shields.io/badge/Zig-0.15.2+-f7a41d?logo=zig&logoColor=111)
+![zig](https://img.shields.io/badge/Zig-0.16.0--dev+-f7a41d?logo=zig&logoColor=111)
 ![solid](https://img.shields.io/badge/Frontend-SolidJS-1f3b6f)
 ![webui](https://img.shields.io/badge/Runtime-webui-111827)
 ![modes](https://img.shields.io/badge/Modes---webview%20--browser%20--web-0f766e)
@@ -71,7 +71,7 @@ Run installed binary:
 
 Build-time:
 
-- Zig `0.15.2+`
+- Zig `0.16.0-dev+`
 - Node.js `20+`
 - npm
 

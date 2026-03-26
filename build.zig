@@ -8,7 +8,7 @@ fn resolveMacosSdkPath(
     if (macos_sdk_option) |path| {
         return path;
     }
-    return b.graph.env_map.get("MACOS_SDK_ROOT");
+    return b.graph.environ_map.get("MACOS_SDK_ROOT");
 }
 
 fn absolutizePath(
@@ -18,8 +18,7 @@ fn absolutizePath(
     if (std.fs.path.isAbsolute(input_path)) {
         return input_path;
     }
-    const cwd = std.process.getCwdAlloc(b.allocator) catch return input_path;
-    return std.fs.path.resolve(b.allocator, &.{ cwd, input_path }) catch input_path;
+    return std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, input_path, b.allocator) catch input_path;
 }
 
 fn optimizeModeName(optimize: std.builtin.OptimizeMode) []const u8 {
@@ -76,9 +75,7 @@ fn addMacosSdkAutoDownloadStep(
         \\  -H 'User-Agent: codex-manager-build' \
         \\  "$metadata_url" -o "$release_json"
         \\
-        \\asset_match="$(grep -m 1 -Eo '"browser_download_url":"[^"]*MacOSX[^"]*sdk.tar.xz"' "$release_json" || true)"
-        \\asset_url="${asset_match#\"browser_download_url\":\"}"
-        \\asset_url="${asset_url%\"}"
+        \\asset_url="$(sed -nE 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]*MacOSX[^"]*\\.sdk\\.tar\\.xz)".*/\1/p' "$release_json" | head -n 1)"
         \\if [ -z "$asset_url" ]; then
         \\  echo "Could not find a MacOSX*.sdk.tar.xz asset in $metadata_url." >&2
         \\  echo "Set -Dmacos_sdk=<path> or MACOS_SDK_ROOT to use a local SDK instead." >&2

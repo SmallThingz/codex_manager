@@ -4,6 +4,7 @@ const rpc = @import("rpc.zig");
 const RawJson = struct {
     data: []const u8,
 
+    /// Emits the already-serialized JSON payload directly into webui's JSON writer.
     pub fn jsonStringify(self: @This(), jws: anytype) !void {
         try jws.beginWriteRaw();
         try jws.writer.writeAll(self.data);
@@ -12,6 +13,8 @@ const RawJson = struct {
 };
 
 pub const RpcBridgeMethods = struct {
+    /// Dispatches a bridge RPC call through the backend and copies the JSON result into a
+    /// thread-local response buffer that webui can safely consume.
     pub fn cm_rpc(request: rpc.RpcRequest) RawJson {
         const cancel_ptr = bridge_cancel_ptr orelse {
             return .{ .data = "{\"error\":\"RPC bridge not initialized\"}" };
@@ -36,6 +39,12 @@ var bridge_cancel_ptr: ?*std.atomic.Value(bool) = null;
 threadlocal var bridge_response_storage: [8 * 1024 * 1024]u8 = undefined;
 threadlocal var bridge_response_len: usize = 0;
 
+/// Registers the cancellation flag shared with the OAuth callback listener.
 pub fn setCancelPointer(cancel_ptr: *std.atomic.Value(bool)) void {
     bridge_cancel_ptr = cancel_ptr;
+}
+
+/// Forwards the captured process environment map into the RPC layer used by the bridge.
+pub fn setEnvironMap(environ_map: *std.process.Environ.Map) void {
+    rpc.setEnvironMap(environ_map);
 }

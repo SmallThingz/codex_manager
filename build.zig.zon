@@ -2,11 +2,11 @@
     .name = .codex_manager_webui,
     .version = "0.1.0",
     .fingerprint = 0x722ff198580114f2,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0-dev",
     .dependencies = .{
         .webui = .{
-            .url = "git+https://github.com/SmallThingz/webui.git#87b509f16d73d97961b0b0f888b0b1f8215858b6",
-            .hash = "webui-0.0.0-NV0cf6toCgA0u52YXCDPqXApWKAc2_pSA36VarRbYmow",
+            .url = "git+https://github.com/SmallThingz/webui.git#f95a08152b760ef8f1a5ab3b3d3a09f586c39bb8",
+            .hash = "webui-0.0.0-NV0cf7IqCwDjOqyyu3dtUfU9IFoHdpTMQ2fldn1ZNrTh",
         },
     },
     .paths = .{
