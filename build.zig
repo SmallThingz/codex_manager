@@ -75,7 +75,7 @@ fn addMacosSdkAutoDownloadStep(
         \\  -H 'User-Agent: codex-manager-build' \
         \\  "$metadata_url" -o "$release_json"
         \\
-        \\asset_url="$(sed -nE 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]*MacOSX[^"]*\\.sdk\\.tar\\.xz)".*/\1/p' "$release_json" | head -n 1)"
+        \\asset_url="$(sed -nE 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]*MacOSX[^"]*\.sdk\.tar\.xz)".*/\1/p' "$release_json" | head -n 1)"
         \\if [ -z "$asset_url" ]; then
         \\  echo "Could not find a MacOSX*.sdk.tar.xz asset in $metadata_url." >&2
         \\  echo "Set -Dmacos_sdk=<path> or MACOS_SDK_ROOT to use a local SDK instead." >&2

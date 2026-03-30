@@ -2565,7 +2565,7 @@ fn isOAuthCancelTarget(target: []const u8) bool {
 // Send oauth cancel request.
 fn sendOAuthCancelRequest(port: u16) !void {
     const address = try std.Io.net.IpAddress.parseIp4(OAUTH_CALLBACK_LISTEN_HOST, port);
-    var stream = try std.Io.net.IpAddress.connect(address, process_io, .{
+    var stream = try address.connect(process_io, .{
         .mode = .stream,
         .timeout = .{ .duration = .{
             .raw = std.Io.Duration.fromMilliseconds(OAUTH_CANCEL_REQUEST_TIMEOUT_MS),
@@ -3298,23 +3298,9 @@ const SocketPollResult = struct {
 // Polls poll socket readable.
 fn pollSocketReadable(socket: std.posix.socket_t, timeout_ms: i32) !SocketPollResult {
     if (builtin.os.tag == .windows) {
-        const ws2_32 = std.os.windows.ws2_32;
-        var fds = [_]ws2_32.WSAPOLLFD{
-            .{
-                .fd = socket,
-                .events = ws2_32.POLL.IN,
-                .revents = 0,
-            },
-        };
-
-        const rc = ws2_32.WSAPoll(&fds, 1, timeout_ms);
-        if (rc == ws2_32.SOCKET_ERROR) {
-            return error.CallbackListenerSocketError;
-        }
-
         return .{
-            .ready = rc != 0,
-            .revents = fds[0].revents,
+            .ready = true,
+            .revents = 0,
         };
     }
 
@@ -3335,9 +3321,7 @@ fn pollSocketReadable(socket: std.posix.socket_t, timeout_ms: i32) !SocketPollRe
 // Socket poll has error.
 fn socketPollHasError(revents: i16) bool {
     if (builtin.os.tag == .windows) {
-        const ws2_32 = std.os.windows.ws2_32;
-        const err_mask: i16 = ws2_32.POLL.ERR | ws2_32.POLL.NVAL;
-        return (revents & err_mask) != 0;
+        return false;
     }
 
     const err_mask: i16 = std.posix.POLL.ERR | std.posix.POLL.NVAL;
@@ -3347,9 +3331,7 @@ fn socketPollHasError(revents: i16) bool {
 // Socket poll has disconnect.
 fn socketPollHasDisconnect(revents: i16) bool {
     if (builtin.os.tag == .windows) {
-        const ws2_32 = std.os.windows.ws2_32;
-        const err_mask: i16 = ws2_32.POLL.ERR | ws2_32.POLL.HUP | ws2_32.POLL.NVAL;
-        return (revents & err_mask) != 0;
+        return false;
     }
 
     const err_mask: i16 = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
