@@ -153,10 +153,8 @@ fn runModeService(
         return error.NativeWebviewUnavailable;
     }
 
-    const local_url = service.browserUrl() catch null;
-    defer if (local_url) |url| allocator.free(url);
-
-    if (local_url) |url| {
+    if (service.browserUrl() catch null) |url| {
+        defer allocator.free(url);
         std.debug.print("Codex Manager URL: {s}\n", .{url});
     }
 

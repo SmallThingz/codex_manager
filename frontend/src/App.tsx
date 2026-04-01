@@ -1181,7 +1181,6 @@ function App() {
         setIsListeningForCallback(false);
         setBusy(null);
         resetCodexLoginSession();
-        setBrowserStart(null);
         return;
       }
 
@@ -1814,7 +1813,8 @@ function App() {
 
   onMount(async () => {
     const fallbackTheme = localStorage.getItem("codex-manager-theme");
-    const initialTheme: Theme = embeddedState?.theme === "dark" ? "dark" : fallbackTheme === "dark" ? "dark" : "light";
+    const initialTheme: Theme =
+      embeddedState?.theme === "dark" || fallbackTheme === "dark" ? "dark" : "light";
     setTheme(initialTheme);
     applyTheme(initialTheme);
 

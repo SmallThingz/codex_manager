@@ -1090,6 +1090,12 @@ fn accountIndex(store: *const StoreState, account_id: []const u8) ?usize {
     return null;
 }
 
+// Returns the stored email for a managed account id.
+fn accountEmailById(store: *const StoreState, account_id: []const u8) ?[]const u8 {
+    const idx = accountIndex(store, account_id) orelse return null;
+    return store.accounts.items[idx].email;
+}
+
 // Account bucket.
 fn accountBucket(account: *const ManagedAccount) AccountBucket {
     if (account.frozen) return .frozen;
@@ -2555,12 +2561,12 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
 fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw: []const u8) ![]u8 {
     const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "refresh_account_usage requires accountId");
 
-    const should_debounce = shouldDebounceRefresh(account_id);
-    var in_flight = isRefreshInflight(account_id);
+    const in_flight = blk: {
+        if (shouldDebounceRefresh(account_id)) {
+            break :blk isRefreshInflight(account_id);
+        }
 
-    if (!should_debounce) {
         try setRefreshInflight(account_id, true);
-        in_flight = true;
         const thread_account_id = allocator.dupe(u8, account_id) catch {
             try setRefreshInflight(account_id, false);
             return jsonError(allocator, "Internal memory error.");
@@ -2571,7 +2577,8 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
             return jsonError(allocator, "Failed to spawn refresh thread.");
         };
         thread.detach();
-    }
+        break :blk true;
+    };
 
     lockIoMutex(&managed_files_mutex);
     defer unlockIoMutex(&managed_files_mutex);
@@ -2581,24 +2588,22 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     const usage_idx = usageEntryIndex(state.usage_by_id.items, account_id) orelse {
         var unavailable = try makeCreditsInfo(allocator, nowEpochSeconds(), .unavailable, "No usage data available for this account.");
         defer unavailable.deinit(allocator);
-        const email = blk: {
-            const idx = accountIndex(&state.store, account_id) orelse break :blk null;
-            break :blk state.store.accounts.items[idx].email;
-        };
-        const response = try buildRefreshUsageResponseJson(allocator, account_id, &unavailable, email, in_flight);
+        const response = try buildRefreshUsageResponseJson(
+            allocator,
+            account_id,
+            &unavailable,
+            accountEmailById(&state.store, account_id),
+            in_flight,
+        );
         defer allocator.free(response);
         return jsonOkRaw(allocator, response);
     };
 
-    const account_email = blk: {
-        const idx = accountIndex(&state.store, account_id) orelse break :blk null;
-        break :blk state.store.accounts.items[idx].email;
-    };
     const response = try buildRefreshUsageResponseJson(
         allocator,
         account_id,
         &state.usage_by_id.items[usage_idx].credits,
-        account_email,
+        accountEmailById(&state.store, account_id),
         in_flight,
     );
     defer allocator.free(response);
