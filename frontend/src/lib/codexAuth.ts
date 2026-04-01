@@ -9,7 +9,6 @@ const AUTO_REFRESH_ACTIVE_MAX_INTERVAL_SEC = 21600;
 
 export type AccountSummary = {
   id: string;
-  accountId: string | null;
   email: string | null;
   state: "active" | "archived" | "frozen";
 };
@@ -232,7 +231,6 @@ const asAccountSummary = (value: unknown): AccountSummary | null => {
 
   return {
     id: account.id,
-    accountId: normalizeOptional(typeof account.accountId === "string" ? account.accountId : null),
     email: normalizeOptional(typeof account.email === "string" ? account.email : null),
     state:
       account.state === "archived" || account.state === "frozen" || account.state === "active"
@@ -584,9 +582,9 @@ export const updateUiPreferences = async (
 /**
  * Imports the currently active Codex CLI account into the manager store.
  */
-export const importCurrentAccount = async (label?: string): Promise<AccountsView> => {
+export const importCurrentAccount = async (): Promise<AccountsView> => {
   const tauri = await loadBackendApis();
-  const view = await tauri.invoke<unknown>("import_current_account", { label });
+  const view = await tauri.invoke<unknown>("import_current_account");
   return parseAccountsViewResponse(view, "import_current_account");
 };
 
@@ -608,7 +606,7 @@ export const resetCodexLoginSession = (): void => {
 /**
  * Starts the backend OAuth callback listener for the current pending login session.
  */
-export const startCodexCallbackListener = async (label?: string): Promise<void> => {
+export const startCodexCallbackListener = async (): Promise<void> => {
   const pending = ensurePendingBrowserLogin();
   const tauri = await loadBackendApis();
   await tauri.invoke<unknown>("start_oauth_callback_listener", {
@@ -617,7 +615,6 @@ export const startCodexCallbackListener = async (label?: string): Promise<void> 
     redirectUri: pending.redirectUri,
     oauthState: pending.state,
     codeVerifier: pending.codeVerifier,
-    label,
   });
 };
 
@@ -663,7 +660,7 @@ export const stopCodexCallbackListener = async (): Promise<void> => {
 /**
  * Saves an API-key account directly without going through the browser OAuth flow.
  */
-export const codexLoginWithApiKey = async (apiKey: string, label?: string): Promise<LoginResult> => {
+export const codexLoginWithApiKey = async (apiKey: string): Promise<LoginResult> => {
   const normalized = normalizeOptional(apiKey);
   if (!normalized) {
     throw new Error("API key is required.");
@@ -673,7 +670,6 @@ export const codexLoginWithApiKey = async (apiKey: string, label?: string): Prom
   const view = parseAccountsViewResponse(
     await tauri.invoke<unknown>("login_with_api_key", {
       apiKey: normalized,
-      label,
     }),
     "login_with_api_key",
   );

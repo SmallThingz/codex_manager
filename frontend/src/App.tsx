@@ -318,18 +318,18 @@ const usageRefreshRows = (
 
 // Account title.
 const accountTitle = (account: AccountSummary): string => {
-  return account.email || account.accountId || account.id;
+  return account.email || account.id;
 };
 
 // Account main identity.
 const accountMainIdentity = (account: AccountSummary): string => {
-  return account.accountId || account.id;
+  return account.id;
 };
 
 // Account meta line.
 const accountMetaLine = (account: AccountSummary): string | null => {
   const title = accountTitle(account);
-  const id = account.accountId || account.id;
+  const id = account.id;
   if (id !== title) {
     return id;
   }
@@ -720,16 +720,11 @@ function App() {
       }
     }
 
-    const nextActiveDiskAccountId =
-      nextActiveAccountId === null
-        ? null
-        : nextAccounts.find((account) => account.id === nextActiveAccountId)?.accountId ?? null;
-
     return {
       ...currentView,
       accounts: nextAccounts,
       activeAccountId: nextActiveAccountId,
-      activeDiskAccountId: nextActiveDiskAccountId,
+      activeDiskAccountId: currentView.activeDiskAccountId,
     };
   };
 
@@ -745,7 +740,7 @@ function App() {
       ...currentView,
       accounts: nextAccounts,
       activeAccountId: account.id,
-      activeDiskAccountId: account.accountId ?? null,
+      activeDiskAccountId: currentView.activeDiskAccountId,
       codexAuthExists: true,
     };
   };

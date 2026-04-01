@@ -37,6 +37,9 @@ const STORE_FILE = "accounts.json";
 const BOOTSTRAP_STATE_FILE = "bootstrap-state.json";
 const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token";
+const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
+const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const OAUTH_CALLBACK_LISTEN_HOST = "127.0.0.1";
 const OAUTH_CALLBACK_PUBLIC_HOST = "localhost";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
@@ -115,7 +118,6 @@ const OAUTH_CALLBACK_SUCCESS_HTML =
 pub const RpcRequest = struct {
     op: []const u8,
     theme: ?[]const u8 = null,
-    label: ?[]const u8 = null,
     apiKey: ?[]const u8 = null,
     issuer: ?[]const u8 = null,
     clientId: ?[]const u8 = null,
@@ -141,6 +143,16 @@ const UsageResult = struct {
     body: []u8,
 };
 
+const FetchCreditsResult = struct {
+    credits: CreditsInfo,
+    updated_auth_json: ?[]u8 = null,
+
+    fn deinit(self: *FetchCreditsResult, allocator: std.mem.Allocator) void {
+        self.credits.deinit(allocator);
+        if (self.updated_auth_json) |value| allocator.free(value);
+    }
+};
+
 const ManagedPaths = struct {
     codexHome: []u8,
     codexAuthPath: []u8,
@@ -160,14 +172,12 @@ const ManagedPaths = struct {
 
 const OAuthReadyAccount = struct {
     id: []u8,
-    accountId: ?[]u8 = null,
     email: ?[]u8 = null,
     state: []const u8 = "active",
 
     // Cleans up resources owned by this value.
     fn deinit(self: *OAuthReadyAccount, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
-        if (self.accountId) |value| allocator.free(value);
         if (self.email) |value| allocator.free(value);
     }
 };
@@ -288,8 +298,6 @@ const UsageCacheEntry = struct {
 
 const ManagedAccount = struct {
     id: []u8,
-    label: ?[]u8 = null,
-    account_id: ?[]u8 = null,
     email: ?[]u8 = null,
     archived: bool = false,
     frozen: bool = false,
@@ -298,8 +306,6 @@ const ManagedAccount = struct {
     // Cleans up resources owned by this value.
     fn deinit(self: *ManagedAccount, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
-        if (self.label) |value| allocator.free(value);
-        if (self.account_id) |value| allocator.free(value);
         if (self.email) |value| allocator.free(value);
         allocator.free(self.auth_json);
     }
@@ -422,14 +428,14 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
         }
 
         if (std.mem.eql(u8, command, "import_current_account")) {
-            return handleImportCurrentAccountCommand(allocator, request.label) catch |err| {
+            return handleImportCurrentAccountCommand(allocator) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
         }
 
         if (std.mem.eql(u8, command, "login_with_api_key")) {
             const api_key = request.apiKey orelse return jsonError(allocator, "login_with_api_key requires apiKey");
-            return handleLoginWithApiKeyCommand(allocator, api_key, request.label) catch |err| {
+            return handleLoginWithApiKeyCommand(allocator, api_key) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
         }
@@ -456,7 +462,6 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
                 redirect_uri,
                 oauth_state,
                 code_verifier,
-                trimOptionalString(request.label),
             ) catch |err| {
                 return jsonError(allocator, @errorName(err));
             };
@@ -872,8 +877,6 @@ fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreSt
 
         var account = ManagedAccount{
             .id = try allocator.dupe(u8, id),
-            .label = null,
-            .account_id = null,
             .email = null,
             .archived = false,
             .frozen = false,
@@ -889,18 +892,8 @@ fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreSt
                     account.frozen = true;
                 }
             }
-        } else {
-            // One-way migration path from older persisted format.
-            account.archived = if (account_obj.get("archived")) |v| jsonGetBool(v) orelse false else false;
-            account.frozen = if (account_obj.get("frozen")) |v| jsonGetBool(v) orelse false else false;
         }
 
-        if (account_obj.get("label")) |label| {
-            if (jsonGetString(label)) |value| account.label = try allocator.dupe(u8, value);
-        }
-        if (account_obj.get("accountId")) |account_id| {
-            if (jsonGetString(account_id)) |value| account.account_id = try allocator.dupe(u8, value);
-        }
         if (account_obj.get("email")) |email| {
             if (jsonGetString(email)) |value| account.email = try allocator.dupe(u8, value);
         }
@@ -1168,6 +1161,75 @@ fn extractAccessTokenFromAuthJson(allocator: std.mem.Allocator, auth_json: []con
     return allocator.dupe(u8, access_token) catch null;
 }
 
+// Extracts extract refresh token from auth json.
+fn extractRefreshTokenFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = jsonGetObject(parsed.value) orelse return null;
+    const tokens = root.get("tokens") orelse return null;
+    const tokens_obj = jsonGetObject(tokens) orelse return null;
+    const refresh = tokens_obj.get("refresh_token") orelse return null;
+    const refresh_token = jsonGetString(refresh) orelse return null;
+    return allocator.dupe(u8, refresh_token) catch null;
+}
+
+// Extracts extract id token from auth json.
+fn extractIdTokenFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = jsonGetObject(parsed.value) orelse return null;
+    const tokens = root.get("tokens") orelse return null;
+    const tokens_obj = jsonGetObject(tokens) orelse return null;
+    const id_token_value = tokens_obj.get("id_token") orelse return null;
+    switch (id_token_value) {
+        .string => |value| return allocator.dupe(u8, value) catch null,
+        .object => |obj| {
+            if (obj.get("raw_jwt")) |raw_jwt_value| {
+                if (jsonGetString(raw_jwt_value)) |value| {
+                    return allocator.dupe(u8, value) catch null;
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+// Extracts extract oauth issuer from auth json.
+fn extractOauthIssuerFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = jsonGetObject(parsed.value) orelse return null;
+    const issuer_value = root.get("oauth_issuer") orelse return null;
+    const issuer = jsonGetString(issuer_value) orelse return null;
+    return allocator.dupe(u8, issuer) catch null;
+}
+
+// Extracts extract oauth client id from auth json.
+fn extractOauthClientIdFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = jsonGetObject(parsed.value) orelse return null;
+    const client_id_value = root.get("oauth_client_id") orelse return null;
+    const client_id = jsonGetString(client_id_value) orelse return null;
+    return allocator.dupe(u8, client_id) catch null;
+}
+
+// Extracts extract oauth redirect uri from auth json.
+fn extractOauthRedirectUriFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = jsonGetObject(parsed.value) orelse return null;
+    const redirect_uri_value = root.get("oauth_redirect_uri") orelse return null;
+    const redirect_uri = jsonGetString(redirect_uri_value) orelse return null;
+    return allocator.dupe(u8, redirect_uri) catch null;
+}
+
 // Extracts extract api key from auth json.
 fn extractApiKeyFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
@@ -1336,10 +1398,6 @@ fn serializeStoreState(allocator: std.mem.Allocator, store: *const StoreState) !
         if (idx != 0) try writer.writeByte(',');
         try writer.writeAll("{\"id\":");
         try writeJsonString(writer, account.id);
-        try writer.writeAll(",\"label\":");
-        try writeJsonOptionalString(writer, account.label);
-        try writer.writeAll(",\"accountId\":");
-        try writeJsonOptionalString(writer, account.account_id);
         try writer.writeAll(",\"email\":");
         try writeJsonOptionalString(writer, account.email);
         try writer.writeAll(",\"state\":");
@@ -1456,8 +1514,6 @@ fn buildAccountsViewJson(allocator: std.mem.Allocator, state: *AppState) ![]u8 {
         try writer.writeByte('{');
         try writer.writeAll("\"id\":");
         try writeJsonString(writer, account.id);
-        try writer.writeAll(",\"accountId\":");
-        try writeJsonOptionalString(writer, account.account_id);
         try writer.writeAll(",\"email\":");
         try writeJsonOptionalString(writer, account.email);
         try writer.writeAll(",\"state\":");
@@ -1961,48 +2017,97 @@ fn fetchCreditsFromAuthJson(
     allocator: std.mem.Allocator,
     auth_json: []const u8,
     account_id_hint: ?[]const u8,
-) !CreditsInfo {
+) !FetchCreditsResult {
     const checked_at = nowEpochSeconds();
 
-    const access_token = extractAccessTokenFromAuthJson(allocator, auth_json);
+    var effective_auth_json = auth_json;
+    var updated_auth_json: ?[]u8 = null;
+    errdefer if (updated_auth_json) |value| allocator.free(value);
+
+    var access_token = extractAccessTokenFromAuthJson(allocator, effective_auth_json);
     defer if (access_token) |token| allocator.free(token);
     if (access_token) |token| {
         const usage = fetchWhamUsage(allocator, token, account_id_hint) catch |err| {
             const message = try std.fmt.allocPrint(allocator, "Failed to fetch usage: {s}", .{@errorName(err)});
             defer allocator.free(message);
-            return makeCreditsInfo(allocator, checked_at, .err, message);
+            return .{ .credits = try makeCreditsInfo(allocator, checked_at, .err, message) };
         };
         defer allocator.free(usage.body);
 
-        if (usage.status < 200 or usage.status >= 300) {
-            const detail = std.mem.trim(u8, usage.body, " \r\n\t");
-            const message = try std.fmt.allocPrint(
-                allocator,
-                "Usage endpoint returned {}. {s}",
-                .{ usage.status, if (detail.len > 0) detail else "No response body." },
-            );
-            defer allocator.free(message);
-            return makeCreditsInfo(allocator, checked_at, .err, message);
+        if (usage.status >= 200 and usage.status < 300) {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, usage.body, .{}) catch {
+                return .{ .credits = try makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned invalid JSON.") };
+            };
+            defer parsed.deinit();
+            const payload = jsonGetObject(parsed.value) orelse {
+                return .{ .credits = try makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned invalid JSON payload.") };
+            };
+
+            return .{ .credits = try parseWhamCredits(allocator, payload, checked_at) };
         }
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, usage.body, .{}) catch {
-            return makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned invalid JSON.");
-        };
-        defer parsed.deinit();
-        const payload = jsonGetObject(parsed.value) orelse {
-            return makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned invalid JSON payload.");
-        };
+        if (usageResponseHasExpiredAccessToken(allocator, usage.status, usage.body)) {
+            updated_auth_json = try refreshChatgptAuthJson(allocator, effective_auth_json);
+            if (updated_auth_json) |refreshed_auth_json| {
+                effective_auth_json = refreshed_auth_json;
 
-        return parseWhamCredits(allocator, payload, checked_at);
+                if (access_token) |existing| {
+                    allocator.free(existing);
+                    access_token = null;
+                }
+                access_token = extractAccessTokenFromAuthJson(allocator, effective_auth_json);
+                if (access_token) |refreshed_token| {
+                    const usage_retry = fetchWhamUsage(allocator, refreshed_token, account_id_hint) catch {
+                        return .{
+                            .credits = try makeCreditsInfo(allocator, checked_at, .unavailable, "Session expired. Sign in again."),
+                            .updated_auth_json = try allocator.dupe(u8, refreshed_auth_json),
+                        };
+                    };
+                    defer allocator.free(usage_retry.body);
+
+                    if (usage_retry.status >= 200 and usage_retry.status < 300) {
+                        var retry_parsed = std.json.parseFromSlice(std.json.Value, allocator, usage_retry.body, .{}) catch {
+                            return .{
+                                .credits = try makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned invalid JSON."),
+                                .updated_auth_json = try allocator.dupe(u8, refreshed_auth_json),
+                            };
+                        };
+                        defer retry_parsed.deinit();
+                        const retry_payload = jsonGetObject(retry_parsed.value) orelse {
+                            return .{
+                                .credits = try makeCreditsInfo(allocator, checked_at, .err, "Usage endpoint returned invalid JSON payload."),
+                                .updated_auth_json = try allocator.dupe(u8, refreshed_auth_json),
+                            };
+                        };
+
+                        return .{
+                            .credits = try parseWhamCredits(allocator, retry_payload, checked_at),
+                            .updated_auth_json = try allocator.dupe(u8, refreshed_auth_json),
+                        };
+                    }
+                }
+            }
+
+            return .{ .credits = try makeCreditsInfo(allocator, checked_at, .unavailable, "Session expired. Sign in again.") };
+        }
+
+        const detail = std.mem.trim(u8, usage.body, " \r\n\t");
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "Usage endpoint returned {}. {s}",
+            .{ usage.status, if (detail.len > 0) detail else "No response body." },
+        );
+        defer allocator.free(message);
+        return .{ .credits = try makeCreditsInfo(allocator, checked_at, .err, message) };
     }
 
-    const api_key = extractApiKeyFromAuthJson(allocator, auth_json);
+    const api_key = extractApiKeyFromAuthJson(allocator, effective_auth_json);
     defer if (api_key) |key| allocator.free(key);
     if (api_key) |key| {
-        return fetchLegacyCreditsFromApiKey(allocator, key, checked_at);
+        return .{ .credits = try fetchLegacyCreditsFromApiKey(allocator, key, checked_at) };
     }
 
-    return makeCreditsInfo(allocator, checked_at, .unavailable, "No access token available for this account.");
+    return .{ .credits = try makeCreditsInfo(allocator, checked_at, .unavailable, "No access token available for this account.") };
 }
 
 // Fetches fetch email from open ai api.
@@ -2029,7 +2134,11 @@ fn fetchEmailFromOpenAiApi(allocator: std.mem.Allocator, access_token: []const u
 
 // Account matches identity.
 fn accountMatchesIdentity(account: *const ManagedAccount, account_id: ?[]const u8, email: ?[]const u8) bool {
-    if (account_id != null and account.account_id != null and std.mem.eql(u8, account_id.?, account.account_id.?)) return true;
+    if (account_id != null) {
+        const stored_account_id = extractAccountIdFromAuthJson(std.heap.page_allocator, account.auth_json);
+        defer if (stored_account_id) |value| std.heap.page_allocator.free(value);
+        if (stored_account_id != null and std.mem.eql(u8, account_id.?, stored_account_id.?)) return true;
+    }
     if (email != null and account.email != null and std.mem.eql(u8, email.?, account.email.?)) return true;
     return false;
 }
@@ -2045,7 +2154,6 @@ fn upsertAccountFromAuth(
     allocator: std.mem.Allocator,
     store: *StoreState,
     auth_json: []const u8,
-    label: ?[]const u8,
     set_active: bool,
 ) ![]const u8 {
     const account_id = extractAccountIdFromAuthJson(allocator, auth_json);
@@ -2063,14 +2171,8 @@ fn upsertAccountFromAuth(
 
     if (existing_index) |idx| {
         var account = &store.accounts.items[idx];
-        if (account.account_id) |value| allocator.free(value);
-        account.account_id = if (account_id) |value| try allocator.dupe(u8, value) else null;
         if (account.email) |value| allocator.free(value);
         account.email = if (email) |value| try allocator.dupe(u8, value) else null;
-        if (label) |new_label| {
-            if (account.label) |value| allocator.free(value);
-            account.label = try allocator.dupe(u8, new_label);
-        }
         allocator.free(account.auth_json);
         account.auth_json = try allocator.dupe(u8, auth_json);
         account.archived = false;
@@ -2084,8 +2186,6 @@ fn upsertAccountFromAuth(
 
     var account = ManagedAccount{
         .id = try generateAccountId(allocator),
-        .label = if (label) |value| try allocator.dupe(u8, value) else null,
-        .account_id = if (account_id) |value| try allocator.dupe(u8, value) else null,
         .email = if (email) |value| try allocator.dupe(u8, value) else null,
         .archived = false,
         .frozen = false,
@@ -2258,9 +2358,7 @@ fn handleRemoveAccountCommand(allocator: std.mem.Allocator, account_id_raw: []co
 }
 
 // Handles handle import current account command.
-fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[]const u8) ![]u8 {
-    const normalized_label = trimOptionalString(label_raw);
-
+fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator) ![]u8 {
     lockIoMutex(&managed_files_mutex);
     defer unlockIoMutex(&managed_files_mutex);
 
@@ -2272,7 +2370,7 @@ fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[
     };
     defer allocator.free(auth_json);
 
-    _ = try upsertAccountFromAuth(allocator, &state.store, auth_json, normalized_label, true);
+    _ = try upsertAccountFromAuth(allocator, &state.store, auth_json, true);
     try persistStateFilesOnly(allocator, &state);
     const view_json = try buildAccountsViewJson(allocator, &state);
     defer allocator.free(view_json);
@@ -2280,9 +2378,8 @@ fn handleImportCurrentAccountCommand(allocator: std.mem.Allocator, label_raw: ?[
 }
 
 // Handles handle login with api key command.
-fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []const u8, label_raw: ?[]const u8) ![]u8 {
+fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []const u8) ![]u8 {
     const api_key = trimOptionalString(api_key_raw) orelse return jsonError(allocator, "login_with_api_key requires apiKey");
-    const label = trimOptionalString(label_raw);
 
     const auth_json = try std.fmt.allocPrint(allocator, "{{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":{f}}}", .{
         std.json.fmt(api_key, .{}),
@@ -2296,7 +2393,7 @@ fn handleLoginWithApiKeyCommand(allocator: std.mem.Allocator, api_key_raw: []con
     defer state.deinit(allocator);
 
     try writeCodexAuthPath(allocator, state.paths.codexAuthPath, auth_json);
-    _ = try upsertAccountFromAuth(allocator, &state.store, auth_json, label, true);
+    _ = try upsertAccountFromAuth(allocator, &state.store, auth_json, true);
 
     try persistStateFilesOnly(allocator, &state);
     const view_json = try buildAccountsViewJson(allocator, &state);
@@ -2373,10 +2470,17 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
         const idx = accountIndex(&state.store, account_id) orelse return;
         const account = state.store.accounts.items[idx];
         auth_json_copy = allocator.dupe(u8, account.auth_json) catch return;
-        if (account.account_id) |value| {
-            account_id_hint = allocator.dupe(u8, value) catch return;
-        }
+        account_id_hint = extractAccountIdFromAuthJson(allocator, account.auth_json);
         needs_email_backfill = account.email == null;
+    }
+
+    var fetch_result = fetchCreditsFromAuthJson(allocator, auth_json_copy.?, account_id_hint) catch return;
+
+    const auth_json_was_refreshed = fetch_result.updated_auth_json != null;
+    if (fetch_result.updated_auth_json) |updated_auth_json| {
+        if (auth_json_copy) |old_auth_json| allocator.free(old_auth_json);
+        auth_json_copy = updated_auth_json;
+        fetch_result.updated_auth_json = null;
     }
 
     if (needs_email_backfill) {
@@ -2387,7 +2491,7 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
         }
     }
 
-    var refreshed_credits = fetchCreditsFromAuthJson(allocator, auth_json_copy.?, account_id_hint) catch return;
+    var refreshed_credits = fetch_result.credits;
     errdefer refreshed_credits.deinit(allocator);
 
     lockIoMutex(&managed_files_mutex);
@@ -2397,10 +2501,32 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     defer state.deinit(allocator);
     const account_idx = accountIndex(&state.store, account_id) orelse return;
 
-    if (fetched_email) |email| {
+    {
         const account = &state.store.accounts.items[account_idx];
-        if (account.email == null) {
-            account.email = allocator.dupe(u8, email) catch return;
+
+        if (auth_json_was_refreshed) {
+            allocator.free(account.auth_json);
+            account.auth_json = allocator.dupe(u8, auth_json_copy.?) catch return;
+
+            const refreshed_email = extractEmailFromAuthJson(allocator, auth_json_copy.?);
+            if (refreshed_email) |email| {
+                if (account.email) |value| allocator.free(value);
+                account.email = email;
+            } else if (fetched_email) |email| {
+                if (account.email == null) {
+                    account.email = allocator.dupe(u8, email) catch return;
+                }
+            }
+
+            if (state.store.active_account_id) |active_id| {
+                if (std.mem.eql(u8, active_id, account.id)) {
+                    writeCodexAuthPath(allocator, state.paths.codexAuthPath, account.auth_json) catch return;
+                }
+            }
+        } else if (fetched_email) |email| {
+            if (account.email == null) {
+                account.email = allocator.dupe(u8, email) catch return;
+            }
         }
     }
 
@@ -2627,7 +2753,6 @@ const OAuthThreadArgs = struct {
     redirect_uri: []u8,
     oauth_state: []u8,
     code_verifier: ?[]u8 = null,
-    label: ?[]u8 = null,
 
     // Initializes and returns this value.
     fn init(
@@ -2636,7 +2761,6 @@ const OAuthThreadArgs = struct {
         redirect_uri: []const u8,
         oauth_state: []const u8,
         code_verifier: ?[]const u8,
-        label: ?[]const u8,
         timeout_seconds: u64,
         external_cancel: *std.atomic.Value(bool),
     ) !OAuthThreadArgs {
@@ -2653,8 +2777,6 @@ const OAuthThreadArgs = struct {
         else
             null;
         errdefer if (code_verifier_copy) |value| std.heap.page_allocator.free(value);
-        const label_copy = if (label) |value| try std.heap.page_allocator.dupe(u8, value) else null;
-        errdefer if (label_copy) |value| std.heap.page_allocator.free(value);
 
         return .{
             .timeout_seconds = timeout_seconds,
@@ -2664,7 +2786,6 @@ const OAuthThreadArgs = struct {
             .redirect_uri = redirect_uri_copy,
             .oauth_state = oauth_state_copy,
             .code_verifier = code_verifier_copy,
-            .label = label_copy,
         };
     }
 
@@ -2675,9 +2796,6 @@ const OAuthThreadArgs = struct {
         std.heap.page_allocator.free(self.redirect_uri);
         std.heap.page_allocator.free(self.oauth_state);
         if (self.code_verifier) |value| {
-            std.heap.page_allocator.free(value);
-        }
-        if (self.label) |value| {
             std.heap.page_allocator.free(value);
         }
     }
@@ -2693,6 +2811,18 @@ const OAuthTokenPair = struct {
         allocator.free(self.id_token);
         allocator.free(self.access_token);
         allocator.free(self.refresh_token);
+    }
+};
+
+const OAuthRefreshTokenResult = struct {
+    id_token: ?[]u8 = null,
+    access_token: []u8,
+    refresh_token: ?[]u8 = null,
+
+    fn deinit(self: *OAuthRefreshTokenResult, allocator: std.mem.Allocator) void {
+        if (self.id_token) |value| allocator.free(value);
+        allocator.free(self.access_token);
+        if (self.refresh_token) |value| allocator.free(value);
     }
 };
 
@@ -2910,11 +3040,128 @@ fn exchangeApiKeyFromIdToken(
     return try allocator.dupe(u8, access_token.?);
 }
 
+// Exchange refreshed oauth tokens from refresh token.
+fn exchangeRefreshTokenForTokens(
+    allocator: std.mem.Allocator,
+    issuer: []const u8,
+    client_id: []const u8,
+    refresh_token: []const u8,
+) !OAuthRefreshTokenResult {
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}/oauth/token", .{issuer});
+    defer allocator.free(endpoint);
+
+    var body_buf = std.ArrayList(u8).empty;
+    defer body_buf.deinit(allocator);
+
+    try appendFormField(allocator, &body_buf, "grant_type", "refresh_token");
+    try appendFormField(allocator, &body_buf, "refresh_token", refresh_token);
+    try appendFormField(allocator, &body_buf, "client_id", client_id);
+
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+    };
+
+    const response = try httpFetchWithoutUserAgent(allocator, .POST, endpoint, &headers, body_buf.items);
+    defer allocator.free(response.body);
+    if (response.status < 200 or response.status >= 300) {
+        return error.RefreshTokenExchangeFailed;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch return error.RefreshTokenExchangeFailed;
+    defer parsed.deinit();
+    const payload = jsonGetObject(parsed.value) orelse return error.RefreshTokenExchangeFailed;
+
+    const access_token = if (payload.get("access_token")) |value| jsonGetString(value) else null;
+    if (access_token == null) return error.RefreshTokenExchangeFailed;
+
+    const id_token = if (payload.get("id_token")) |value| jsonGetString(value) else null;
+    const next_refresh_token = if (payload.get("refresh_token")) |value| jsonGetString(value) else null;
+
+    return .{
+        .id_token = if (id_token) |value| try allocator.dupe(u8, value) else null,
+        .access_token = try allocator.dupe(u8, access_token.?),
+        .refresh_token = if (next_refresh_token) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+// Returns whether a usage response indicates the saved access token is expired.
+fn usageResponseHasExpiredAccessToken(allocator: std.mem.Allocator, status: u16, body: []const u8) bool {
+    if (status != 401) return false;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+
+    const root = jsonGetObject(parsed.value) orelse return false;
+    const error_value = root.get("error") orelse return false;
+    const error_obj = jsonGetObject(error_value) orelse return false;
+    const code_value = error_obj.get("code") orelse return false;
+    const code = jsonGetString(code_value) orelse return false;
+    return std.mem.eql(u8, code, "token_expired");
+}
+
+// Refreshes a saved ChatGPT auth payload using its refresh token.
+fn refreshChatgptAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) !?[]u8 {
+    const saved_refresh_token = extractRefreshTokenFromAuthJson(allocator, auth_json) orelse return null;
+    defer allocator.free(saved_refresh_token);
+
+    const saved_id_token = extractIdTokenFromAuthJson(allocator, auth_json);
+    defer if (saved_id_token) |value| allocator.free(value);
+
+    const saved_api_key = extractApiKeyFromAuthJson(allocator, auth_json);
+    defer if (saved_api_key) |value| allocator.free(value);
+
+    const saved_issuer = extractOauthIssuerFromAuthJson(allocator, auth_json);
+    defer if (saved_issuer) |value| allocator.free(value);
+    const issuer = saved_issuer orelse CODEX_OAUTH_ISSUER;
+
+    const saved_client_id = extractOauthClientIdFromAuthJson(allocator, auth_json);
+    defer if (saved_client_id) |value| allocator.free(value);
+    const client_id = saved_client_id orelse CODEX_OAUTH_CLIENT_ID;
+
+    const saved_redirect_uri = extractOauthRedirectUriFromAuthJson(allocator, auth_json);
+    defer if (saved_redirect_uri) |value| allocator.free(value);
+    const redirect_uri = saved_redirect_uri orelse CODEX_OAUTH_REDIRECT_URI;
+
+    var refreshed = exchangeRefreshTokenForTokens(allocator, issuer, client_id, saved_refresh_token) catch return null;
+    defer refreshed.deinit(allocator);
+
+    const next_id_token = refreshed.id_token orelse saved_id_token orelse return null;
+    const next_refresh_token = refreshed.refresh_token orelse saved_refresh_token;
+
+    var next_api_key = if (saved_api_key) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    defer if (next_api_key) |value| allocator.free(value);
+
+    if (next_api_key == null and refreshed.id_token != null) {
+        next_api_key = exchangeApiKeyFromIdToken(allocator, issuer, client_id, refreshed.id_token.?) catch null;
+    }
+
+    const next_tokens = OAuthTokenPair{
+        .id_token = @constCast(next_id_token),
+        .access_token = refreshed.access_token,
+        .refresh_token = @constCast(next_refresh_token),
+    };
+
+    return try buildChatgptAuthPayloadJson(
+        allocator,
+        &next_tokens,
+        next_api_key,
+        issuer,
+        client_id,
+        redirect_uri,
+    );
+}
+
 // Builds build chatgpt auth payload json.
 fn buildChatgptAuthPayloadJson(
     allocator: std.mem.Allocator,
     tokens: *const OAuthTokenPair,
     api_key: ?[]const u8,
+    issuer: ?[]const u8,
+    client_id: ?[]const u8,
+    redirect_uri: ?[]const u8,
 ) ![]u8 {
     const account_id = extractAccountIdFromIdToken(allocator, tokens.id_token);
     defer if (account_id) |value| allocator.free(value);
@@ -2941,6 +3188,13 @@ fn buildChatgptAuthPayloadJson(
         try writer.writeAll(",\"OPENAI_API_KEY\":");
         try writeJsonString(writer, value);
     }
+
+    try writer.writeAll(",\"oauth_issuer\":");
+    try writeJsonString(writer, issuer orelse CODEX_OAUTH_ISSUER);
+    try writer.writeAll(",\"oauth_client_id\":");
+    try writeJsonString(writer, client_id orelse CODEX_OAUTH_CLIENT_ID);
+    try writer.writeAll(",\"oauth_redirect_uri\":");
+    try writeJsonString(writer, redirect_uri orelse CODEX_OAUTH_REDIRECT_URI);
 
     try writer.writeByte('}');
     return out.toOwnedSlice();
@@ -3007,7 +3261,14 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
     );
     defer if (api_key) |value| allocator.free(value);
 
-    const auth_json = try buildChatgptAuthPayloadJson(allocator, &tokens, api_key);
+    const auth_json = try buildChatgptAuthPayloadJson(
+        allocator,
+        &tokens,
+        api_key,
+        args.issuer,
+        args.client_id,
+        args.redirect_uri,
+    );
     defer allocator.free(auth_json);
 
     const existing_email = extractEmailFromAuthJson(allocator, auth_json);
@@ -3025,7 +3286,7 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
     defer state.deinit(allocator);
 
     try writeCodexAuthPath(allocator, state.paths.codexAuthPath, auth_json);
-    const managed_account_id = try upsertAccountFromAuth(allocator, &state.store, auth_json, args.label, true);
+    const managed_account_id = try upsertAccountFromAuth(allocator, &state.store, auth_json, true);
     const account_idx = accountIndex(&state.store, managed_account_id) orelse return error.AccountNotFound;
     var managed_account = &state.store.accounts.items[account_idx];
 
@@ -3037,7 +3298,6 @@ fn completeOAuthLoginFromCallback(allocator: std.mem.Allocator, args: *const OAu
 
     return .{
         .id = try allocator.dupe(u8, managed_account.id),
-        .accountId = if (managed_account.account_id) |value| try allocator.dupe(u8, value) else null,
         .email = if (managed_account.email) |value| try allocator.dupe(u8, value) else null,
         .state = accountStateString(managed_account),
     };
@@ -3052,7 +3312,6 @@ fn startOAuthCallbackListener(
     redirect_uri: []const u8,
     oauth_state: []const u8,
     code_verifier: ?[]const u8,
-    label: ?[]const u8,
 ) !void {
     lockIoMutex(&oauth_listener_state.mutex);
     defer unlockIoMutex(&oauth_listener_state.mutex);
@@ -3075,7 +3334,6 @@ fn startOAuthCallbackListener(
         redirect_uri,
         oauth_state,
         code_verifier,
-        label,
         timeout_seconds,
         external_cancel,
     );
@@ -3100,11 +3358,6 @@ fn pollOAuthCallbackListener(allocator: std.mem.Allocator) !OAuthPollResult {
     if (oauth_listener_state.ready_account) |account| {
         const id_copy = try allocator.dupe(u8, account.id);
         errdefer allocator.free(id_copy);
-        const account_id_copy = if (account.accountId) |value|
-            try allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (account_id_copy) |value| allocator.free(value);
         const email_copy = if (account.email) |value|
             try allocator.dupe(u8, value)
         else
@@ -3115,7 +3368,6 @@ fn pollOAuthCallbackListener(allocator: std.mem.Allocator) !OAuthPollResult {
             .status = "ready",
             .account = .{
                 .id = id_copy,
-                .accountId = account_id_copy,
                 .email = email_copy,
                 .state = account.state,
             },
@@ -3645,6 +3897,66 @@ test "parseOAuthCallbackQuery accepts authorization code callback" {
     try std.testing.expect(parsed.state != null);
     try std.testing.expectEqualStrings("xyz", parsed.state.?);
     try std.testing.expect(parsed.auth_error == null);
+}
+
+test "usageResponseHasExpiredAccessToken detects token_expired backend payloads" {
+    const body =
+        \\{
+        \\  "error": {
+        \\    "message": "Provided authentication token is expired. Please try signing in again.",
+        \\    "type": null,
+        \\    "code": "token_expired",
+        \\    "param": null
+        \\  },
+        \\  "status": 401
+        \\}
+    ;
+    try std.testing.expect(usageResponseHasExpiredAccessToken(std.testing.allocator, 401, body));
+    try std.testing.expect(!usageResponseHasExpiredAccessToken(std.testing.allocator, 400, body));
+}
+
+test "usageResponseHasExpiredAccessToken ignores unrelated backend payloads" {
+    const body =
+        \\{
+        \\  "error": {
+        \\    "message": "Unauthorized",
+        \\    "code": "not_authorized"
+        \\  }
+        \\}
+    ;
+    try std.testing.expect(!usageResponseHasExpiredAccessToken(std.testing.allocator, 401, body));
+    try std.testing.expect(!usageResponseHasExpiredAccessToken(std.testing.allocator, 401, "not-json"));
+}
+
+test "buildChatgptAuthPayloadJson stores oauth refresh metadata" {
+    var tokens = OAuthTokenPair{
+        .id_token = try std.testing.allocator.dupe(u8, "header.payload.signature"),
+        .access_token = try std.testing.allocator.dupe(u8, "access-token"),
+        .refresh_token = try std.testing.allocator.dupe(u8, "refresh-token"),
+    };
+    defer tokens.deinit(std.testing.allocator);
+
+    const auth_json = try buildChatgptAuthPayloadJson(
+        std.testing.allocator,
+        &tokens,
+        "sk-test",
+        "https://auth.openai.com",
+        "app_test",
+        "http://localhost:1455/auth/callback",
+    );
+    defer std.testing.allocator.free(auth_json);
+
+    const issuer = extractOauthIssuerFromAuthJson(std.testing.allocator, auth_json) orelse return error.ExpectedIssuer;
+    defer std.testing.allocator.free(issuer);
+    try std.testing.expectEqualStrings("https://auth.openai.com", issuer);
+
+    const client_id = extractOauthClientIdFromAuthJson(std.testing.allocator, auth_json) orelse return error.ExpectedClientId;
+    defer std.testing.allocator.free(client_id);
+    try std.testing.expectEqualStrings("app_test", client_id);
+
+    const redirect_uri = extractOauthRedirectUriFromAuthJson(std.testing.allocator, auth_json) orelse return error.ExpectedRedirectUri;
+    defer std.testing.allocator.free(redirect_uri);
+    try std.testing.expectEqualStrings("http://localhost:1455/auth/callback", redirect_uri);
 }
 
 test "formatIso8601UtcMillis renders UTC timestamp with milliseconds" {

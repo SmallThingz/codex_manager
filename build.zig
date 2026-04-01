@@ -334,6 +334,14 @@ pub fn build(b: *std.Build) void {
     }
     dev_step.dependOn(&run_cmd.step);
 
+    const run_step = b.step("run", "Build frontend and run Codex Manager without gdb");
+    const plain_run_cmd = b.addSystemCommand(&.{installed_exe_path});
+    plain_run_cmd.step.dependOn(&install_artifact.step);
+    if (b.args) |args| {
+        plain_run_cmd.addArgs(args);
+    }
+    run_step.dependOn(&plain_run_cmd.step);
+
     const backend_tests = b.addTest(.{
         .root_module = b.createModule(.{
             // Keep package root at repo root so @embedFile("../frontend/...") used by
