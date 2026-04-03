@@ -7,10 +7,24 @@ const rpc = @import("rpc.zig");
 
 const DEFAULT_WIDTH: u32 = 1000;
 const DEFAULT_HEIGHT: u32 = 760;
+const HELP_TEXT =
+    \\Usage: codex-manager [options]
+    \\
+    \\Launch modes:
+    \\  -t, --tab      Open Codex Manager in a browser tab (default)
+    \\  -u, --url      Serve the URL only; do not open a browser
+    \\  -b, --browser  Open Codex Manager in a browser app window
+    \\  -w, --webview  Open Codex Manager in the native webview
+    \\
+    \\Help:
+    \\  -h, --help     Show this help text
+    \\
+;
 
 const LaunchRequest = struct {
     surfaces: [3]?webui.LaunchSurface = .{ null, null, null },
     len: usize = 0,
+    browser_auto_open: bool = true,
 
     /// Appends a launch surface once while preserving the user-specified order.
     fn append(self: *LaunchRequest, surface: webui.LaunchSurface) void {
@@ -41,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     embedded_index.setEnvironMap(init.environ_map);
     rpc_webui.setEnvironMap(init.environ_map);
-    const launch_request = try parseLaunchRequest(init.minimal.args, allocator);
+    const launch_request = (try parseLaunchRequest(init.minimal.args, allocator)) orelse return;
     rpc_webui.setCancelPointer(&oauth_listener_cancel);
 
     const window_style: webui.WindowStyle = .{
@@ -55,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Parses CLI launch flags into an ordered surface preference list for webui.
-fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !LaunchRequest {
+fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !?LaunchRequest {
     var request: LaunchRequest = .{};
     var arg_it = try std.process.Args.Iterator.initAllocator(args, allocator);
     defer arg_it.deinit();
@@ -63,6 +77,10 @@ fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !Lau
     _ = arg_it.next();
     while (arg_it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printHelp();
+            return null;
+        }
         if (std.mem.eql(u8, arg, "--webview") or std.mem.eql(u8, arg, "-w")) {
             request.append(.native_webview);
             continue;
@@ -71,13 +89,19 @@ fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !Lau
             request.append(.browser_window);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--web") or std.mem.eql(u8, arg, "-u")) {
+        if (std.mem.eql(u8, arg, "--tab") or std.mem.eql(u8, arg, "-t")) {
             request.append(.web_url);
+            request.browser_auto_open = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--url") or std.mem.eql(u8, arg, "-u")) {
+            request.append(.web_url);
+            request.browser_auto_open = false;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print(
-                "Unsupported flag: {s}. Supported launch flags: --webview/-w --browser/-b --web/-u\n",
+                "Unsupported flag: {s}. Use --help for supported options.\n",
                 .{arg},
             );
             return error.InvalidLaunchFlag;
@@ -85,12 +109,16 @@ fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !Lau
     }
 
     if (request.len == 0) {
-        request.append(.native_webview);
-        request.append(.browser_window);
         request.append(.web_url);
+        request.browser_auto_open = true;
     }
 
     return request;
+}
+
+/// Prints the command-line help text.
+fn printHelp() void {
+    std.debug.print(HELP_TEXT, .{});
 }
 
 /// Creates the webui service with the requested launch policy and keeps it alive until shutdown.
@@ -117,7 +145,7 @@ fn runModeService(
             .browser_window => .app_window,
             .web_url => .tab,
         },
-        .auto_open = first_surface != .web_url,
+        .auto_open = if (first_surface == .web_url) launch_request.browser_auto_open else true,
         .fallback_mode = if (strict_native_only)
             .strict
         else
