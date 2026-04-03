@@ -11,7 +11,7 @@ const LaunchRequest = struct {
     surfaces: [3]?webui.LaunchSurface = .{ null, null, null },
     len: usize = 0,
 
-    // Append.
+    /// Appends a launch surface once while preserving the user-specified order.
     fn append(self: *LaunchRequest, surface: webui.LaunchSurface) void {
         if (self.contains(surface)) return;
         if (self.len >= self.surfaces.len) return;
@@ -19,7 +19,7 @@ const LaunchRequest = struct {
         self.len += 1;
     }
 
-    // Contains.
+    /// Returns whether the request already includes the given launch surface.
     fn contains(self: *const LaunchRequest, surface: webui.LaunchSurface) bool {
         for (self.surfaces[0..self.len]) |entry| {
             if (entry == surface) return true;
@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
     try runModeService(allocator, init.io, live_index_path, window_style, launch_request);
 }
 
-// Parses parse launch request.
+/// Parses CLI launch flags into an ordered surface preference list for webui.
 fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !LaunchRequest {
     var request: LaunchRequest = .{};
     var arg_it = try std.process.Args.Iterator.initAllocator(args, allocator);
@@ -88,7 +88,7 @@ fn parseLaunchRequest(args: std.process.Args, allocator: std.mem.Allocator) !Lau
     return request;
 }
 
-// Runs run mode service.
+/// Creates the webui service with the requested launch policy and keeps it alive until shutdown.
 fn runModeService(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -165,7 +165,7 @@ fn runModeService(
     service.shutdown();
 }
 
-// Ensure native webview available.
+/// Rejects explicit native-only launches when the runtime can only fall back to another surface.
 fn ensureNativeWebviewAvailable(service: *webui.Service, allocator: std.mem.Allocator) !void {
     const capabilities = service.probeCapabilities();
     if (capabilities.surface_if_shown != .native_webview or capabilities.fallback_expected) {
@@ -183,7 +183,7 @@ fn ensureNativeWebviewAvailable(service: *webui.Service, allocator: std.mem.Allo
     try logMissingNativeRequirements(service, allocator);
 }
 
-// Log missing native requirements.
+/// Logs missing native runtime requirements and fails if any required dependency is unavailable.
 fn logMissingNativeRequirements(service: *webui.Service, allocator: std.mem.Allocator) !void {
     const requirements = try service.listRuntimeRequirements(allocator);
     defer allocator.free(requirements);

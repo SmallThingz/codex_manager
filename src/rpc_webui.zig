@@ -39,7 +39,7 @@ var bridge_cancel_ptr: ?*std.atomic.Value(bool) = null;
 threadlocal var bridge_response_storage: [8 * 1024 * 1024]u8 = undefined;
 threadlocal var bridge_response_len: usize = 0;
 
-/// Registers the cancellation flag shared with the OAuth callback listener.
+/// Registers the cancellation flag shared with the OAuth callback listener thread.
 pub fn setCancelPointer(cancel_ptr: *std.atomic.Value(bool)) void {
     bridge_cancel_ptr = cancel_ptr;
 }

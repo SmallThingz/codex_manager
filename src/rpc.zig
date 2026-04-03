@@ -365,26 +365,6 @@ const AppState = struct {
 /// The caller is responsible for freeing the returned slice. Cancellation-sensitive flows such as
 /// the OAuth callback listener use `cancel_ptr` to coordinate stop requests across threads.
 pub fn handleRpcRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
-    return rpcHandleRequest(allocator, request, cancel_ptr);
-}
-
-// Json error.
-fn jsonError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .@"error" = message }, .{})});
-}
-
-// Json ok.
-fn jsonOk(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
-}
-
-// Json ok raw.
-fn jsonOkRaw(allocator: std.mem.Allocator, raw_value: []const u8) ![]u8 {
-    return allocator.dupe(u8, raw_value);
-}
-
-// Rpc handle request.
-fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_ptr: *std.atomic.Value(bool)) ![]u8 {
     if (std.mem.eql(u8, request.op, "shell:open_url")) {
         const url = request.url orelse return jsonError(allocator, "open_url requires url");
         openUrl(url, allocator) catch |err| {
@@ -488,13 +468,22 @@ fn rpcHandleRequest(allocator: std.mem.Allocator, request: RpcRequest, cancel_pt
     return jsonError(allocator, "unknown RPC op");
 }
 
-// Path exists.
-fn pathExists(path: []const u8) bool {
-    std.Io.Dir.accessAbsolute(process_io, path, .{}) catch return false;
-    return true;
+/// Serializes a JSON RPC error object.
+fn jsonError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{ .@"error" = message }, .{})});
 }
 
-// Returns get env var owned compat.
+/// Serializes a successful RPC result using normal JSON formatting.
+fn jsonOk(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
+}
+
+/// Returns an already-serialized JSON payload without re-encoding it.
+fn jsonOkRaw(allocator: std.mem.Allocator, raw_value: []const u8) ![]u8 {
+    return allocator.dupe(u8, raw_value);
+}
+
+/// Reads an environment variable into owned memory across libc and no-libc targets.
 fn getEnvVarOwnedCompat(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
     if (process_environ_map) |environ_map| {
         if (environ_map.get(key)) |value| {
@@ -517,16 +506,7 @@ fn getEnvVarOwnedCompat(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
     return error.EnvironmentVariableNotFound;
 }
 
-// Returns get home dir.
-fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
-    if (builtin.os.tag == .windows) {
-        return getEnvVarOwnedCompat(allocator, "USERPROFILE");
-    }
-
-    return getEnvVarOwnedCompat(allocator, "HOME");
-}
-
-// Returns get app local data dir.
+/// Resolves the per-user application data directory used by the account store and UI snapshot.
 fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     if (builtin.os.tag == .windows) {
         const appdata = try getEnvVarOwnedCompat(allocator, "APPDATA");
@@ -534,7 +514,7 @@ fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
         return std.fs.path.join(allocator, &.{ appdata, APP_ID });
     }
 
-    const home = try getHomeDir(allocator);
+    const home = try getEnvVarOwnedCompat(allocator, "HOME");
     defer allocator.free(home);
 
     if (builtin.os.tag == .macos) {
@@ -544,9 +524,12 @@ fn getAppLocalDataDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".local", "share", APP_ID });
 }
 
-// Returns get managed paths.
+/// Builds the canonical on-disk paths used by the manager and Codex auth integration.
 fn getManagedPaths(allocator: std.mem.Allocator) !ManagedPaths {
-    const home = try getHomeDir(allocator);
+    const home = try getEnvVarOwnedCompat(
+        allocator,
+        if (builtin.os.tag == .windows) "USERPROFILE" else "HOME",
+    );
     defer allocator.free(home);
 
     const codex_home = try std.fs.path.join(allocator, &.{ home, CODEX_DIR });
@@ -573,21 +556,16 @@ fn getManagedPaths(allocator: std.mem.Allocator) !ManagedPaths {
     };
 }
 
-// Reads read optional text file.
+/// Reads a text file if it exists, otherwise returns `null`.
 fn readOptionalTextFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    if (!pathExists(path)) {
+    std.Io.Dir.accessAbsolute(process_io, path, .{}) catch {
         return null;
-    }
-    const text = try readTextFile(allocator, path);
+    };
+    const text = try std.Io.Dir.cwd().readFileAlloc(process_io, path, allocator, .limited(16 * 1024 * 1024));
     return text;
 }
 
-// Reads read text file.
-fn readTextFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(process_io, path, allocator, .limited(16 * 1024 * 1024));
-}
-
-// Writes write text file atomic.
+/// Writes a file by replacing it atomically so readers never observe partial state.
 fn writeTextFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         try std.Io.Dir.cwd().createDirPath(process_io, parent);
@@ -612,12 +590,12 @@ fn deleteFileIfExists(path: []const u8) !void {
     };
 }
 
-// Now epoch seconds.
+/// Returns the current wall-clock time in whole UTC seconds.
 fn nowEpochSeconds() i64 {
     return @divFloor(nowMilliseconds(), 1000);
 }
 
-// Trims trim optional string.
+/// Trims an optional string and treats empty results as `null`.
 fn trimOptionalString(value: ?[]const u8) ?[]const u8 {
     const raw = value orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \r\n\t");
@@ -625,7 +603,7 @@ fn trimOptionalString(value: ?[]const u8) ?[]const u8 {
     return trimmed;
 }
 
-// Normalizes normalize auto refresh interval sec.
+/// Clamps the active-account auto-refresh interval into the supported range.
 fn normalizeAutoRefreshIntervalSec(value: ?u64) u64 {
     const raw = value orelse AUTO_REFRESH_ACTIVE_DEFAULT_INTERVAL_SEC;
     if (raw < AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC) return AUTO_REFRESH_ACTIVE_MIN_INTERVAL_SEC;
@@ -633,7 +611,7 @@ fn normalizeAutoRefreshIntervalSec(value: ?u64) u64 {
     return raw;
 }
 
-// Json get object.
+/// Returns an object map only when the JSON value is an object.
 fn jsonGetObject(value: std.json.Value) ?std.json.ObjectMap {
     return switch (value) {
         .object => |object| object,
@@ -641,7 +619,7 @@ fn jsonGetObject(value: std.json.Value) ?std.json.ObjectMap {
     };
 }
 
-// Json get array.
+/// Returns an array only when the JSON value is an array.
 fn jsonGetArray(value: std.json.Value) ?std.json.Array {
     return switch (value) {
         .array => |array| array,
@@ -649,7 +627,7 @@ fn jsonGetArray(value: std.json.Value) ?std.json.Array {
     };
 }
 
-// Json get string.
+/// Returns a non-empty trimmed JSON string value.
 fn jsonGetString(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |s| if (std.mem.trim(u8, s, " \r\n\t").len > 0) s else null,
@@ -657,7 +635,7 @@ fn jsonGetString(value: std.json.Value) ?[]const u8 {
     };
 }
 
-// Json get bool.
+/// Coerces a JSON scalar into a boolean using the backend's accepted representations.
 fn jsonGetBool(value: std.json.Value) ?bool {
     return switch (value) {
         .bool => |b| b,
@@ -673,7 +651,7 @@ fn jsonGetBool(value: std.json.Value) ?bool {
     };
 }
 
-// Json get f64.
+/// Coerces a JSON scalar into a finite `f64` when possible.
 fn jsonGetF64(value: std.json.Value) ?f64 {
     const parsed: ?f64 = switch (value) {
         .float => |n| n,
@@ -686,7 +664,7 @@ fn jsonGetF64(value: std.json.Value) ?f64 {
     return parsed;
 }
 
-// Json get i64.
+/// Coerces a JSON scalar into an `i64` when possible.
 fn jsonGetI64(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |n| n,
@@ -696,13 +674,7 @@ fn jsonGetI64(value: std.json.Value) ?i64 {
     };
 }
 
-// Dup maybe string.
-fn dupMaybeString(allocator: std.mem.Allocator, input: ?[]const u8) !?[]u8 {
-    const value = input orelse return null;
-    return try allocator.dupe(u8, value);
-}
-
-// Parses parse account bucket.
+/// Parses the bucket name used by the UI drag/drop account ordering commands.
 fn parseAccountBucket(value: []const u8) ?AccountBucket {
     if (std.mem.eql(u8, value, "active")) return .active;
     if (std.mem.eql(u8, value, "depleted")) return .depleted;
@@ -710,46 +682,12 @@ fn parseAccountBucket(value: []const u8) ?AccountBucket {
     return null;
 }
 
-// Credits source string.
-fn creditsSourceString(value: CreditsSource) []const u8 {
-    return switch (value) {
-        .wham_usage => "wham_usage",
-        .legacy_credit_grants => "legacy_credit_grants",
-    };
-}
-
-// Credits mode string.
-fn creditsModeString(value: CreditsMode) []const u8 {
-    return switch (value) {
-        .balance => "balance",
-        .percent_fallback => "percent_fallback",
-        .legacy => "legacy",
-    };
-}
-
-// Credits unit string.
-fn creditsUnitString(value: CreditsUnit) []const u8 {
-    return switch (value) {
-        .USD => "USD",
-        .percent => "%",
-    };
-}
-
-// Credits status string.
-fn creditsStatusString(value: CreditsStatus) []const u8 {
-    return switch (value) {
-        .available => "available",
-        .unavailable => "unavailable",
-        .err => "error",
-    };
-}
-
-// Writes write json string.
+/// Writes a JSON string value to an already-open JSON writer.
 fn writeJsonString(writer: anytype, value: []const u8) !void {
     try writer.print("{f}", .{std.json.fmt(value, .{})});
 }
 
-// Writes write json optional string.
+/// Writes a nullable JSON string field.
 fn writeJsonOptionalString(writer: anytype, value: ?[]const u8) !void {
     if (value) |text| {
         try writeJsonString(writer, text);
@@ -758,16 +696,7 @@ fn writeJsonOptionalString(writer: anytype, value: ?[]const u8) !void {
     }
 }
 
-// Writes write json optional i64.
-fn writeJsonOptionalI64(writer: anytype, value: ?i64) !void {
-    if (value) |n| {
-        try writer.print("{}", .{n});
-    } else {
-        try writer.writeAll("null");
-    }
-}
-
-// Writes write json optional f64.
+/// Writes a nullable JSON floating-point field, filtering out non-finite values.
 fn writeJsonOptionalF64(writer: anytype, value: ?f64) !void {
     if (value) |n| {
         if (std.math.isFinite(n)) {
@@ -780,7 +709,7 @@ fn writeJsonOptionalF64(writer: anytype, value: ?f64) !void {
     }
 }
 
-// Writes write json bool.
+/// Writes a JSON boolean literal.
 fn writeJsonBool(writer: anytype, value: bool) !void {
     try writer.writeAll(if (value) "true" else "false");
 }
@@ -811,37 +740,7 @@ fn setRefreshInflight(account_id: []const u8, inflight: bool) !void {
     });
 }
 
-// Determines should debounce refresh.
-fn shouldDebounceRefresh(account_id: []const u8) bool {
-    lockIoMutex(&refresh_debounce_state);
-    defer unlockIoMutex(&refresh_debounce_state);
-
-    const now_ms = nowMilliseconds();
-    for (refresh_debounce_entries.items) |*entry| {
-        if (!std.mem.eql(u8, entry.account_id, account_id)) continue;
-        if (entry.inflight) return true;
-        if (entry.last_started_ms > 0 and now_ms - entry.last_started_ms < USAGE_FETCH_DEBOUNCE_MS) {
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-// Checks is refresh inflight.
-fn isRefreshInflight(account_id: []const u8) bool {
-    lockIoMutex(&refresh_debounce_state);
-    defer unlockIoMutex(&refresh_debounce_state);
-
-    for (refresh_debounce_entries.items) |entry| {
-        if (std.mem.eql(u8, entry.account_id, account_id)) {
-            return entry.inflight;
-        }
-    }
-    return false;
-}
-
-// Loads load store state.
+/// Loads the persisted account store from disk, tolerating missing or malformed files.
 fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreState {
     var store = StoreState{};
     errdefer store.deinit(allocator);
@@ -904,7 +803,7 @@ fn loadStoreState(allocator: std.mem.Allocator, store_path: []const u8) !StoreSt
     return store;
 }
 
-// Parses parse credits info.
+/// Parses a persisted credits snapshot from the bootstrap-state cache.
 fn parseCreditsInfo(allocator: std.mem.Allocator, value: std.json.Value) !?CreditsInfo {
     const obj = jsonGetObject(value) orelse return null;
 
@@ -928,7 +827,7 @@ fn parseCreditsInfo(allocator: std.mem.Allocator, value: std.json.Value) !?Credi
             break :blk .balance;
         } else .balance,
         .unit = if (unit) |unit_text| if (std.mem.eql(u8, unit_text, "%")) .percent else .USD else .USD,
-        .plan_type = try dupMaybeString(allocator, plan_type),
+        .plan_type = if (plan_type) |value_text| try allocator.dupe(u8, value_text) else null,
         .is_paid_plan = if (obj.get("isPaidPlan")) |v| jsonGetBool(v) orelse false else false,
         .hourly_remaining_percent = if (obj.get("hourlyRemainingPercent")) |v| jsonGetF64(v) else null,
         .weekly_remaining_percent = if (obj.get("weeklyRemainingPercent")) |v| jsonGetF64(v) else null,
@@ -1090,26 +989,13 @@ fn accountIndex(store: *const StoreState, account_id: []const u8) ?usize {
     return null;
 }
 
-// Returns the stored email for a managed account id.
+/// Returns the stored email for a managed account id.
 fn accountEmailById(store: *const StoreState, account_id: []const u8) ?[]const u8 {
     const idx = accountIndex(store, account_id) orelse return null;
     return store.accounts.items[idx].email;
 }
 
-// Account bucket.
-fn accountBucket(account: *const ManagedAccount) AccountBucket {
-    if (account.frozen) return .frozen;
-    if (account.archived) return .depleted;
-    return .active;
-}
-
-// Applies apply bucket.
-fn applyBucket(account: *ManagedAccount, bucket: AccountBucket) void {
-    account.archived = bucket == .depleted;
-    account.frozen = bucket == .frozen;
-}
-
-// Account state string.
+/// Returns the serialized account-state string consumed by the frontend.
 fn accountStateString(account: *const ManagedAccount) []const u8 {
     if (account.frozen) return "frozen";
     if (account.archived) return "archived";
@@ -1144,12 +1030,12 @@ fn sanitizeStoreActiveAccount(allocator: std.mem.Allocator, store: *StoreState) 
     }
 }
 
-// Loads load codex auth json.
+/// Loads Codex CLI's auth payload if it exists.
 fn loadCodexAuthJson(allocator: std.mem.Allocator, codex_auth_path: []const u8) !?[]u8 {
     return readOptionalTextFile(allocator, codex_auth_path);
 }
 
-// Writes write codex auth path.
+/// Rewrites Codex CLI's auth payload atomically.
 fn writeCodexAuthPath(allocator: std.mem.Allocator, codex_auth_path: []const u8, contents: []const u8) !void {
     try writeTextFileAtomic(allocator, codex_auth_path, contents);
 }
@@ -1290,7 +1176,7 @@ fn extractEmailFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?
     return null;
 }
 
-// Extracts extract account id from id token.
+/// Extracts the ChatGPT account id embedded in the OAuth ID token claims.
 fn extractAccountIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
     const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
     const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
@@ -1313,44 +1199,7 @@ fn extractAccountIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u
     return allocator.dupe(u8, account_id) catch null;
 }
 
-// Extracts extract organization id from id token.
-fn extractOrganizationIdFromIdToken(allocator: std.mem.Allocator, id_token: []const u8) ?[]u8 {
-    const first_dot = std.mem.indexOfScalar(u8, id_token, '.') orelse return null;
-    const second_dot = std.mem.indexOfScalarPos(u8, id_token, first_dot + 1, '.') orelse return null;
-    if (second_dot <= first_dot + 1) return null;
-
-    const payload_b64 = id_token[first_dot + 1 .. second_dot];
-    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeUpperBound(payload_b64.len) catch return null;
-    const decoded = allocator.alloc(u8, decoded_len) catch return null;
-    defer allocator.free(decoded);
-    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_b64) catch return null;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return null;
-    defer parsed.deinit();
-
-    const payload = jsonGetObject(parsed.value) orelse return null;
-    const auth_value = payload.get("https://api.openai.com/auth") orelse return null;
-    const auth = jsonGetObject(auth_value) orelse return null;
-
-    if (auth.get("organizations")) |organizations_value| {
-        const organizations = jsonGetArray(organizations_value) orelse return null;
-        if (organizations.items.len > 0) {
-            const first_org = jsonGetObject(organizations.items[0]) orelse return null;
-            const org_id_value = first_org.get("id") orelse return null;
-            const org_id = jsonGetString(org_id_value) orelse return null;
-            return allocator.dupe(u8, org_id) catch null;
-        }
-    }
-
-    if (auth.get("organization_id")) |org_id_value| {
-        const org_id = jsonGetString(org_id_value) orelse return null;
-        return allocator.dupe(u8, org_id) catch null;
-    }
-
-    return null;
-}
-
-// Extracts extract email from auth json.
+/// Extracts the account email from the persisted auth payload, preferring top-level fields.
 fn extractEmailFromAuthJson(allocator: std.mem.Allocator, auth_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, auth_json, .{}) catch return null;
     defer parsed.deinit();
@@ -1417,7 +1266,7 @@ fn serializeStoreState(allocator: std.mem.Allocator, store: *const StoreState) !
     return out.toOwnedSlice();
 }
 
-// Writes write credits info json.
+/// Writes a compact JSON object for the cached usage/credits snapshot shown in the UI.
 fn writeCreditsInfoJson(writer: anytype, credits: *const CreditsInfo) !void {
     try writer.writeByte('{');
     try writer.writeAll("\"available\":");
@@ -1429,11 +1278,21 @@ fn writeCreditsInfoJson(writer: anytype, credits: *const CreditsInfo) !void {
     try writer.writeAll(",\"currency\":");
     try writeJsonString(writer, credits.currency);
     try writer.writeAll(",\"source\":");
-    try writeJsonString(writer, creditsSourceString(credits.source));
+    try writeJsonString(writer, switch (credits.source) {
+        .wham_usage => "wham_usage",
+        .legacy_credit_grants => "legacy_credit_grants",
+    });
     try writer.writeAll(",\"mode\":");
-    try writeJsonString(writer, creditsModeString(credits.mode));
+    try writeJsonString(writer, switch (credits.mode) {
+        .balance => "balance",
+        .percent_fallback => "percent_fallback",
+        .legacy => "legacy",
+    });
     try writer.writeAll(",\"unit\":");
-    try writeJsonString(writer, creditsUnitString(credits.unit));
+    try writeJsonString(writer, switch (credits.unit) {
+        .USD => "USD",
+        .percent => "%",
+    });
     try writer.writeAll(",\"planType\":");
     try writeJsonOptionalString(writer, credits.plan_type);
     try writer.writeAll(",\"isPaidPlan\":");
@@ -1443,11 +1302,23 @@ fn writeCreditsInfoJson(writer: anytype, credits: *const CreditsInfo) !void {
     try writer.writeAll(",\"weeklyRemainingPercent\":");
     try writeJsonOptionalF64(writer, credits.weekly_remaining_percent);
     try writer.writeAll(",\"hourlyRefreshAt\":");
-    try writeJsonOptionalI64(writer, credits.hourly_refresh_at);
+    if (credits.hourly_refresh_at) |n| {
+        try writer.print("{}", .{n});
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"weeklyRefreshAt\":");
-    try writeJsonOptionalI64(writer, credits.weekly_refresh_at);
+    if (credits.weekly_refresh_at) |n| {
+        try writer.print("{}", .{n});
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"status\":");
-    try writeJsonString(writer, creditsStatusString(credits.status));
+    try writeJsonString(writer, switch (credits.status) {
+        .available => "available",
+        .unavailable => "unavailable",
+        .err => "error",
+    });
     try writer.writeAll(",\"message\":");
     try writeJsonString(writer, credits.message);
     try writer.writeAll(",\"checkedAt\":");
@@ -2296,7 +2167,8 @@ fn handleMoveAccountCommand(
     var moved = state.store.accounts.orderedRemove(source_idx);
     errdefer moved.deinit(allocator);
 
-    applyBucket(&moved, target_bucket);
+    moved.archived = target_bucket == .depleted;
+    moved.frozen = target_bucket == .frozen;
 
     if (state.store.active_account_id != null and std.mem.eql(u8, state.store.active_account_id.?, moved.id) and target_bucket != .active) {
         if (switch_away) {
@@ -2310,7 +2182,8 @@ fn handleMoveAccountCommand(
     var bucket_indices = std.ArrayListUnmanaged(usize).empty;
     defer bucket_indices.deinit(allocator);
     for (state.store.accounts.items, 0..) |account, idx| {
-        if (accountBucket(&account) == target_bucket) {
+        const bucket: AccountBucket = if (account.frozen) .frozen else if (account.archived) .depleted else .active;
+        if (bucket == target_bucket) {
             try bucket_indices.append(allocator, idx);
         }
     }
@@ -2562,8 +2435,26 @@ fn handleRefreshAccountUsageCommand(allocator: std.mem.Allocator, account_id_raw
     const account_id = trimOptionalString(account_id_raw) orelse return jsonError(allocator, "refresh_account_usage requires accountId");
 
     const in_flight = blk: {
-        if (shouldDebounceRefresh(account_id)) {
-            break :blk isRefreshInflight(account_id);
+        lockIoMutex(&refresh_debounce_state);
+        const DebounceState = struct {
+            hit: bool,
+            inflight: bool,
+        };
+        const debounce_state: DebounceState = debounced: {
+            const now_ms = nowMilliseconds();
+            for (refresh_debounce_entries.items) |entry| {
+                if (!std.mem.eql(u8, entry.account_id, account_id)) continue;
+                if (entry.inflight) break :debounced DebounceState{ .hit = true, .inflight = true };
+                if (entry.last_started_ms > 0 and now_ms - entry.last_started_ms < USAGE_FETCH_DEBOUNCE_MS) {
+                    break :debounced DebounceState{ .hit = true, .inflight = false };
+                }
+                break :debounced DebounceState{ .hit = false, .inflight = false };
+            }
+            break :debounced DebounceState{ .hit = false, .inflight = false };
+        };
+        unlockIoMutex(&refresh_debounce_state);
+        if (debounce_state.hit) {
+            break :blk debounce_state.inflight;
         }
 
         try setRefreshInflight(account_id, true);
@@ -3711,7 +3602,7 @@ fn expectRpcErrorContains(response: []const u8, needle: []const u8) !void {
 
 test "rpcHandleRequest returns unknown op error for unsupported operation" {
     var cancel = std.atomic.Value(bool).init(false);
-    const response = try rpcHandleRequest(
+    const response = try handleRpcRequest(
         std.testing.allocator,
         .{
             .op = "noop",
@@ -3725,7 +3616,7 @@ test "rpcHandleRequest returns unknown op error for unsupported operation" {
 
 test "rpcHandleRequest cancel listener command sets cancel flag" {
     var cancel = std.atomic.Value(bool).init(false);
-    const response = try rpcHandleRequest(
+    const response = try handleRpcRequest(
         std.testing.allocator,
         .{
             .op = "invoke:cancel_oauth_callback_listener",
