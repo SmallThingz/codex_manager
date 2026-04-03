@@ -43,10 +43,6 @@ function inlineHtmlAssetsPlugin(): Plugin {
       let html = readFileSync(indexPath, "utf8");
       const filesToDelete = new Set<string>();
 
-      if (!html.includes('src="/webui.js"') && !html.includes("src='/webui.js'")) {
-        html = html.replace("</head>", '  <script src="/webui.js"></script>\n</head>');
-      }
-
       html = html.replace(/<link\b[^>]*>/g, (tag) => {
         if (!/\brel=(["'])stylesheet\1/.test(tag)) {
           return tag;

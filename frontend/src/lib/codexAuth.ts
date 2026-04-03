@@ -86,6 +86,10 @@ type WebuiRpcBridge = {
   cm_rpc: (request: Record<string, unknown>) => Promise<unknown> | unknown;
 };
 
+type WebuiFrontendBridge = {
+  register: (name: string, handler: (...args: unknown[]) => unknown) => boolean;
+};
+
 type BackendApis = {
   invoke: <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
   openUrl: (url: string) => Promise<void>;
@@ -94,6 +98,14 @@ type BackendApis = {
 let backendApisPromise: Promise<BackendApis> | null = null;
 let pendingBrowserLogin: PendingBrowserLogin | null = null;
 const inflightRefreshByAccountId = new Map<string, Promise<CreditsInfo>>();
+const pendingUsageRefreshByAccountId = new Map<
+  string,
+  {
+    promise: Promise<CreditsInfo>;
+    resolve: (credits: CreditsInfo) => void;
+  }
+>();
+let usageRefreshPushRegistered = false;
 
 // Now epoch.
 const nowEpoch = (): number => Math.floor(Date.now() / 1000);
@@ -399,6 +411,115 @@ const waitForWebuiBridge = async (): Promise<WebuiRpcBridge> => {
   throw new Error("WebUI bridge is unavailable (webuiRpc.cm_rpc missing).");
 };
 
+// Returns get webui frontend push bridge.
+const getWebuiFrontendBridge = (): WebuiFrontendBridge | null => {
+  const bridge = (globalThis as { webuiFrontend?: WebuiFrontendBridge }).webuiFrontend;
+  if (!bridge || typeof bridge.register !== "function") {
+    return null;
+  }
+  return bridge;
+};
+
+// Wait for webui frontend push bridge.
+const waitForWebuiFrontendBridge = async (): Promise<WebuiFrontendBridge> => {
+  const immediate = getWebuiFrontendBridge();
+  if (immediate) {
+    return immediate;
+  }
+
+  await waitForWebuiBridge();
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 25));
+    const bridge = getWebuiFrontendBridge();
+    if (bridge) {
+      return bridge;
+    }
+  }
+
+  throw new Error("WebUI frontend push bridge is unavailable.");
+};
+
+// Clears pending usage refresh waiter.
+const clearPendingUsageRefresh = (accountId: string) => {
+  pendingUsageRefreshByAccountId.delete(accountId);
+};
+
+// Creates create pending usage refresh waiter.
+const createPendingUsageRefresh = (accountId: string) => {
+  const existing = pendingUsageRefreshByAccountId.get(accountId);
+  if (existing) {
+    return existing;
+  }
+
+  let resolvePromise: (credits: CreditsInfo) => void = () => {};
+  const promise = new Promise<CreditsInfo>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  const pending = {
+    promise,
+    resolve: (credits: CreditsInfo) => {
+      clearPendingUsageRefresh(accountId);
+      resolvePromise(credits);
+    },
+  };
+  pendingUsageRefreshByAccountId.set(accountId, pending);
+  return pending;
+};
+
+// Parses as pushed usage refresh result.
+const asPushedUsageRefreshResult = (value: unknown): { accountId: string; credits: CreditsInfo } | null => {
+  let parsedValue = value;
+  if (typeof parsedValue === "string") {
+    try {
+      parsedValue = JSON.parse(parsedValue) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
+  const parsed = asRecord(parsedValue);
+  if (!parsed || typeof parsed.accountId !== "string") {
+    return null;
+  }
+
+  const credits = asCreditsInfo(parsed.credits);
+  if (!credits) {
+    return null;
+  }
+
+  return {
+    accountId: parsed.accountId,
+    credits,
+  };
+};
+
+// Registers the pushed usage-refresh completion handler exposed to backend websocket RPC.
+const ensureUsageRefreshPushHandler = async (): Promise<void> => {
+  if (usageRefreshPushRegistered) {
+    return;
+  }
+
+  const frontendBridge = await waitForWebuiFrontendBridge();
+  if (usageRefreshPushRegistered) {
+    return;
+  }
+
+  frontendBridge.register("cm.handleUsageRefreshCompletion", (payload: unknown) => {
+    const pushed = asPushedUsageRefreshResult(payload);
+    if (!pushed) {
+      return null;
+    }
+
+    const pending = pendingUsageRefreshByAccountId.get(pushed.accountId);
+    if (pending) {
+      pending.resolve(pushed.credits);
+    }
+    return null;
+  });
+  usageRefreshPushRegistered = true;
+};
+
 // Sends a request through the injected webui bridge and decodes the backend response.
 const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}): Promise<T> => {
   const request = { op, ...payload };
@@ -410,13 +531,16 @@ const callBridge = async <T>(op: string, payload: Record<string, unknown> = {}):
 // Loads load backend apis.
 const loadBackendApis = async (): Promise<BackendApis> => {
   if (!backendApisPromise) {
-    backendApisPromise = Promise.resolve({
-      invoke: async <T>(command: string, payload: Record<string, unknown> = {}) =>
-        callBridge<T>(`invoke:${command}`, payload),
-      openUrl: async (url: string) => {
-        await callBridge<null>("shell:open_url", { url });
-      },
-    });
+    backendApisPromise = (async () => {
+      await ensureUsageRefreshPushHandler();
+      return {
+        invoke: async <T>(command: string, payload: Record<string, unknown> = {}) =>
+          callBridge<T>(`invoke:${command}`, payload),
+        openUrl: async (url: string) => {
+          await callBridge<null>("shell:open_url", { url });
+        },
+      };
+    })();
   }
 
   return backendApisPromise;
@@ -748,33 +872,35 @@ export const getRemainingCreditsForAccount = async (id: string): Promise<Credits
   const pending = (async (): Promise<CreditsInfo> => {
     try {
       const tauri = await loadBackendApis();
+      const pushedRefresh = createPendingUsageRefresh(id);
 
-      while (true) {
-        let payload: unknown;
-        try {
-          payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
-        } catch (invokeError) {
-          const rendered = invokeError instanceof Error ? invokeError.message : String(invokeError);
-          return errorCreditsInfo(rendered);
-        }
-
-        const record = asRecord(payload);
-        if (record) {
-          const inFlight = valueAsBoolean(record.inFlight) ?? false;
-          if (inFlight) {
-            await new Promise((resolve) => window.setTimeout(resolve, 500));
-            continue;
-          }
-
-          const credits = asCreditsInfo(record.credits);
-          if (credits) {
-            return credits;
-          }
-        }
-
-        return errorCreditsInfo("Usage refresh returned an invalid response.");
+      let payload: unknown;
+      try {
+        payload = await tauri.invoke<unknown>("refresh_account_usage", { accountId: id });
+      } catch (invokeError) {
+        clearPendingUsageRefresh(id);
+        const rendered = invokeError instanceof Error ? invokeError.message : String(invokeError);
+        return errorCreditsInfo(rendered);
       }
+
+      const record = asRecord(payload);
+      if (record) {
+        const inFlight = valueAsBoolean(record.inFlight) ?? false;
+        if (inFlight) {
+          return await pushedRefresh.promise;
+        }
+
+        clearPendingUsageRefresh(id);
+        const credits = asCreditsInfo(record.credits);
+        if (credits) {
+          return credits;
+        }
+      }
+
+      clearPendingUsageRefresh(id);
+      return errorCreditsInfo("Usage refresh returned an invalid response.");
     } catch (refreshError) {
+      clearPendingUsageRefresh(id);
       const rendered = refreshError instanceof Error ? refreshError.message : String(refreshError);
       return errorCreditsInfo(rendered);
     }

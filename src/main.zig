@@ -134,6 +134,8 @@ fn runModeService(
         },
     });
     defer service.deinit();
+    rpc_webui.setService(&service);
+    defer rpc_webui.setService(null);
 
     if (strict_native_only) {
         try ensureNativeWebviewAvailable(&service, allocator);

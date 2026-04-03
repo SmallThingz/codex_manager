@@ -154,7 +154,7 @@ fn canonicalizeBootstrapJson(allocator: std.mem.Allocator, bootstrap_json: []con
 
 /// Injects the webui bridge script tag when the built frontend omitted it.
 fn ensureModuleWebUiScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
-    const script_tag = "<script src=\"/webui_bridge.js\"></script>";
+    const script_tag = "<script src=\"/webui/bridge.js\"></script>";
 
     if (std.mem.indexOf(u8, html, script_tag) != null) {
         return allocator.dupe(u8, html);

@@ -213,6 +213,27 @@ const OAuthPollResult = struct {
 
 var oauth_listener_state = OAuthListenerState{};
 
+const UsageRefreshNotifier = struct {
+    handler: ?*const fn (?*anyopaque, []const u8) void = null,
+    context: ?*anyopaque = null,
+};
+
+var usage_refresh_notifier = UsageRefreshNotifier{};
+
+/// Registers the bridge callback used to push usage-refresh completions to the frontend.
+pub fn setUsageRefreshNotifier(handler: ?*const fn (?*anyopaque, []const u8) void, context: ?*anyopaque) void {
+    usage_refresh_notifier = .{
+        .handler = handler,
+        .context = context,
+    };
+}
+
+/// Delivers a completed usage-refresh payload to the registered frontend bridge, if one exists.
+fn notifyUsageRefreshCompleted(payload_json: []const u8) void {
+    const handler = usage_refresh_notifier.handler orelse return;
+    handler(usage_refresh_notifier.context, payload_json);
+}
+
 const USAGE_FETCH_DEBOUNCE_MS: i64 = 15 * 1000;
 
 var managed_files_mutex: std.Io.Mutex = .init;
@@ -2340,6 +2361,8 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     var needs_email_backfill = false;
     var fetched_email: ?[]u8 = null;
     defer if (fetched_email) |email| allocator.free(email);
+    var push_payload: ?[]u8 = null;
+    defer if (push_payload) |payload| allocator.free(payload);
 
     lockIoMutex(&managed_files_mutex);
     {
@@ -2373,61 +2396,76 @@ fn backgroundRefreshAccountUsage(args: RefreshThreadArgs) void {
     var refreshed_credits = fetch_result.credits;
     errdefer refreshed_credits.deinit(allocator);
 
-    lockIoMutex(&managed_files_mutex);
-    defer unlockIoMutex(&managed_files_mutex);
-
-    var state = loadAppState(allocator) catch return;
-    defer state.deinit(allocator);
-    const account_idx = accountIndex(&state.store, account_id) orelse return;
-
     {
-        const account = &state.store.accounts.items[account_idx];
+        lockIoMutex(&managed_files_mutex);
+        defer unlockIoMutex(&managed_files_mutex);
 
-        if (auth_json_was_refreshed) {
-            allocator.free(account.auth_json);
-            account.auth_json = allocator.dupe(u8, auth_json_copy.?) catch return;
+        var state = loadAppState(allocator) catch return;
+        defer state.deinit(allocator);
+        const account_idx = accountIndex(&state.store, account_id) orelse return;
 
-            const refreshed_email = extractEmailFromAuthJson(allocator, auth_json_copy.?);
-            if (refreshed_email) |email| {
-                if (account.email) |value| allocator.free(value);
-                account.email = email;
+        {
+            const account = &state.store.accounts.items[account_idx];
+
+            if (auth_json_was_refreshed) {
+                allocator.free(account.auth_json);
+                account.auth_json = allocator.dupe(u8, auth_json_copy.?) catch return;
+
+                const refreshed_email = extractEmailFromAuthJson(allocator, auth_json_copy.?);
+                if (refreshed_email) |email| {
+                    if (account.email) |value| allocator.free(value);
+                    account.email = email;
+                } else if (fetched_email) |email| {
+                    if (account.email == null) {
+                        account.email = allocator.dupe(u8, email) catch return;
+                    }
+                }
+
+                if (state.store.active_account_id) |active_id| {
+                    if (std.mem.eql(u8, active_id, account.id)) {
+                        writeCodexAuthPath(allocator, state.paths.codexAuthPath, account.auth_json) catch return;
+                    }
+                }
             } else if (fetched_email) |email| {
                 if (account.email == null) {
                     account.email = allocator.dupe(u8, email) catch return;
                 }
             }
-
-            if (state.store.active_account_id) |active_id| {
-                if (std.mem.eql(u8, active_id, account.id)) {
-                    writeCodexAuthPath(allocator, state.paths.codexAuthPath, account.auth_json) catch return;
-                }
-            }
-        } else if (fetched_email) |email| {
-            if (account.email == null) {
-                account.email = allocator.dupe(u8, email) catch return;
-            }
         }
-    }
 
-    if (usageEntryIndex(state.usage_by_id.items, account_id)) |idx| {
-        var old = state.usage_by_id.items[idx];
-        old.credits.deinit(allocator);
-        allocator.free(old.account_id);
-        state.usage_by_id.items[idx] = .{
-            .account_id = allocator.dupe(u8, account_id) catch return,
-            .credits = refreshed_credits,
+        const usage_idx = if (usageEntryIndex(state.usage_by_id.items, account_id)) |idx| blk: {
+            var old = state.usage_by_id.items[idx];
+            old.credits.deinit(allocator);
+            allocator.free(old.account_id);
+            state.usage_by_id.items[idx] = .{
+                .account_id = allocator.dupe(u8, account_id) catch return,
+                .credits = refreshed_credits,
+            };
+            break :blk idx;
+        } else blk: {
+            state.usage_by_id.append(allocator, .{
+                .account_id = allocator.dupe(u8, account_id) catch return,
+                .credits = refreshed_credits,
+            }) catch return;
+            break :blk state.usage_by_id.items.len - 1;
         };
-    } else {
-        state.usage_by_id.append(allocator, .{
-            .account_id = allocator.dupe(u8, account_id) catch return,
-            .credits = refreshed_credits,
-        }) catch return;
+
+        // Ownership moved into state.usage_by_id.
+        refreshed_credits = undefined;
+
+        persistStateFilesOnly(allocator, &state) catch {};
+        push_payload = buildRefreshUsageResponseJson(
+            allocator,
+            account_id,
+            &state.usage_by_id.items[usage_idx].credits,
+            null,
+            false,
+        ) catch null;
     }
 
-    // Ownership moved into state.usage_by_id.
-    refreshed_credits = undefined;
-
-    persistStateFilesOnly(allocator, &state) catch {};
+    if (push_payload) |payload| {
+        notifyUsageRefreshCompleted(payload);
+    }
 }
 
 // Handles handle refresh account usage command.
