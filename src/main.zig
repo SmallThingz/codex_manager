@@ -3,6 +3,7 @@ const webui = @import("webui");
 
 const embedded_index = @import("embedded_index.zig");
 const rpc_webui = @import("rpc_webui.zig");
+const rpc = @import("rpc.zig");
 
 const DEFAULT_WIDTH: u32 = 1000;
 const DEFAULT_HEIGHT: u32 = 760;
@@ -29,6 +30,10 @@ const LaunchRequest = struct {
 };
 
 var oauth_listener_cancel = std.atomic.Value(bool).init(false);
+
+comptime {
+    _ = rpc;
+}
 
 /// Boots the desktop/web launcher, prepares the live HTML payload, and runs the selected webui
 /// surface order until shutdown.

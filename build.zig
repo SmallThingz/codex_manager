@@ -294,6 +294,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addEmbedPath(b.path("."));
     if (frontend_build_step) |frontend_step| {
         exe.step.dependOn(frontend_step);
     }
@@ -344,12 +345,16 @@ pub fn build(b: *std.Build) void {
 
     const backend_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/rpc.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .strip = strip_symbols,
+            .imports = &.{
+                .{ .name = "webui", .module = webui_module },
+            },
         }),
     });
+    backend_tests.root_module.addEmbedPath(b.path("."));
 
     const run_backend_tests = b.addRunArtifact(backend_tests);
     const test_step = b.step("test", "Run backend Zig tests");
