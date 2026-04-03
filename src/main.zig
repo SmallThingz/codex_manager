@@ -117,6 +117,7 @@ fn runModeService(
             .browser_window => .app_window,
             .web_url => .tab,
         },
+        .auto_open = first_surface != .web_url,
         .fallback_mode = if (strict_native_only)
             .strict
         else

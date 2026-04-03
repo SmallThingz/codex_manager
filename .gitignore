@@ -12,3 +12,5 @@ zig-pkg
 .zig*
 *.local
 frontend/package-lock.json
+
+src/generated_index.html

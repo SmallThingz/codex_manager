@@ -10,7 +10,7 @@ const BOOTSTRAP_PLACEHOLDER = "REPLACE_THIS_VARIABLE_WHEN_SENDING";
 const DEFAULT_BOOTSTRAP_STATE_JSON =
     \\{"theme":null,"view":null,"usageById":{},"savedAt":0}
 ;
-const INDEX_HTML = @embedFile("frontend/dist/index.html");
+const INDEX_HTML = @embedFile("generated_index.html");
 
 const IndexTemplate = struct {
     prefix: []const u8,

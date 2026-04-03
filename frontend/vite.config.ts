@@ -22,6 +22,7 @@ function resolveAssetPath(outDir: string, ref: string): string {
 
 function inlineHtmlAssetsPlugin(): Plugin {
   let config: ResolvedConfig | undefined;
+  const generatedEmbedPath = resolve(rootDir, "../src/generated_index.html");
 
   return {
     name: "inline-html-assets",
@@ -87,6 +88,7 @@ function inlineHtmlAssetsPlugin(): Plugin {
       );
 
       writeFileSync(indexPath, html, "utf8");
+      writeFileSync(generatedEmbedPath, html, "utf8");
 
       for (const filePath of filesToDelete) {
         rmSync(filePath, { force: true });

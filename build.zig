@@ -294,7 +294,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addEmbedPath(b.path("."));
     if (frontend_build_step) |frontend_step| {
         exe.step.dependOn(frontend_step);
     }
@@ -354,7 +353,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    backend_tests.root_module.addEmbedPath(b.path("."));
 
     const run_backend_tests = b.addRunArtifact(backend_tests);
     const test_step = b.step("test", "Run backend Zig tests");
