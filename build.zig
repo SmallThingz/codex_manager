@@ -285,7 +285,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "codex-manager",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .strip = strip_symbols,
@@ -344,9 +344,7 @@ pub fn build(b: *std.Build) void {
 
     const backend_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            // Keep package root at repo root so @embedFile("../frontend/...") used by
-            // imported modules remains inside package boundaries during tests.
-            .root_source_file = b.path("rpc_tests.zig"),
+            .root_source_file = b.path("src/rpc.zig"),
             .target = target,
             .optimize = optimize,
             .strip = strip_symbols,
